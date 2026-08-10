@@ -1,0 +1,279 @@
+/**
+ * 数据访问层 —— 三个窗口共享主进程中同一套数据读写逻辑，避免不一致。
+ * 提供角色卡 / 记忆体 / 会话 / 模型 / 设置 的领域操作。
+ * 所有变更通过 storage.mutateJson 在「每文件串行队列」内原子完成，避免并发丢更新。
+ */
+import { randomUUID } from 'crypto'
+import type {
+  AppSettings,
+  CharacterCard,
+  ChatMessage,
+  Live2DModelMeta,
+  MemoryItem,
+  SessionDetail,
+  SessionIndexItem,
+} from '../../src/types'
+import { paths, readJson, writeJson, mutateJson, deleteFile, fileExists } from './storage'
+
+export function genId(prefix: string): string {
+  return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`
+}
+
+/**
+ * 校验资源 ID 是否为系统生成的合法格式。
+ * 会话/模型 ID 会拼入文件路径，必须校验，防止渲染进程构造路径穿越 ID（如 ../../secure/apiKey）。
+ */
+export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'card' | 'mem'): void {
+  if (typeof id !== 'string' || !new RegExp(`^${kind}_[0-9a-f]{12}$`).test(id)) {
+    throw new Error('非法资源 ID')
+  }
+}
+
+// ---------------- 角色卡 ----------------
+
+const DEFAULT_CARDS: CharacterCard[] = []
+
+/** 旧数据兼容：早期版本只有单个 persona 字段，读取时归一化为 identity */
+interface LegacyCharacterCard extends CharacterCard {
+  persona?: string
+}
+
+function normalizeCard(raw: LegacyCharacterCard): CharacterCard {
+  return {
+    ...raw,
+    identity: raw.identity ?? raw.persona ?? '',
+    consciousness: raw.consciousness ?? '',
+  }
+}
+
+export async function listCharacterCards(): Promise<CharacterCard[]> {
+  const cards = await readJson<LegacyCharacterCard[]>(paths.characterCardsFile, DEFAULT_CARDS)
+  return cards.map(normalizeCard).sort((a, b) => b.createdAt - a.createdAt)
+}
+
+export async function getCharacterCard(id: string): Promise<CharacterCard | null> {
+  const cards = await listCharacterCards()
+  return cards.find((c) => c.id === id) ?? null
+}
+
+export async function createCharacterCard(
+  input: Pick<CharacterCard, 'name' | 'identity' | 'consciousness' | 'modelId'>,
+): Promise<CharacterCard> {
+  const now = Date.now()
+  const card: CharacterCard = {
+    id: genId('card'),
+    name: input.name.trim() || '未命名角色',
+    identity: input.identity ?? '',
+    consciousness: input.consciousness ?? '',
+    modelId: input.modelId || null,
+    createdAt: now,
+    updatedAt: now,
+  }
+  await mutateJson(paths.characterCardsFile, DEFAULT_CARDS, (cards) => [card, ...cards])
+  return card
+}
+
+export async function updateCharacterCard(
+  id: string,
+  patch: Partial<Pick<CharacterCard, 'name' | 'identity' | 'consciousness' | 'modelId'>>,
+): Promise<void> {
+  await mutateJson(paths.characterCardsFile, DEFAULT_CARDS, (cards) => {
+    let found = false
+    const next = cards.map((c) => {
+      if (c.id !== id) return c
+      found = true
+      return { ...c, ...patch, updatedAt: Date.now() }
+    })
+    if (!found) throw new Error('角色卡不存在')
+    return next
+  })
+}
+
+export async function removeCharacterCard(id: string): Promise<void> {
+  await mutateJson(paths.characterCardsFile, DEFAULT_CARDS, (cards) => cards.filter((c) => c.id !== id))
+}
+
+// ---------------- 记忆体 ----------------
+
+const DEFAULT_MEMORIES: MemoryItem[] = []
+
+export async function listMemories(): Promise<MemoryItem[]> {
+  return readJson<MemoryItem[]>(paths.memoryFile, DEFAULT_MEMORIES)
+}
+
+export async function addMemory(content: string): Promise<MemoryItem> {
+  const text = content.trim()
+  if (!text) throw new Error('记忆内容不能为空')
+  const item: MemoryItem = { id: genId('mem'), content: text, createdAt: Date.now() }
+  await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => [item, ...items])
+  return item
+}
+
+export async function updateMemory(id: string, content: string): Promise<void> {
+  const text = content.trim()
+  if (!text) throw new Error('记忆内容不能为空')
+  await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => {
+    let found = false
+    const next = items.map((m) => {
+      if (m.id !== id) return m
+      found = true
+      return { ...m, content: text }
+    })
+    if (!found) throw new Error('记忆条目不存在')
+    return next
+  })
+}
+
+export async function removeMemory(id: string): Promise<void> {
+  await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => items.filter((m) => m.id !== id))
+}
+
+/** 拼接 system prompt：身份 + 意识 + 全局记忆体 */
+export function buildSystemPrompt(identity: string, consciousness: string, memories: MemoryItem[]): string {
+  const parts: string[] = []
+  if (identity.trim()) parts.push(`【身份】\n${identity.trim()}`)
+  if (consciousness.trim()) parts.push(`【意识】\n${consciousness.trim()}`)
+  if (memories.length > 0) {
+    const memLines = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
+    parts.push(`【长期记忆】\n${memLines}`)
+  }
+  return parts.join('\n\n')
+}
+
+// ---------------- 会话 ----------------
+
+const DEFAULT_SESSION_INDEX: SessionIndexItem[] = []
+
+export async function listSessions(): Promise<SessionIndexItem[]> {
+  const list = await readJson<SessionIndexItem[]>(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX)
+  return list.sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export async function getSession(id: string): Promise<SessionDetail> {
+  assertValidResourceId(id, 'session')
+  const data = await readJson<SessionDetail | null>(paths.sessionFile(id), null)
+  if (data) return data
+  // 文件缺失：尝试从索引恢复基本信息，返回空会话
+  const index = await listSessions()
+  const entry = index.find((s) => s.id === id)
+  return { id, characterCardId: entry?.characterCardId ?? '', messages: [] }
+}
+
+export async function createSession(characterCardId: string): Promise<SessionIndexItem> {
+  assertValidResourceId(characterCardId, 'card')
+  const card = await getCharacterCard(characterCardId)
+  const now = Date.now()
+  const item: SessionIndexItem = {
+    id: genId('session'),
+    title: '新会话',
+    characterCardId,
+    characterCardName: card?.name ?? '未命名角色',
+    createdAt: now,
+    updatedAt: now,
+    messageCount: 0,
+  }
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => [item, ...index])
+  const detail: SessionDetail = { id: item.id, characterCardId, messages: [] }
+  await writeJson(paths.sessionFile(item.id), detail)
+  return item
+}
+
+/** 根据首条用户消息自动生成标题（前 20 字） */
+export function deriveTitle(messages: ChatMessage[]): string {
+  const first = messages.find((m) => m.role === 'user')
+  if (!first) return '新会话'
+  const t = first.content.trim().replace(/\s+/g, ' ')
+  return t.slice(0, 20) || '新会话'
+}
+
+export async function appendSessionMessages(id: string, extra: ChatMessage[]): Promise<SessionDetail> {
+  assertValidResourceId(id, 'session')
+  const session = await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    const base = cur ?? { id, characterCardId: '', messages: [] }
+    return { ...base, messages: [...base.messages, ...extra] }
+  })
+
+  // 更新索引（title / messageCount / updatedAt）
+  const detail = session as SessionDetail
+  const card = await getCharacterCard(detail.characterCardId)
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => {
+    const idx = index.findIndex((s) => s.id === id)
+    if (idx === -1) return index
+    const existing = index[idx] as SessionIndexItem
+    const next: SessionIndexItem = {
+      ...existing,
+      title: existing.title === '新会话' ? deriveTitle(detail.messages) : existing.title,
+      characterCardName: card?.name ?? existing.characterCardName,
+      messageCount: detail.messages.length,
+      updatedAt: Date.now(),
+    }
+    index[idx] = next
+    return index
+  })
+  return detail
+}
+
+export async function removeSession(id: string): Promise<void> {
+  assertValidResourceId(id, 'session')
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => index.filter((s) => s.id !== id))
+  await deleteFile(paths.sessionFile(id))
+}
+
+// ---------------- Live2D 模型 ----------------
+
+const DEFAULT_MODELS: Live2DModelMeta[] = []
+
+export async function listModels(): Promise<Live2DModelMeta[]> {
+  return readJson<Live2DModelMeta[]>(paths.modelsIndexFile, DEFAULT_MODELS)
+}
+
+export async function addModel(meta: Live2DModelMeta): Promise<Live2DModelMeta> {
+  await mutateJson(paths.modelsIndexFile, DEFAULT_MODELS, (list) => [meta, ...list])
+  return meta
+}
+
+export async function removeModel(modelId: string): Promise<void> {
+  assertValidResourceId(modelId, 'model')
+  await mutateJson(paths.modelsIndexFile, DEFAULT_MODELS, (list) => list.filter((m) => m.id !== modelId))
+  // 递归删除模型目录（可能含子目录/纹理）
+  await deleteFile(paths.modelDir(modelId))
+  // 角色卡若绑定该模型，解除绑定
+  await mutateJson(paths.characterCardsFile, DEFAULT_CARDS, (cards) =>
+    cards.map((c) => (c.modelId === modelId ? { ...c, modelId: null, updatedAt: Date.now() } : c)),
+  )
+}
+
+// ---------------- 设置 ----------------
+
+const DEFAULT_SETTINGS: AppSettings = {
+  baseURL: '',
+  model: '',
+  temperature: 0.8,
+  maxTokens: 1024,
+  stream: true,
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const saved = await readJson<Partial<AppSettings> | null>(paths.settingsFile, null)
+  return { ...DEFAULT_SETTINGS, ...(saved ?? {}) }
+}
+
+export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
+  const result = await mutateJson<Partial<AppSettings> | null>(paths.settingsFile, null, (current) => {
+    const base = current ?? {}
+    const next: Partial<AppSettings> = { ...base }
+    // 仅合并白名单字段，避免污染
+    if (patch.baseURL !== undefined) next.baseURL = patch.baseURL
+    if (patch.model !== undefined) next.model = patch.model
+    if (patch.temperature !== undefined) next.temperature = patch.temperature
+    if (patch.maxTokens !== undefined) next.maxTokens = patch.maxTokens
+    if (patch.stream !== undefined) next.stream = patch.stream
+    return next
+  })
+  return { ...DEFAULT_SETTINGS, ...result }
+}
+
+/** Cubism Core 是否已就绪 */
+export async function isCorePresent(): Promise<boolean> {
+  return fileExists(paths.coreFile)
+}

@@ -1,0 +1,88 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-surface: #0f1115;
+  --color-surface-2: #151922;
+  --color-panel: #171a21;
+  --color-card: #1e222b;
+  --color-card-hover: #262b36;
+  --color-border: #2a2f3a;
+  --color-border-strong: #363c49;
+  --color-text: #e6e8ec;
+  --color-text-2: #9aa1ad;
+  --color-text-muted: #6b7280;
+  --color-accent: #8b5cf6;
+  --color-accent-2: #6366f1;
+  --color-danger: #ef4444;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --font-sans:
+    'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Helvetica Neue', Arial, system-ui, sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* 桌宠窗口透明背景 */
+body.pet-body {
+  background: transparent;
+  overflow: hidden;
+}
+
+#root {
+  height: 100%;
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4a5160;
+}
+
+/* 文本选择仅限聊天正文等需要的地方 */
+.selectable {
+  user-select: text;
+}
+
+/* 拖动窗口的无边框区域（自定义标题栏） */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* 打字机光标 */
+.streaming-cursor::after {
+  content: '▍';
+  color: var(--color-accent);
+  animation: blink 0.8s step-end infinite;
+}
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}

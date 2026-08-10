@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# 本地工具链 / 索引，不纳入版本控制
+.serena/
+.codegraph/
+
+# 内部技术方案，不对外发布
+AI桌宠项目技术方案.md

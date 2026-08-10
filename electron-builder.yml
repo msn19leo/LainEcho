@@ -1,0 +1,32 @@
+appId: com.aidesktop.pet
+productName: AI桌宠
+directories:
+  buildResources: build
+  output: release
+files:
+  - dist-electron/**
+  - dist/**
+  - build/icon.png
+  - package.json
+  - "!node_modules/**"
+asar: true
+npmRebuild: false
+electronLanguages:
+  - zh-CN
+  - en-US
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+  artifactName: ${productName}-${version}-setup.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: AI桌宠
+  deleteAppDataOnUninstall: false
+publish: null
