@@ -58,6 +58,7 @@ export const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   parameters: { ...DEFAULT_PARAMETERS },
   animation: { ...DEFAULT_ANIMATION },
   view: { ...DEFAULT_VIEW },
+  selectedModelId: null,
 }
 
 interface ModelSettingsState {
@@ -89,6 +90,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
           parameters: { ...DEFAULT_PARAMETERS, ...data.parameters },
           animation: { ...DEFAULT_ANIMATION, ...data.animation },
           view: { ...DEFAULT_VIEW, ...data.view },
+          selectedModelId: data.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
         },
         loaded: true,
       })
@@ -103,6 +105,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
       parameters: { ...get().settings.parameters, ...(patch.parameters ?? {}) },
       animation: { ...get().settings.animation, ...(patch.animation ?? {}) },
       view: { ...get().settings.view, ...(patch.view ?? {}) },
+      selectedModelId: patch.selectedModelId !== undefined ? patch.selectedModelId : get().settings.selectedModelId,
     }
     set({ settings: next })
     await api.modelSettings.save(patch)
@@ -115,6 +118,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         parameters: { ...cur.parameters, ...(patch.parameters ?? {}) },
         animation: { ...cur.animation, ...(patch.animation ?? {}) },
         view: { ...cur.view, ...(patch.view ?? {}) },
+        selectedModelId: patch.selectedModelId !== undefined ? patch.selectedModelId : cur.selectedModelId,
       },
     })
   },
@@ -129,6 +133,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         parameters: { ...DEFAULT_PARAMETERS, ...settings.parameters },
         animation: { ...DEFAULT_ANIMATION, ...settings.animation },
         view: { ...DEFAULT_VIEW, ...settings.view },
+        selectedModelId: settings.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
       },
     })
   },

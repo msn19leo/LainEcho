@@ -323,6 +323,7 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
     expressionEnabled: false,
   },
   view: { scale: 1, x: 0, y: 0 },
+  selectedModelId: null,
 }
 
 /** 读取模型设置，缺失字段用默认值补全 */
@@ -333,6 +334,7 @@ export async function getModelSettings(): Promise<ModelSettings> {
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(saved.parameters ?? {}) },
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
+    selectedModelId: saved.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
   }
 }
 
@@ -344,11 +346,13 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     if (patch.parameters) next.parameters = { ...(base.parameters ?? {}), ...patch.parameters }
     if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
     if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
+    if (patch.selectedModelId !== undefined) next.selectedModelId = patch.selectedModelId
     return next
   })
   return {
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(result?.parameters ?? {}) },
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
+    selectedModelId: result?.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
   }
 }

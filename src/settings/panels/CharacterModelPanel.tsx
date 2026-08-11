@@ -26,7 +26,7 @@ import {
   Switch,
 } from '../../components/ui'
 import { toast } from '../../components/toast'
-import { formatRelativeTime } from '../../lib/utils'
+import { cn, formatRelativeTime } from '../../lib/utils'
 import {
   DEFAULT_VIEW,
   useModelSettingsStore,
@@ -109,6 +109,17 @@ export function CharacterModelPanel() {
     }
   }
 
+  /** 选择当前全局使用的 Live2D 模型 */
+  const handleSelectModel = async (modelId: string) => {
+    if (settings.selectedModelId === modelId) return
+    try {
+      await save({ selectedModelId: modelId })
+      toast('已切换当前模型')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '切换失败', 'error')
+    }
+  }
+
   // ---- 参数更新辅助函数 ----
 
   /** 更新单个动画设置 */
@@ -174,22 +185,46 @@ export function CharacterModelPanel() {
         <Empty text="还没有模型。选择包含 xxx.model3.json 的文件夹导入（会复制到应用数据目录）" />
       ) : (
         <div className="space-y-2">
-          {models.map((m) => (
-            <Card key={m.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
-                <PersonStanding size={17} strokeWidth={1.75} color="var(--primary-400)" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium text-text">{m.name}</div>
-                <div className="mt-0.5 truncate text-xs text-text-muted selectable">
-                  {m.model3Path} · {formatRelativeTime(m.createdAt)} 导入
+          {models.map((m) => {
+            const selected = settings.selectedModelId === m.id
+            return (
+              <Card
+                key={m.id}
+                className={cn(
+                  'flex items-center gap-3 py-3',
+                  selected && 'ring-2 ring-[var(--primary-400)] ring-offset-2 ring-offset-[var(--bg-base)] shadow-[0_0_16px_var(--primary-glow)]',
+                )}
+                onClick={() => void handleSelectModel(m.id)}
+              >
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                  <PersonStanding size={17} strokeWidth={1.75} color="var(--primary-400)" />
                 </div>
-              </div>
-              <Button variant="danger" size="sm" onClick={() => setDeleting(m)}>
-                删除
-              </Button>
-            </Card>
-          ))}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="truncate text-sm font-medium text-text">{m.name}</div>
+                    {selected && (
+                      <span className="inline-flex shrink-0 items-center rounded-full bg-[var(--primary-400)]/15 px-2 py-0.5 text-[10px] text-[var(--primary-400)] ring-1 ring-[var(--primary-400)]/30">
+                        当前选择
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 truncate text-xs text-text-muted selectable">
+                    {m.model3Path} · {formatRelativeTime(m.createdAt)} 导入
+                  </div>
+                </div>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setDeleting(m)
+                  }}
+                >
+                  删除
+                </Button>
+              </Card>
+            )
+          })}
         </div>
       )}
 

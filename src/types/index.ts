@@ -148,6 +148,8 @@ export interface ModelSettings {
   parameters: ModelParameters
   animation: ModelAnimationSettings
   view: ModelViewSettings
+  /** 当前全局选中的 Live2D 模型 id（角色卡未绑定时使用） */
+  selectedModelId: string | null
 }
 
 /** 会话导出结果为 Markdown 时返回 */

@@ -43,6 +43,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const loadGenRef = useRef(0)
   /** 当前展示的模型 id（模型列表变化时保持，不跳回 models[0]） */
   const currentModelIdRef = useRef<string | null>(null)
+  /** 当前角色卡绑定的模型 id（null 表示未绑定，应使用全局选中模型） */
+  const currentCardModelIdRef = useRef<string | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
@@ -125,7 +127,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     modelRef.current = null
   }
 
-  /** 加载（或切换）指定模型；不传 modelId 时取模型列表第一个 */
+  /** 加载（或切换）指定模型；不传 modelId 时按优先级选择：角色卡绑定 > 全局选中 > 列表第一个 */
   async function loadModel(modelId?: string) {
     const app = appRef.current
     const cls = live2dClassRef.current
@@ -135,7 +137,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     const models = await api.model.list()
     if (gen !== loadGenRef.current || cancelledRef.current) return // 已被更新的加载请求取代
-    console.log('[pet] 模型列表数量:', models.length, '当前选中:', currentModelIdRef.current ?? null)
+    console.log('[pet] 模型列表数量:', models.length, '当前展示:', currentModelIdRef.current ?? null, '角色卡绑定:', currentCardModelIdRef.current ?? null, '全局选中:', settingsRef.current.selectedModelId ?? null)
     if (models.length === 0) {
       clearModel()
       setLoading(false)
@@ -143,7 +145,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       setBanner('尚未导入 Live2D 模型，请在设置 → 角色模型中导入')
       return
     }
-    const meta = (modelId ? models.find((m) => m.id === modelId) : undefined) ?? (models[0] as Live2DModelMeta)
+    // 确定目标模型 id：显式传入 > 角色卡绑定 > 全局选中 > 列表第一个
+    const findModel = (id?: string | null) => id ? models.find((m) => m.id === id) : undefined
+    const meta =
+      findModel(modelId) ??
+      findModel(currentCardModelIdRef.current) ??
+      findModel(settingsRef.current.selectedModelId) ??
+      (models[0] as Live2DModelMeta)
     currentModelIdRef.current = meta.id
 
     clearModel()
@@ -382,7 +390,15 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     // 订阅始终注册（即使 core 缺失也会收到导入事件后重试）：
     // 角色卡切换 → 换模型；模型列表变化 / Cubism Core 导入 → 重新初始化
     unsubModel = api.pet.onModelChanged((modelId) => {
-      if (modelId) void loadModel(modelId)
+      if (modelId) {
+        // 角色卡绑定了模型：记录并加载该模型
+        currentCardModelIdRef.current = modelId
+        void loadModel(modelId)
+      } else {
+        // 角色卡未绑定模型：清除绑定，按全局选中模型重新加载
+        currentCardModelIdRef.current = null
+        void loadModel()
+      }
     })
     unsubModels = api.pet.onModelsChanged(() => {
       void init()
@@ -391,8 +407,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       void init()
     })
 
-    // 订阅模型设置变化（设置窗口修改后实时同步）
-    unsubSettings = api.pet.onModelSettingsChanged((settings) => {
+    /** 应用模型设置（更新 ticker、拟合，并在必要时切换模型） */
+    const applySettings = (settings: ModelSettings, shouldSwitchModel: boolean) => {
       settingsRef.current = settings
       // FPS 变化时更新 ticker
       if (appRef.current) {
@@ -400,15 +416,20 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
       // 缩放/位置变化时重新拟合
       fitModel()
+      // 选中模型变化且当前角色卡未绑定时，切换到新选中模型
+      if (shouldSwitchModel && !currentCardModelIdRef.current && settings.selectedModelId !== currentModelIdRef.current) {
+        void loadModel(settings.selectedModelId ?? undefined)
+      }
+    }
+
+    // 订阅模型设置变化（设置窗口修改后实时同步）
+    unsubSettings = api.pet.onModelSettingsChanged((settings) => {
+      applySettings(settings, true)
     })
 
     // 启动时加载已保存的模型设置
     void api.modelSettings.get().then((settings) => {
-      settingsRef.current = settings
-      if (appRef.current) {
-        appRef.current.ticker.maxFPS = settings.animation.maxFps === 0 ? 0 : settings.animation.maxFps
-      }
-      fitModel()
+      applySettings(settings, true)
     })
 
     return () => {
