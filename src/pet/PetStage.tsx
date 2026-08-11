@@ -15,7 +15,8 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings } from '../types'
+import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
 
 export interface PetStageHandle {
   zoom: (factor: number) => void
@@ -47,11 +48,22 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
   const currentScaleRef = useRef(1)
 
+  /** 模型设置引用（每帧读取，不触发重渲染） */
+  const settingsRef = useRef<ModelSettings>(DEFAULT_MODEL_SETTINGS)
+  /** 鼠标位置（屏幕坐标，用于鼠标跟踪） */
+  const mouseRef = useRef<{ x: number; y: number; active: boolean; lastMoveAt: number }>({ x: 0, y: 0, active: false, lastMoveAt: 0 })
+  /** 当前注视焦点（lerp 平滑后的值，让模型缓慢追踪鼠标而非瞬间跟随） */
+  const focusRef = useRef({ x: 0, y: 0 })
+  /** 眨眼状态机 */
+  const blinkRef = useRef(createBlinkState())
+  /** 空闲眼神状态 */
+  const idleEyeRef = useRef(createIdleEyeState())
+
   useImperativeHandle(stageRef, () => ({
     zoom: (factor) => {
       currentScaleRef.current = zoomModel(modelRef.current, factor)
     },
-    playTap: () => playTap(modelRef.current),
+    playTap: () => playTap(modelRef.current, settingsRef.current.animation.idleAnimation || undefined),
     getScale: () => currentScaleRef.current,
     switchModel: (modelId) => {
       void loadModel(modelId)
@@ -79,21 +91,25 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     const mw = char?.width || canvasW
     const mh = char?.height || canvasH
 
-    const scale = Math.min(w / mw, h / mh) * 0.9
+    // 基础缩放 × 用户设置的缩放系数
+    const view = settingsRef.current.view
+    const baseScale = Math.min(w / mw, h / mh) * 0.9
+    const scale = baseScale * view.scale
     currentScaleRef.current = scale
     model.scale.set(scale, scale)
     model.anchor.set(0.5, 0.5)
 
     if (char) {
       // 角色中心相对画布中心的偏移，换算到世界坐标后，让角色中心落在窗口中心
+      // 再叠加用户设置的 X/Y 偏移
       const cx = char.x + char.width / 2
       const cy = char.y + char.height / 2
       model.position.set(
-        w / 2 - (cx - canvasW / 2) * scale,
-        h / 2 - (cy - canvasH / 2) * scale,
+        w / 2 - (cx - canvasW / 2) * scale + view.x,
+        h / 2 - (cy - canvasH / 2) * scale + view.y,
       )
     } else {
-      model.position.set(w / 2, h / 2)
+      model.position.set(w / 2 + view.x, h / 2 + view.y)
     }
   }
 
@@ -209,8 +225,49 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     let unsubModel = () => {}
     let unsubModels = () => {}
     let unsubCore = () => {}
+    let unsubSettings = () => {}
+    let unsubCursor = () => {}
     let ro: ResizeObserver | null = null
     let booting = false
+
+    /** 每帧参数引擎回调（注册到 PIXI ticker） */
+    const tickerFn = (delta: number) => {
+      const model = modelRef.current
+      if (!model) return
+      const settings = settingsRef.current
+      const animation = settings.animation
+      const params = settings.parameters
+
+      // 获取 internalModel（暴露 coreModel 和 focusController）
+      const internal = (model as unknown as {
+        internalModel?: InternalModelLike
+      }).internalModel
+      const coreModel = internal?.coreModel
+      if (!coreModel) return
+
+      // 判断鼠标跟踪是否激活（鼠标超过 1 秒未移动则切换到空闲眼神，参考 airi 的 1s 超时）
+      if (mouseRef.current.active && performance.now() - mouseRef.current.lastMoveAt > 1000) {
+        mouseRef.current.active = false
+      }
+      const mouseTrackingActive = animation.mouseTracking && mouseRef.current.active
+
+      // 执行顺序：
+      // 1. 应用用户参数（写 angleZ + eyeOpen + eyebrow + mouth + body + breath）
+      //    鼠标跟踪激活时跳过 angleX/Y（由 updateEyeTracking 覆盖）
+      applyModelParameters(coreModel, params, mouseTrackingActive)
+
+      // 2. 眨眼（读回 eyeOpen 值，乘以眨眼系数）
+      if (animation.enableBlink) {
+        updateBlink(coreModel, blinkRef.current, animation.blinkMode, delta, params)
+      }
+
+      // 3. 鼠标跟踪 / 空闲眼神（覆盖 angleX/Y 和 eyeBallX/Y）
+      if (mouseTrackingActive) {
+        updateEyeTracking(coreModel, mouseRef.current, animation, focusRef.current)
+      } else if (animation.idleEyeMovement) {
+        updateIdleEyes(internal!, idleEyeRef.current, delta)
+      }
+    }
 
     /** 完整初始化（幂等）：
      *  - core 缺失时停在提示横幅，收到 core 导入事件后重试
@@ -281,6 +338,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         container.appendChild(app.view as unknown as HTMLElement)
         console.log('[pet] PIXI app 创建成功', baseW, baseH)
 
+        // 注册每帧参数引擎
+        app.ticker.add(tickerFn)
+
+        // 应用 FPS 限制
+        const anim = settingsRef.current.animation
+        app.ticker.maxFPS = anim.maxFps === 0 ? 0 : anim.maxFps
+
         // 监听窗口尺寸变化：始终恢复到基准尺寸，忽略拖动中的失真读数
         ro = new ResizeObserver(() => {
           if (!container || cancelledRef.current) return
@@ -289,11 +353,25 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         })
         ro.observe(container)
 
+        // 鼠标跟踪：通过主进程全局轮询获取鼠标坐标（参考 airi 桌面端用 OS API）
+        // 透明窗口 + -webkit-app-region: drag 导致 window.mousemove 无法正常触发，
+        // 且需要跟踪屏幕任意位置的鼠标，不仅限于 300x440 的桌宠窗口内。
+        // 主进程每 33ms 发送 cursor:move 事件，坐标已转换为窗口相对坐标。
+        unsubCursor = api.pet.onCursorMove((pos) => {
+          mouseRef.current.x = pos.x
+          mouseRef.current.y = pos.y
+          mouseRef.current.lastMoveAt = performance.now()
+          mouseRef.current.active = true
+        })
+
         // ---- 3. 加载模型 ----
         await loadModel()
 
-        // 随机待机动作
-        idleTimer = setInterval(() => playRandomIdle(modelRef.current), IDLE_MS)
+        // 随机待机动作（根据设置决定播放指定动作组或随机）
+        idleTimer = setInterval(() => {
+          const idleAnim = settingsRef.current.animation.idleAnimation
+          playRandomIdle(modelRef.current, idleAnim || undefined)
+        }, IDLE_MS)
       } finally {
         booting = false
       }
@@ -313,12 +391,34 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       void init()
     })
 
+    // 订阅模型设置变化（设置窗口修改后实时同步）
+    unsubSettings = api.pet.onModelSettingsChanged((settings) => {
+      settingsRef.current = settings
+      // FPS 变化时更新 ticker
+      if (appRef.current) {
+        appRef.current.ticker.maxFPS = settings.animation.maxFps === 0 ? 0 : settings.animation.maxFps
+      }
+      // 缩放/位置变化时重新拟合
+      fitModel()
+    })
+
+    // 启动时加载已保存的模型设置
+    void api.modelSettings.get().then((settings) => {
+      settingsRef.current = settings
+      if (appRef.current) {
+        appRef.current.ticker.maxFPS = settings.animation.maxFps === 0 ? 0 : settings.animation.maxFps
+      }
+      fitModel()
+    })
+
     return () => {
       cancelledRef.current = true
       idleTimer && clearInterval(idleTimer)
       unsubModel()
       unsubModels()
       unsubCore()
+      unsubSettings()
+      unsubCursor()
       ro?.disconnect()
       clearModel()
       appRef.current?.destroy(true, { children: true, texture: true })
@@ -440,7 +540,7 @@ function zoomModel(model: Live2DModel | null, factor: number): number {
 const PRIORITY_IDLE = 1
 const PRIORITY_FORCE = 3
 
-function playTap(model: Live2DModel | null) {
+function playTap(model: Live2DModel | null, idleAnimation?: string) {
   if (!model) return
   try {
     const groups = getMotionGroups(model)
@@ -449,15 +549,24 @@ function playTap(model: Live2DModel | null) {
       model.motion(tapGroup, 0, PRIORITY_FORCE)
       return
     }
-    playRandomIdle(model)
+    playRandomIdle(model, idleAnimation)
   } catch {
     // 忽略动作播放失败
   }
 }
 
-function playRandomIdle(model: Live2DModel | null) {
+function playRandomIdle(model: Live2DModel | null, preferredGroup?: string) {
   if (!model) return
   try {
+    // 如果指定了空闲动作组，优先播放该组
+    if (preferredGroup) {
+      const groups = getMotionGroups(model)
+      if (groups.includes(preferredGroup)) {
+        model.motion(preferredGroup, 0, PRIORITY_IDLE)
+        return
+      }
+    }
+    // 否则从非 Tap 开头的动作组中随机选择
     const groups = getMotionGroups(model).filter((g) => !g.toLowerCase().startsWith('tap'))
     if (groups.length === 0) return
     const pick = groups[Math.floor(Math.random() * groups.length)] as string
@@ -622,4 +731,312 @@ function computeCharacterBounds(
   } catch {
     return null
   }
+}
+
+// ==================== 参数引擎 ====================
+
+/** Cubism Core 模型接口（仅声明参数引擎用到的部分） */
+interface CoreModelLike {
+  setParameterValueById?: (id: string, value: number) => void
+  getParameterValueById?: (id: string) => number
+  addParameterValueById?: (id: string, value: number, weight?: number) => void
+}
+
+/** pixi-live2d-display 的 focusController 接口（驱动头部旋转平滑过渡） */
+interface FocusControllerLike {
+  focus?: (x: number, y: number, instant?: boolean) => void
+  update?: (deltaTime: number) => void
+}
+
+/** InternalModel 接口（暴露 coreModel 和 focusController） */
+interface InternalModelLike {
+  coreModel?: CoreModelLike
+  focusController?: FocusControllerLike
+}
+
+/**
+ * 将用户设置的模型参数写入 Cubism Core（每帧调用，覆盖 SDK 动画的同名参数）。
+ * 对应 airi 的 Model.vue 第 339-359 行参数映射。
+ * 当 mouseTrackingActive=true 时跳过 angleX/angleY，让 model.focus() 的 focusController 控制头部旋转。
+ */
+function applyModelParameters(core: CoreModelLike, p: ModelParameters, mouseTrackingActive: boolean): void {
+  if (!core.setParameterValueById) return
+  // Head Rotation（鼠标跟踪激活时跳过 X/Y，由 focusController 控制）
+  if (!mouseTrackingActive) {
+    core.setParameterValueById('ParamAngleX', p.angleX)
+    core.setParameterValueById('ParamAngleY', p.angleY)
+  }
+  core.setParameterValueById('ParamAngleZ', p.angleZ)
+  // Eyes（注意：ParamEyeBallX/Y 不在此处设置，由鼠标跟踪/空闲眼神控制）
+  core.setParameterValueById('ParamEyeLOpen', p.leftEyeOpen)
+  core.setParameterValueById('ParamEyeROpen', p.rightEyeOpen)
+  core.setParameterValueById('ParamEyeSmile', p.leftEyeSmile)
+  // Eyebrows
+  core.setParameterValueById('ParamBrowLX', p.leftEyebrowLR)
+  core.setParameterValueById('ParamBrowRX', p.rightEyebrowLR)
+  core.setParameterValueById('ParamBrowLY', p.leftEyebrowY)
+  core.setParameterValueById('ParamBrowRY', p.rightEyebrowY)
+  core.setParameterValueById('ParamBrowLAngle', p.leftEyebrowAngle)
+  core.setParameterValueById('ParamBrowRAngle', p.rightEyebrowAngle)
+  core.setParameterValueById('ParamBrowLForm', p.leftEyebrowForm)
+  core.setParameterValueById('ParamBrowRForm', p.rightEyebrowForm)
+  // Mouth
+  core.setParameterValueById('ParamMouthOpenY', p.mouthOpen)
+  core.setParameterValueById('ParamMouthForm', p.mouthForm)
+  // Face
+  core.setParameterValueById('ParamCheek', p.cheek)
+  // Body
+  core.setParameterValueById('ParamBodyAngleX', p.bodyAngleX)
+  core.setParameterValueById('ParamBodyAngleY', p.bodyAngleY)
+  core.setParameterValueById('ParamBodyAngleZ', p.bodyAngleZ)
+  // Breath
+  core.setParameterValueById('ParamBreath', p.breath)
+}
+
+// ---------------- 眨眼状态机 ----------------
+
+interface BlinkState {
+  phase: 'idle' | 'closing' | 'opening'
+  progress: number
+  startLeft: number
+  startRight: number
+  delayMs: number
+  openDurationMs: number
+}
+
+/** 创建眨眼状态机初始值 */
+function createBlinkState(): BlinkState {
+  return {
+    phase: 'idle',
+    progress: 0,
+    startLeft: 1,
+    startRight: 1,
+    delayMs: 3000 + Math.random() * 5000,
+    openDurationMs: 300,
+  }
+}
+
+/** 眨眼时间常量（参考 airi） */
+const BLINK_CLOSE_MS = 75
+const BLINK_OPEN_MIN_MS = 150
+const BLINK_OPEN_MAX_MS = 300
+const BLINK_DELAY_MIN_MS = 3000
+const BLINK_DELAY_MAX_MS = 8000
+
+/** 限制到 0~1 */
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v))
+}
+
+/** easeOutQuad: 1 - (1-t)² */
+function easeOutQuad(t: number): number {
+  return 1 - (1 - t) * (1 - t)
+}
+
+/** easeInQuad: t² */
+function easeInQuad(t: number): number {
+  return t * t
+}
+
+/**
+ * 每帧更新眨眼。支持两种模式（参考 airi 的 useMotionUpdatePluginAutoEyeBlink）：
+ * - Auto：调用 SDK 内置 eyeBlink 控制器，再与用户设置的 eyeOpen 相乘
+ * - Force：自定义状态机（idle → closing → opening），3-8 秒随机间隔
+ *
+ * 眨眼在 applyModelParameters 之后执行（对应 airi 的 final 阶段），
+ * 读回 applyModelParameters 写入的 base 值，乘以眨眼系数后覆盖。
+ */
+function updateBlink(
+  core: CoreModelLike,
+  state: BlinkState,
+  mode: 'auto' | 'force',
+  delta: number,
+  params: ModelParameters,
+): void {
+  const dtMs = delta * (1000 / 60)
+  const baseLeft = params.leftEyeOpen
+  const baseRight = params.rightEyeOpen
+
+  // ---- Auto 模式：SDK eyeBlink × 用户 eyeOpen ----
+  if (mode === 'auto') {
+    // SDK eyeBlink 已在 motionManager.update 中执行，这里读回值并乘以用户系数
+    const curL = core.getParameterValueById?.('ParamEyeLOpen') ?? 1
+    const curR = core.getParameterValueById?.('ParamEyeROpen') ?? 1
+    core.setParameterValueById?.('ParamEyeLOpen', clamp01(curL * baseLeft))
+    core.setParameterValueById?.('ParamEyeROpen', clamp01(curR * baseRight))
+    return
+  }
+
+  // ---- Force 模式：自定义状态机 ----
+
+  // idle 阶段：倒计时到下次眨眼，同时每帧写入 base 值保持眼睛打开
+  if (state.phase === 'idle') {
+    state.delayMs = Math.max(0, state.delayMs - dtMs)
+    if (state.delayMs === 0) {
+      state.phase = 'closing'
+      state.progress = 0
+      state.startLeft = baseLeft
+      state.startRight = baseRight
+    }
+    // idle 阶段也写入 base 值，防止其他参数覆盖
+    core.setParameterValueById?.('ParamEyeLOpen', baseLeft)
+    core.setParameterValueById?.('ParamEyeROpen', baseRight)
+    return
+  }
+
+  // closing 阶段：easeOutQuad 从 start 向 0 收敛
+  if (state.phase === 'closing') {
+    state.progress = Math.min(1, state.progress + dtMs / BLINK_CLOSE_MS)
+    const eased = easeOutQuad(state.progress)
+    core.setParameterValueById?.('ParamEyeLOpen', clamp01(state.startLeft * (1 - eased)))
+    core.setParameterValueById?.('ParamEyeROpen', clamp01(state.startRight * (1 - eased)))
+    if (state.progress >= 1) {
+      state.phase = 'opening'
+      state.progress = 0
+      state.openDurationMs = BLINK_OPEN_MIN_MS + Math.random() * (BLINK_OPEN_MAX_MS - BLINK_OPEN_MIN_MS)
+    }
+    return
+  }
+
+  // opening 阶段：easeInQuad 从 0 向 start 回归
+  if (state.phase === 'opening') {
+    state.progress = Math.min(1, state.progress + dtMs / state.openDurationMs)
+    const eased = easeInQuad(state.progress)
+    core.setParameterValueById?.('ParamEyeLOpen', clamp01(state.startLeft * eased))
+    core.setParameterValueById?.('ParamEyeROpen', clamp01(state.startRight * eased))
+    if (state.progress >= 1) {
+      // 回到 idle，重置延迟
+      state.phase = 'idle'
+      state.delayMs = BLINK_DELAY_MIN_MS + Math.random() * (BLINK_DELAY_MAX_MS - BLINK_DELAY_MIN_MS)
+      core.setParameterValueById?.('ParamEyeLOpen', baseLeft)
+      core.setParameterValueById?.('ParamEyeROpen', baseRight)
+    }
+  }
+}
+
+// ---------------- 空闲眼神 ----------------
+
+interface IdleEyeState {
+  nextSaccadeAt: number
+  targetX: number
+  targetY: number
+  elapsed: number
+  lastSaccadeAt: number
+}
+
+/** 创建空闲眼神状态初始值 */
+function createIdleEyeState(): IdleEyeState {
+  return {
+    nextSaccadeAt: -1,
+    targetX: 0,
+    targetY: 0,
+    elapsed: 0,
+    lastSaccadeAt: 0,
+  }
+}
+
+/**
+ * 加权概率分布生成扫视间隔（参考 airi 的 utils/eye-motions.ts）。
+ * 间隔范围 800ms~4400ms，大部分概率集中在 1200-2400ms。
+ */
+function randomSaccadeInterval(): number {
+  const SACCADE_STEP = 400
+  const cumulative = [0.075, 0.185, 0.310, 0.450, 0.575, 0.625, 0.665, 0.695, 0.715, 1.0]
+  const r = Math.random()
+  for (let i = 0; i < cumulative.length; i++) {
+    if (r <= cumulative[i]!) {
+      return 800 + i * SACCADE_STEP + Math.random() * SACCADE_STEP
+    }
+  }
+  return 800 + 9 * SACCADE_STEP + Math.random() * SACCADE_STEP
+}
+
+/** 线性插值 */
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t
+}
+
+/**
+ * 空闲眼神动画（参考 airi 的 useLive2DIdleEyeFocus）。
+ * 无鼠标跟踪时随机扫视，模拟人类眼球运动：
+ * - 通过 focusController 驱动头部旋转平滑过渡（ParamAngleX/Y/Z）
+ * - 直接写 ParamEyeBallX/Y 用 lerp 平滑（绕过 focusController 的眼球控制）
+ */
+function updateIdleEyes(
+  internal: InternalModelLike,
+  state: IdleEyeState,
+  delta: number,
+): void {
+  const core = internal.coreModel
+  if (!core) return
+  const dtMs = delta * (1000 / 60)
+  state.elapsed += dtMs
+
+  // 到达下次扫视时间，或时间倒流（模型重载），生成新目标
+  if (state.elapsed >= state.nextSaccadeAt || state.elapsed < state.lastSaccadeAt) {
+    state.targetX = Math.random() * 2 - 1            // -1 ~ 1
+    state.targetY = Math.random() * 1.7 - 1          // -1 ~ 0.7
+    state.lastSaccadeAt = state.elapsed
+    state.nextSaccadeAt = state.elapsed + randomSaccadeInterval()
+    // 通过 focusController 设置头部注视方向（乘 0.5 缩小幅度，参考 airi）
+    internal.focusController?.focus?.(state.targetX * 0.5, state.targetY * 0.5, false)
+  }
+
+  // 每帧推进 focusController 插值（驱动 ParamAngleX/Y/Z 平滑过渡）
+  internal.focusController?.update?.((state.elapsed - state.lastSaccadeAt) / 1000)
+
+  // 直接写 ParamEyeBallX/Y，用 lerp 平滑过渡（参考 airi 的 animation.ts）
+  const curX = core.getParameterValueById?.('ParamEyeBallX') ?? 0
+  const curY = core.getParameterValueById?.('ParamEyeBallY') ?? 0
+  core.setParameterValueById?.('ParamEyeBallX', lerp(curX, state.targetX, 0.3))
+  core.setParameterValueById?.('ParamEyeBallY', lerp(curY, state.targetY, 0.3))
+}
+
+// ---------------- 鼠标跟踪 ----------------
+
+/**
+ * 鼠标跟踪（参考 airi 的 useLive2DEyeFocusFor）。
+ * 将鼠标在画布内的位置映射为 -1~1 的归一化坐标，
+ * 通过 lerp 平滑插值后写入 ParamEyeBallX/Y（眼球）和 ParamAngleX/Y（头部旋转）。
+ *
+ * 每帧用 focusRef 中的缓存值朝目标值缓慢逼近（系数 0.08），
+ * 让模型"追"着鼠标走而非瞬间跳到目标位置，视觉上更自然。
+ *
+ * mouse.x/y 是窗口相对坐标（由主进程 screen.getCursorScreenPoint - windowPosition 计算），
+ * 可超出画布范围（鼠标在窗口外时），通过 clamp 限制到 -1~1。
+ *
+ * eyeOffset 是百分比，换算为像素后加到鼠标坐标上，微调注视点基准位置。
+ */
+function updateEyeTracking(
+  core: CoreModelLike,
+  mouse: { x: number; y: number; active: boolean; lastMoveAt: number },
+  animation: ModelAnimationSettings,
+  focus: { x: number; y: number },
+): void {
+  const canvasEl = document.querySelector('canvas')
+  if (!canvasEl) return
+
+  const rect = canvasEl.getBoundingClientRect()
+  // mouse.x/y 是窗口相对坐标，rect.left/top 在透明窗口中通常为 0
+  // eyeOffset: 百分比 → 像素偏移
+  const offsetX = (animation.eyeOffsetX / 100) * rect.width
+  const offsetY = (animation.eyeOffsetY / 100) * rect.height
+  const cssX = mouse.x - rect.left + offsetX
+  const cssY = mouse.y - rect.top + offsetY
+
+  // 归一化到 -1~1（画布中心为 0,0），clamp 防止超出范围
+  const targetX = Math.max(-1, Math.min(1, (cssX / rect.width) * 2 - 1))
+  const targetY = Math.max(-1, Math.min(1, (cssY / rect.height) * 2 - 1))
+
+  // lerp 平滑：每帧朝目标移动 8%，产生缓动的追踪效果
+  focus.x = lerp(focus.x, targetX, 0.08)
+  focus.y = lerp(focus.y, targetY, 0.08)
+
+  // 眼球跟随（ParamEyeBallX/Y 范围 -1~1）
+  core.setParameterValueById?.('ParamEyeBallX', focus.x)
+  core.setParameterValueById?.('ParamEyeBallY', -focus.y) // Y 轴翻转：鼠标在上方时眼睛看上
+
+  // 头部旋转跟随（ParamAngleX/Y 范围 -30~30）
+  core.setParameterValueById?.('ParamAngleX', focus.x * 30)
+  core.setParameterValueById?.('ParamAngleY', -focus.y * 30)
 }

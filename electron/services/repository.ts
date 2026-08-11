@@ -10,6 +10,7 @@ import type {
   ChatMessage,
   Live2DModelMeta,
   MemoryItem,
+  ModelSettings,
   SessionDetail,
   SessionIndexItem,
 } from '../../src/types'
@@ -291,4 +292,63 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
 /** Cubism Core 是否已就绪 */
 export async function isCorePresent(): Promise<boolean> {
   return fileExists(paths.coreFile)
+}
+
+// ---------------- 模型设置 ----------------
+
+/** 模型设置默认值（与前端 DEFAULT_MODEL_SETTINGS 保持一致） */
+const DEFAULT_MODEL_SETTINGS: ModelSettings = {
+  parameters: {
+    angleX: 0, angleY: 0, angleZ: 0,
+    leftEyeOpen: 1, rightEyeOpen: 1, leftEyeSmile: 0,
+    leftEyebrowLR: 0, rightEyebrowLR: 0,
+    leftEyebrowY: 0, rightEyebrowY: 0,
+    leftEyebrowAngle: 0, rightEyebrowAngle: 0,
+    leftEyebrowForm: 0, rightEyebrowForm: 0,
+    mouthOpen: 0, mouthForm: 0,
+    cheek: 0,
+    bodyAngleX: 0, bodyAngleY: 0, bodyAngleZ: 0,
+    breath: 0,
+  },
+  animation: {
+    mouseTracking: true,
+    eyeOffsetX: 0, eyeOffsetY: 0,
+    idleEyeMovement: true,
+    enableBlink: true,
+    blinkMode: 'force',
+    idleAnimation: '',
+    renderScale: 2,
+    maxFps: 0,
+    dropShadow: true,
+    expressionEnabled: false,
+  },
+  view: { scale: 1, x: 0, y: 0 },
+}
+
+/** 读取模型设置，缺失字段用默认值补全 */
+export async function getModelSettings(): Promise<ModelSettings> {
+  const saved = await readJson<Partial<ModelSettings> | null>(paths.modelSettingsFile, null)
+  if (!saved) return DEFAULT_MODEL_SETTINGS
+  return {
+    parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(saved.parameters ?? {}) },
+    animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
+    view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
+  }
+}
+
+/** 深度合并保存模型设置（部分更新） */
+export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<ModelSettings> {
+  const result = await mutateJson<Partial<ModelSettings> | null>(paths.modelSettingsFile, null, (current) => {
+    const base = current ?? {}
+    const next: Partial<ModelSettings> = { ...base }
+    if (patch.parameters) next.parameters = { ...(base.parameters ?? {}), ...patch.parameters }
+    if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
+    if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
+    return next
+  })
+  return {
+    parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(result?.parameters ?? {}) },
+    animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
+    view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
+  }
 }

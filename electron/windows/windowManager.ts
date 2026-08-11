@@ -7,6 +7,7 @@ import path from 'path'
 import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWindow'
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
+import type { ModelSettings } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -76,6 +77,13 @@ class WindowManager {
   notifyCoreChanged(): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:core-changed')
+    }
+  }
+
+  /** 模型设置变化后广播给桌宠窗口（实时更新参数/动画） */
+  notifyModelSettingsChanged(settings: ModelSettings): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:model-settings-changed', settings)
     }
   }
 

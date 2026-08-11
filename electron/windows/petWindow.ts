@@ -1,7 +1,7 @@
 /**
  * 桌宠窗口：无边框、透明背景、始终置顶、可拖动缩放、不穿透鼠标。
  */
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, screen } from 'electron'
 import path from 'path'
 import { loadWindowPage } from './base'
 
@@ -66,6 +66,33 @@ export function createPetWindow(): BrowserWindow {
       win.hide()
     }
   })
+
+  // ---- 全局鼠标跟踪 ----
+  // 透明窗口 + -webkit-app-region: drag 导致 window.mousemove 无法正常触发，
+  // 且桌宠窗口仅 300x440，需要跟踪屏幕任意位置的鼠标（参考 airi 桌面端用 OS API）。
+  // 通过 screen.getCursorScreenPoint() 轮询全局鼠标坐标，转换为窗口相对坐标后发送给渲染进程。
+  let cursorTimer: ReturnType<typeof setInterval> | null = null
+  const startCursorTracking = () => {
+    if (cursorTimer) return
+    cursorTimer = setInterval(() => {
+      if (win.isDestroyed() || !win.isVisible()) return
+      const pos = screen.getCursorScreenPoint()
+      const [winX, winY] = win.getPosition()
+      win.webContents.send('cursor:move', {
+        x: pos.x - (winX ?? 0),
+        y: pos.y - (winY ?? 0),
+      })
+    }, 33) // ~30fps，足够流畅的眼球跟踪
+  }
+  const stopCursorTracking = () => {
+    if (cursorTimer) {
+      clearInterval(cursorTimer)
+      cursorTimer = null
+    }
+  }
+  win.on('show', startCursorTracking)
+  win.on('hide', stopCursorTracking)
+  win.on('closed', stopCursorTracking)
 
   void loadWindowPage(win, 'pet.html')
   return win

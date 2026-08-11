@@ -69,9 +69,85 @@ export interface Live2DModelMeta {
   id: string
   /** 展示名，默认取导入文件夹名 */
   name: string
-  /** model3.json 相对 userData/models/{id}/ 的路径 */
+  /** model3 json 相对 userData/models/{id}/ 的路径 */
   model3Path: string
   createdAt: number
+}
+
+// ---------------- Live2D 模型设置 ----------------
+
+/** 眨眼模式：Auto = SDK 内置眨眼曲线，Force = 自定义状态机 */
+export type BlinkMode = 'auto' | 'force'
+
+/** 模型参数（对应 Cubism 标准参数 ID） */
+export interface ModelParameters {
+  // Head Rotation（-30~30）
+  angleX: number
+  angleY: number
+  angleZ: number
+  // Eyes（0~1）
+  leftEyeOpen: number
+  rightEyeOpen: number
+  leftEyeSmile: number
+  // Eyebrows（-1~1）
+  leftEyebrowLR: number
+  rightEyebrowLR: number
+  leftEyebrowY: number
+  rightEyebrowY: number
+  leftEyebrowAngle: number
+  rightEyebrowAngle: number
+  leftEyebrowForm: number
+  rightEyebrowForm: number
+  // Mouth（0~1 / -1~1）
+  mouthOpen: number
+  mouthForm: number
+  // Face（0~1）
+  cheek: number
+  // Body（-30~30）
+  bodyAngleX: number
+  bodyAngleY: number
+  bodyAngleZ: number
+  // Breath（-1~1）
+  breath: number
+}
+
+/** 动画与渲染设置 */
+export interface ModelAnimationSettings {
+  /** 鼠标跟踪 */
+  mouseTracking: boolean
+  /** 眼睛偏移百分比（X/Y） */
+  eyeOffsetX: number
+  eyeOffsetY: number
+  /** 空闲眼神动画 */
+  idleEyeMovement: boolean
+  /** 启用眨眼 */
+  enableBlink: boolean
+  /** 眨眼模式 */
+  blinkMode: BlinkMode
+  /** 空闲动作组名（空字符串 = 不指定） */
+  idleAnimation: string
+  /** 渲染缩放（影响清晰度，0.5~2） */
+  renderScale: number
+  /** 最大 FPS（0 = 无限制） */
+  maxFps: number
+  /** 投射阴影 */
+  dropShadow: boolean
+  /** 表情系统 */
+  expressionEnabled: boolean
+}
+
+/** 缩放与位置 */
+export interface ModelViewSettings {
+  scale: number
+  x: number
+  y: number
+}
+
+/** 完整的模型设置（持久化到 model-settings.json） */
+export interface ModelSettings {
+  parameters: ModelParameters
+  animation: ModelAnimationSettings
+  view: ModelViewSettings
 }
 
 /** 会话导出结果为 Markdown 时返回 */
@@ -149,6 +225,8 @@ export interface WindowApi {
   }
   model: {
     list: () => Promise<Live2DModelMeta[]>
+    /** 读取指定模型的动作组名列表（从 model3.json 的 FileReferences.Motions 解析） */
+    motionGroups: (modelId: string) => Promise<string[]>
     /** 弹原生文件夹选择框并导入 Live2D 模型 */
     importFromFolder: () => Promise<Live2DModelMeta | null>
     remove: (modelId: string) => Promise<void>
@@ -197,5 +275,16 @@ export interface WindowApi {
     onCoreChanged: (cb: () => void) => () => void
     /** 获取 Live2D 模型资源的 file:// 前缀（用于拼 model3.json 地址） */
     modelUrl: (modelId: string, model3Path: string) => string
+    /** 订阅模型设置变化（设置窗口修改后广播到桌宠窗口） */
+    onModelSettingsChanged: (cb: (settings: ModelSettings) => void) => () => void
+    /** 订阅全局鼠标坐标变化（窗口相对坐标，由主进程轮询 screen.getCursorScreenPoint） */
+    onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
+  }
+  /** 模型设置（缩放/位置/动画/参数） */
+  modelSettings: {
+    /** 读取持久化的模型设置 */
+    get: () => Promise<ModelSettings>
+    /** 保存模型设置（部分合并），并广播到桌宠窗口 */
+    save: (patch: Partial<ModelSettings>) => Promise<void>
   }
 }

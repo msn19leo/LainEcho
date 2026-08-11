@@ -376,3 +376,39 @@ html {
 [data-sonner-toaster][data-theme='light'] {
   --normal-border: color-mix(in oklab, var(--primary-400) 20%, transparent);
 }
+
+/* ============================================================================
+ * Slider 滑块 —— Cyber-Kawaii 风格（青色 handle + 主色光晕）
+ * ========================================================================== */
+.slider-cyber {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+}
+.slider-cyber::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary-400);
+  border: 2px solid var(--bg-base);
+  box-shadow: 0 0 8px var(--primary-glow);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+.slider-cyber::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+.slider-cyber::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary-400);
+  border: 2px solid var(--bg-base);
+  box-shadow: 0 0 8px var(--primary-glow);
+  cursor: pointer;
+}

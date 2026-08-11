@@ -54,6 +54,9 @@ export const paths = {
   get coreFile() {
     return path.join(this.coreDir, 'live2dcubismcore.min.js')
   },
+  get modelSettingsFile() {
+    return path.join(this.dataDir, 'model-settings.json')
+  },
   sessionFile(id: string) {
     return path.join(this.sessionsDir, `${id}.json`)
   },

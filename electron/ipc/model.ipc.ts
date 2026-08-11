@@ -27,6 +27,25 @@ async function findModel3(dirPath: string): Promise<string | null> {
 export function registerModelIpc(): void {
   ipcMain.handle('model:list', (): Promise<Live2DModelMeta[]> => listModels())
 
+  /** 读取指定模型的 model3.json，返回动作组名列表 */
+  ipcMain.handle('model:motion-groups', async (_e, modelId: string): Promise<string[]> => {
+    try {
+      const models = await listModels()
+      const meta = models.find((m) => m.id === modelId)
+      if (!meta) return []
+      const model3Path = path.join(paths.modelDir(modelId), meta.model3Path)
+      const raw = await fs.readFile(model3Path, 'utf-8')
+      const json = JSON.parse(raw) as {
+        FileReferences?: { Motions?: Record<string, unknown[]> }
+      }
+      const motions = json.FileReferences?.Motions
+      if (!motions || typeof motions !== 'object') return []
+      return Object.keys(motions).sort()
+    } catch {
+      return []
+    }
+  })
+
   ipcMain.handle('model:import-from-folder', async () => {
     const result = await dialog.showOpenDialog({
       title: '选择 Live2D 模型文件夹',

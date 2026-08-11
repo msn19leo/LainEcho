@@ -6,7 +6,7 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { StreamDonePayload, StreamErrorPayload, WindowApi } from '../src/types'
+import type { StreamDonePayload, StreamErrorPayload, ModelSettings, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
@@ -55,6 +55,7 @@ const api: WindowApi = {
   },
   model: {
     list: () => ipcRenderer.invoke('model:list'),
+    motionGroups: (modelId) => ipcRenderer.invoke('model:motion-groups', modelId),
     importFromFolder: () => ipcRenderer.invoke('model:import-from-folder'),
     remove: (modelId) => ipcRenderer.invoke('model:remove', modelId),
     coreStatus: () => ipcRenderer.invoke('model:core-status'),
@@ -104,7 +105,22 @@ const api: WindowApi = {
       ipcRenderer.on('pet:core-changed', listener)
       return () => ipcRenderer.removeListener('pet:core-changed', listener)
     },
+    onModelSettingsChanged: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, settings: ModelSettings) => cb(settings)
+      ipcRenderer.on('pet:model-settings-changed', listener)
+      return () => ipcRenderer.removeListener('pet:model-settings-changed', listener)
+    },
+    /** 全局鼠标坐标变化回调（窗口相对坐标，由主进程 screen.getCursorScreenPoint 轮询） */
+    onCursorMove: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, pos: { x: number; y: number }) => cb(pos)
+      ipcRenderer.on('cursor:move', listener)
+      return () => ipcRenderer.removeListener('cursor:move', listener)
+    },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
+  },
+  modelSettings: {
+    get: () => ipcRenderer.invoke('model-settings:get'),
+    save: (patch) => ipcRenderer.invoke('model-settings:save', patch),
   },
 }
 

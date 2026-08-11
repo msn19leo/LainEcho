@@ -6,11 +6,11 @@
 import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
+  Bot,
   BrainCircuit,
   ChevronLeft,
   ChevronRight,
   Database,
-  Drama,
   House,
   KeyRound,
   PersonStanding,
@@ -39,7 +39,7 @@ interface ModuleDef {
 }
 
 const MODULES: ModuleDef[] = [
-  { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Drama },
+  { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Bot },
   { id: 'model', title: '角色模型', desc: 'Live2D 模型导入与管理。', icon: PersonStanding },
   { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },

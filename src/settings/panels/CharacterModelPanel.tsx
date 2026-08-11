@@ -1,13 +1,36 @@
 /**
- * 角色模型面板：Cubism Core 引导 + Live2D 模型导入/管理。
+ * 角色模型面板：Cubism Core 引导 + Live2D 模型导入/管理 + 模型设置（缩放/位置/动画）。
+ * 模型设置通过 zustand store 管理，变更后通过 IPC 广播到桌宠窗口实时生效。
  */
 import { useEffect, useState } from 'react'
-import { AlertCircle, CheckCircle2, PersonStanding, Plus } from 'lucide-react'
+import {
+  AlertCircle,
+  CheckCircle2,
+  Maximize2,
+  PersonStanding,
+  Play,
+  Plus,
+} from 'lucide-react'
 import { api } from '../../api'
-import type { Live2DModelMeta } from '../../types'
-import { Button, Card, ConfirmModal, Empty, Loading } from '../../components/ui'
+import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode } from '../../types'
+import {
+  AccordionItem,
+  Button,
+  Card,
+  ConfirmModal,
+  Empty,
+  Loading,
+  SegmentedControl,
+  Select,
+  Slider,
+  Switch,
+} from '../../components/ui'
 import { toast } from '../../components/toast'
 import { formatRelativeTime } from '../../lib/utils'
+import {
+  DEFAULT_VIEW,
+  useModelSettingsStore,
+} from '../../store/modelSettingsStore'
 
 export function CharacterModelPanel() {
   const [corePresent, setCorePresent] = useState(false)
@@ -15,17 +38,33 @@ export function CharacterModelPanel() {
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
   const [deleting, setDeleting] = useState<Live2DModelMeta | null>(null)
+  /** 可用的动作组列表（从模型 model3.json 读取） */
+  const [motionGroups, setMotionGroups] = useState<string[]>([])
+
+  const { settings, loaded, load, save } = useModelSettingsStore()
 
   const refresh = async () => {
     const [core, list] = await Promise.all([api.model.coreStatus(), api.model.list()])
     setCorePresent(core.present)
     setModels(list)
     setLoading(false)
+    // 读取第一个模型的动作组（用于空闲动作下拉框）
+    if (list.length > 0) {
+      try {
+        const groups = await api.model.motionGroups(list[0]!.id)
+        setMotionGroups(groups)
+      } catch {
+        setMotionGroups([])
+      }
+    } else {
+      setMotionGroups([])
+    }
   }
 
   useEffect(() => {
     void refresh()
-  }, [])
+    void load()
+  }, [load])
 
   const handleImportCore = async () => {
     try {
@@ -68,6 +107,18 @@ export function CharacterModelPanel() {
     } catch (err) {
       toast(err instanceof Error ? err.message : '删除失败', 'error')
     }
+  }
+
+  // ---- 参数更新辅助函数 ----
+
+  /** 更新单个动画设置 */
+  const updateAnim = <K extends keyof ModelAnimationSettings>(key: K, value: ModelAnimationSettings[K]) => {
+    void save({ animation: { ...settings.animation, [key]: value } })
+  }
+
+  /** 更新缩放/位置 */
+  const updateView = (key: 'scale' | 'x' | 'y', value: number) => {
+    void save({ view: { ...settings.view, [key]: value } })
   }
 
   return (
@@ -140,6 +191,150 @@ export function CharacterModelPanel() {
             </Card>
           ))}
         </div>
+      )}
+
+      {/* ==================== 模型设置分区 ==================== */}
+
+      {!loaded ? (
+        <Loading text="加载模型设置…" />
+      ) : (
+        <>
+          {/* 1. 缩放与位置 */}
+          <AccordionItem title="缩放与位置" icon={<Maximize2 size={15} strokeWidth={1.75} />}>
+            <Slider
+              label="缩放"
+              value={settings.view.scale}
+              min={0.1}
+              max={3}
+              step={0.01}
+              defaultValue={DEFAULT_VIEW.scale}
+              onChange={(v) => updateView('scale', v)}
+              format={(v) => v.toFixed(2)}
+            />
+            <Slider
+              label="X"
+              value={settings.view.x}
+              min={-500}
+              max={500}
+              step={1}
+              defaultValue={0}
+              onChange={(v) => updateView('x', v)}
+              format={(v) => v.toFixed(0)}
+            />
+            <Slider
+              label="Y"
+              value={settings.view.y}
+              min={-500}
+              max={500}
+              step={1}
+              defaultValue={0}
+              onChange={(v) => updateView('y', v)}
+              format={(v) => v.toFixed(0)}
+            />
+          </AccordionItem>
+
+          {/* 2. 动画 */}
+          <AccordionItem title="动画" icon={<Play size={15} strokeWidth={1.75} />}>
+            {/* 鼠标跟踪 */}
+            <div className="border-b border-border py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[13px] font-medium text-text-2">鼠标跟踪</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                    模型头部和眼球跟随光标移动。光标停止后恢复空闲眼神。
+                  </div>
+                </div>
+                <Switch checked={settings.animation.mouseTracking} onChange={(v) => updateAnim('mouseTracking', v)} />
+              </div>
+              {settings.animation.mouseTracking && (
+                <div className="mt-3 space-y-1">
+                  <div className="mb-1 text-xs font-medium text-text-muted">眼睛偏移 (%)</div>
+                  <Slider
+                    label="X"
+                    value={settings.animation.eyeOffsetX}
+                    min={-100}
+                    max={100}
+                    step={1}
+                    defaultValue={0}
+                    onChange={(v) => updateAnim('eyeOffsetX', v)}
+                    format={(v) => v.toFixed(0)}
+                  />
+                  <Slider
+                    label="Y"
+                    value={settings.animation.eyeOffsetY}
+                    min={-100}
+                    max={100}
+                    step={1}
+                    defaultValue={0}
+                    onChange={(v) => updateAnim('eyeOffsetY', v)}
+                    format={(v) => v.toFixed(0)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* 空闲眼神 */}
+            <div className="border-b border-border py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[13px] font-medium text-text-2">空闲眼神动画</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                    无光标焦点时随机看向四周，模拟自然眼球运动。
+                  </div>
+                </div>
+                <Switch checked={settings.animation.idleEyeMovement} onChange={(v) => updateAnim('idleEyeMovement', v)} />
+              </div>
+            </div>
+
+            {/* 眨眼 */}
+            <div className="border-b border-border py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[13px] font-medium text-text-2">眨眼</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                    让模型自主眨眼。
+                  </div>
+                </div>
+                <Switch checked={settings.animation.enableBlink} onChange={(v) => updateAnim('enableBlink', v)} />
+              </div>
+              {settings.animation.enableBlink && (
+                <div className="mt-3">
+                  <div className="mb-2 text-xs font-medium text-text-muted">眨眼模式</div>
+                  <SegmentedControl<BlinkMode>
+                    value={settings.animation.blinkMode}
+                    onChange={(v) => updateAnim('blinkMode', v)}
+                    options={[
+                      { value: 'auto', label: '内置' },
+                      { value: 'force', label: '强制' },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-xs text-text-muted">
+                    {settings.animation.blinkMode === 'auto'
+                      ? '使用模型内置眨眼曲线。'
+                      : '使用自定义眨眼计时器（适用于无眨眼曲线的模型）。'}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* 空闲动作 */}
+            <div className="py-2.5">
+              <div className="mb-2 text-[13px] font-medium text-text-2">空闲动作</div>
+              <Select
+                value={settings.animation.idleAnimation}
+                onChange={(e) => updateAnim('idleAnimation', e.target.value)}
+              >
+                <option value="">默认（随机）</option>
+                {motionGroups.map((g) => (
+                  <option key={g} value={g}>{g}</option>
+                ))}
+              </Select>
+              {motionGroups.length === 0 && (
+                <p className="mt-1 text-xs text-text-muted">未检测到可用动作组</p>
+              )}
+            </div>
+          </AccordionItem>
+        </>
       )}
 
       <ConfirmModal
