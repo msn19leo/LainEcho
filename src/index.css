@@ -1,23 +1,193 @@
 @import 'tailwindcss';
 
-@theme {
-  --color-surface: #0f1115;
-  --color-surface-2: #151922;
-  --color-panel: #171a21;
-  --color-card: #1e222b;
-  --color-card-hover: #262b36;
-  --color-border: #2a2f3a;
-  --color-border-strong: #363c49;
-  --color-text: #e6e8ec;
-  --color-text-2: #9aa1ad;
-  --color-text-muted: #6b7280;
-  --color-accent: #8b5cf6;
-  --color-accent-2: #6366f1;
-  --color-danger: #ef4444;
-  --color-success: #22c55e;
-  --color-warning: #f59e0b;
-  --font-sans:
-    'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Helvetica Neue', Arial, system-ui, sans-serif;
+/* ============================================================================
+ * Design Tokens —— 「赛博可爱（Cyber-Kawaii）」配色逻辑（参考 moeru-ai/airi）
+ *
+ * 严格遵循的配色核心原则：
+ *   - 禁止紫色系（含紫、紫红、紫罗兰等任何紫色调）。
+ *   - 浅色模式：白色 #FFFFFF 为基底，浅蓝色 #E8F4FD → #4A9EFF 为主色调。
+ *   - 深色模式：黑色 #0A0A0A / #111111 为基底，青色 #00D4FF → #0088CC 为主色调。
+ *   - 点缀色：浅粉色 #FFB6C1 → #FF8A9E（深色强调至 #FF6B8A）。
+ *
+ * 主题通过 <html data-theme="dark|light"> 切换；默认深色（:root 即深色定义）。
+ * 旧 token 名（surface/card/text/border/accent…）经 @theme inline 映射到这些
+ * 变量上，既有组件的类名无需改动即可跟随主题与设计语言升级。
+ * ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* —— 背景层级（纯黑基底 + 极深蓝黑分割） —— */
+  --bg-base: #0a0a0a; /* 近纯黑，赛博夜空底 */
+  --bg-gradient: radial-gradient(ellipse at top right, #0d1116 0%, #0a0a0a 60%);
+  --bg-surface-2: #111111; /* 导航 / 标题栏 / 输入区 */
+  --bg-panel: #111111; /* 弹窗 / Drawer 面板 */
+  --bg-surface: #0f0f0f; /* 卡片默认背景 */
+  --bg-surface-hover: #161616; /* 卡片 hover 背景 */
+  --bg-region: #1a1f2e; /* 极深蓝黑，区域分割 */
+  --bg-elevated: rgba(0, 212, 255, 0.05); /* 毛玻璃叠加层，带青色调 */
+
+  /* —— 品牌主色（青色系，赛博荧光） ——
+   * 从极浅 #E0F7FF（文字高亮）到主色 #00D4FF 到深色 #0088CC。 */
+  --primary-100: #e0f7ff; /* 极浅，用于文字高亮 */
+  --primary-400: #00d4ff; /* 主色 */
+  --primary-500: #00b8e6; /* 主色略深 */
+  --primary-600: #0088cc; /* 深色 */
+  --primary-700: #006699; /* 更深，按压态 */
+  --primary-glow: rgba(0, 212, 255, 0.35);
+
+  /* —— 点缀粉色（贯穿全局的品牌锚点，深色下更突出） —— */
+  --accent-300: #ffd0d8; /* 浅粉高光 */
+  --accent-400: #ffb6c1; /* 浅粉 */
+  --accent-500: #ff6b8a; /* 强调粉（深色模式） */
+  --accent-600: #e85577; /* 按压态 */
+  --accent-glow: rgba(255, 107, 138, 0.3);
+
+  /* —— 文字 —— */
+  --text-primary: #e8f0f8;
+  --text-secondary: #8a9bb0;
+  --text-tertiary: #5a6b7c;
+  --text-disabled: #3a4554;
+
+  /* —— 边框（带主色调，非中性灰） —— */
+  --border-subtle: rgba(0, 212, 255, 0.15);
+  --border-strong: rgba(0, 212, 255, 0.35);
+
+  /* —— 状态色 —— */
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+
+  /* —— 渐变与光效（品牌辨识度关键） ——
+   * airi 风格：所有渐变叠加主色/粉光晕。 */
+  --gradient-brand: linear-gradient(135deg, #00d4ff 0%, #ff6b8a 100%);
+  --gradient-primary: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
+  --gradient-accent: linear-gradient(135deg, #ffb6c1 0%, #ff6b8a 100%);
+  --on-brand: #06141a; /* 青→粉渐变上的文字色（深青黑） */
+
+  /* 毛玻璃规格：blur(20px) + 主色调半透明背景 + 主色调 0.15 边框 */
+  --glass-bg: rgba(10, 10, 10, 0.8);
+  --glass-border: rgba(0, 212, 255, 0.15);
+  --glass-blur: 20px;
+
+  --shadow-glow-primary: 0 0 24px var(--primary-glow);
+  --shadow-glow-accent: 0 0 24px var(--accent-glow);
+  --shadow-card: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-card-hover: 0 12px 32px rgba(0, 0, 0, 0.5);
+
+  /* —— 圆角哲学（禁止 4px/6px 小圆角） ——
+   * 主容器 24px；按钮/头像 16px 或 50%；输入框 12px。 */
+  --radius-sm: 12px; /* 输入框 */
+  --radius-md: 16px; /* 按钮 / 头像 */
+  --radius-lg: 24px; /* 主容器 */
+  --radius-xl: 28px; /* 大型面板 / Modal */
+  --radius-full: 999px;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  /* —— 背景层级（纯白基底 + 极浅蓝灰分割） —— */
+  --bg-base: #ffffff;
+  --bg-gradient: radial-gradient(ellipse at top right, #ffffff 0%, #e8f4fd 60%);
+  --bg-surface-2: #f5f8fc; /* 区域分割 */
+  --bg-panel: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #f5f8fc;
+  --bg-region: #e8f4fd; /* 极浅蓝，区域分割 */
+  --bg-elevated: rgba(74, 158, 255, 0.04);
+
+  /* —— 品牌主色（浅蓝系，柔和克制） ——
+   * 从极浅 #E8F4FD 到主色 #4A9EFF 到深色 #2B7BD4。 */
+  --primary-100: #e8f4fd; /* 极浅，区域高亮背景 */
+  --primary-400: #4a9eff; /* 主色 */
+  --primary-500: #4a9eff; /* 主色 */
+  --primary-600: #2b7bd4; /* 深色 */
+  --primary-700: #1e6bb0; /* 按压态 */
+  --primary-glow: rgba(74, 158, 255, 0.18);
+
+  /* —— 点缀粉色 —— */
+  --accent-300: #ffd0d8;
+  --accent-400: #ffb6c1; /* 浅粉 */
+  --accent-500: #ff8a9e; /* 强调粉 */
+  --accent-600: #e07088;
+  --accent-glow: rgba(255, 138, 158, 0.22);
+
+  /* —— 文字 —— */
+  --text-primary: #1a2332;
+  --text-secondary: #5a6b7c;
+  --text-tertiary: #8a9bb0;
+  --text-disabled: #b6c2d1;
+
+  /* —— 边框（带主色调） —— */
+  --border-subtle: rgba(74, 158, 255, 0.15);
+  --border-strong: rgba(74, 158, 255, 0.35);
+
+  /* —— 状态色 —— */
+  --success: #059669;
+  --warning: #d97706;
+  --danger: #dc2626;
+
+  /* —— 渐变与光效 —— */
+  --gradient-brand: linear-gradient(135deg, #4a9eff 0%, #ff8a9e 100%);
+  --gradient-primary: linear-gradient(135deg, #4a9eff 0%, #2b7bd4 100%);
+  --gradient-accent: linear-gradient(135deg, #ffb6c1 0%, #ff8a9e 100%);
+  --on-brand: #ffffff; /* 蓝→粉渐变上的文字色（白） */
+
+  /* 毛玻璃规格 */
+  --glass-bg: rgba(255, 255, 255, 0.7);
+  --glass-border: rgba(74, 158, 255, 0.15);
+  --glass-blur: 20px;
+
+  --shadow-glow-primary: 0 0 24px var(--primary-glow);
+  --shadow-glow-accent: 0 0 24px var(--accent-glow);
+  --shadow-card: 0 4px 16px rgba(16, 27, 38, 0.08);
+  --shadow-card-hover: 0 12px 32px rgba(16, 27, 38, 0.14);
+}
+
+/* 把 tokens 映射进 Tailwind 工具类。inline 模式让工具类在「使用处」展开为 var() 引用，
+ * 因此 data-theme 切换时所有颜色/边框/圆角即时生效。 */
+@theme inline {
+  /* 旧 token 映射（既有组件类名不变，视觉跟随新系统） */
+  --color-surface: var(--bg-base);
+  --color-surface-2: var(--bg-surface-2);
+  --color-panel: var(--bg-panel);
+  --color-card: var(--bg-surface);
+  --color-card-hover: var(--bg-surface-hover);
+  --color-border: var(--border-subtle);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text-primary);
+  --color-text-2: var(--text-secondary);
+  --color-text-muted: var(--text-tertiary);
+  --color-accent: var(--primary-500);
+  --color-accent-2: var(--accent-500);
+  --color-danger: var(--danger);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+
+  /* 新 token 映射 */
+  --color-primary-100: var(--primary-100);
+  --color-primary-400: var(--primary-400);
+  --color-primary-500: var(--primary-500);
+  --color-primary-600: var(--primary-600);
+  --color-primary-700: var(--primary-700);
+  --color-accent-300: var(--accent-300);
+  --color-accent-400: var(--accent-400);
+  --color-accent-500: var(--accent-500);
+  --color-accent-600: var(--accent-600);
+  --color-text-tertiary: var(--text-tertiary);
+  --color-text-disabled: var(--text-disabled);
+  --color-bg-base: var(--bg-base);
+  --color-bg-surface: var(--bg-surface);
+  --color-bg-surface-hover: var(--bg-surface-hover);
+  --color-bg-region: var(--bg-region);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-bg-panel: var(--bg-panel);
+  --color-bg-surface-2: var(--bg-surface-2);
+  --color-border-subtle: var(--border-subtle);
+  --color-border-strong: var(--border-strong);
+  --color-primary-glow: var(--primary-glow);
+  --color-accent-glow: var(--accent-glow);
 }
 
 html,
@@ -26,10 +196,17 @@ body {
   padding: 0;
   height: 100%;
   background: transparent;
-  color: var(--color-text);
-  font-family: var(--font-sans);
+  color: var(--text-primary);
+  font-family:
+    'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Helvetica Neue', Arial, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   user-select: none;
+}
+
+/* 三窗口根容器：统一铺品牌渐变背景 */
+.app-window {
+  background: var(--bg-gradient);
+  color: var(--text-primary);
 }
 
 /* 桌宠窗口透明背景 */
@@ -38,11 +215,30 @@ body.pet-body {
   overflow: hidden;
 }
 
+/* 聊天窗口：窗口已设 transparent: true，body 保持透明，
+ * 仅显示 FloatingDock 浮动面板，窗口紧贴 Dock 可视区域无多余透明区。 */
+body.chat-body {
+  background: transparent;
+  color: var(--text-primary);
+}
+
 #root {
   height: 100%;
 }
 
-/* 细滚动条 */
+/* 主题切换全局过渡（airi 风格的平滑切换） */
+html {
+  transition:
+    background-color 0.3s ease,
+    color 0.3s ease;
+}
+* {
+  transition-property: background-color, border-color, color, box-shadow;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
+}
+
+/* 细滚动条（圆角对齐 12px 规范，禁止 4px） */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -51,11 +247,11 @@ body.pet-body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-border-strong);
-  border-radius: 4px;
+  background: var(--border-strong);
+  border-radius: var(--radius-sm);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4a5160;
+  background: var(--primary-400);
 }
 
 /* 文本选择仅限聊天正文等需要的地方 */
@@ -71,18 +267,112 @@ body.pet-body {
   -webkit-app-region: no-drag;
 }
 
-/* 打字机光标 */
+/* ============================================================================
+ * 毛玻璃工具类（airi 光晕感核心）—— 统一 blur(20px) + 主色调边框
+ * ========================================================================== */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+}
+.glass-strong {
+  background: color-mix(in oklab, var(--glass-bg) 88%, transparent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  border: 1px solid var(--glass-border);
+}
+
+/* 光晕工具类：在边框/渐变上叠加主色或粉色 drop-shadow */
+.glow-primary {
+  box-shadow: var(--shadow-glow-primary);
+}
+.glow-accent {
+  box-shadow: var(--shadow-glow-accent);
+}
+.drop-glow-primary {
+  filter: drop-shadow(0 0 6px var(--primary-glow));
+}
+.drop-glow-accent {
+  filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
+/* 品牌渐变背景。
+ * 必须用 background-image：linear-gradient 无法作为 background-color 生效，
+ * 直接 bg-[var(--gradient-brand)] 会被浏览器丢弃，导致按钮背景透明、白字在浅色面板上不可见。 */
+.bg-brand-gradient {
+  background-image: var(--gradient-brand);
+}
+.bg-primary-gradient {
+  background-image: var(--gradient-primary);
+}
+.bg-accent-gradient {
+  background-image: var(--gradient-accent);
+}
+
+/* ============================================================================
+ * 打字机光标 —— 流光渐变闪烁（动效强度 7）
+ * ========================================================================== */
 .streaming-cursor::after {
   content: '▍';
-  color: var(--color-accent);
-  animation: blink 0.8s step-end infinite;
+  margin-left: 1px;
+  background: linear-gradient(
+    180deg,
+    var(--primary-400) 0%,
+    var(--accent-500) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: stream-blink 0.9s ease-in-out infinite;
 }
-@keyframes blink {
+@keyframes stream-blink {
   0%,
   100% {
     opacity: 1;
+    filter: drop-shadow(0 0 4px var(--primary-glow));
   }
   50% {
-    opacity: 0;
+    opacity: 0.3;
+    filter: drop-shadow(0 0 2px var(--accent-glow));
   }
+}
+
+/* 品牌渐变环形加载 */
+.brand-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 3px solid var(--border-subtle);
+  border-top-color: var(--primary-400);
+  border-right-color: var(--accent-500);
+  animation: spin 0.8s linear infinite;
+  filter: drop-shadow(0 0 6px var(--primary-glow));
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* sonner toast 主题对齐 Design Tokens */
+[data-sonner-toaster] {
+  --normal-bg: var(--bg-panel);
+  --normal-border: var(--border-subtle);
+  --normal-text: var(--text-primary);
+  --normal-shadow: var(--shadow-card-hover);
+  --success-bg: var(--bg-panel);
+  --success-border: color-mix(in oklab, var(--success) 45%, transparent);
+  --success-text: var(--success);
+  --error-bg: var(--bg-panel);
+  --error-border: color-mix(in oklab, var(--danger) 45%, transparent);
+  --error-text: var(--danger);
+  --info-bg: var(--bg-panel);
+  --info-border: var(--border-subtle);
+  --info-text: var(--text-primary);
+  --toast-radius: var(--radius-md);
+  --width: 340px;
+}
+[data-sonner-toaster][data-theme='light'] {
+  --normal-border: color-mix(in oklab, var(--primary-400) 20%, transparent);
 }

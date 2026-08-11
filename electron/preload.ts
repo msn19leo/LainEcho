@@ -99,6 +99,11 @@ const api: WindowApi = {
       ipcRenderer.on('pet:models-changed', listener)
       return () => ipcRenderer.removeListener('pet:models-changed', listener)
     },
+    onCoreChanged: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('pet:core-changed', listener)
+      return () => ipcRenderer.removeListener('pet:core-changed', listener)
+    },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
   },
 }

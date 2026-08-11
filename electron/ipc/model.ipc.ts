@@ -101,6 +101,8 @@ export function registerModelIpc(): void {
       throw new Error(`导入 Cubism Core 失败：${err instanceof Error ? err.message : String(err)}`)
     }
     const present = await fileExists(paths.coreFile)
+    // 通知桌宠窗口重新初始化（此前可能因 core 缺失停在提示横幅上）
+    if (present) windowManager.notifyCoreChanged()
     return { present, path: present ? paths.coreFile : null }
   })
 }

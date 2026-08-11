@@ -72,6 +72,13 @@ class WindowManager {
     }
   }
 
+  /** Cubism Core 运行库导入后广播给桌宠，触发重新初始化（解决运行中导入后不显示模型） */
+  notifyCoreChanged(): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:core-changed')
+    }
+  }
+
   /** 向所有窗口广播事件（会话变化等，用于跨窗口同步） */
   broadcast(channel: string, ...args: unknown[]): void {
     for (const win of BrowserWindow.getAllWindows()) {

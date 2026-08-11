@@ -2,6 +2,7 @@
  * Data 面板：会话管理（搜索、按角色卡筛选、导出为 Markdown 后删除）。
  */
 import { useEffect, useMemo, useState } from 'react'
+import { MessageSquare, Search } from 'lucide-react'
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
 import type { SessionIndexItem } from '../../types'
@@ -84,14 +85,21 @@ export function DataPanel() {
 
   return (
     <div className="space-y-3">
-      {/* 搜索 + 筛选 */}
-      <div className="flex gap-2">
-        <Input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="🔍 按标题搜索会话…"
-        />
-        <Select value={filterCard} onChange={(e) => setFilterCard(e.target.value)} className="w-40 shrink-0">
+      {/* 搜索 + 筛选：各占一半 */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="relative">
+          <Search
+            size={14}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
+          />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="按标题搜索会话…"
+            className="pl-8"
+          />
+        </div>
+        <Select value={filterCard} onChange={(e) => setFilterCard(e.target.value)}>
           <option value="">全部角色卡</option>
           {cards.map((c) => (
             <option key={c.id} value={c.id}>
@@ -114,8 +122,8 @@ export function DataPanel() {
         <div className="space-y-2">
           {filtered.map((s) => (
             <Card key={s.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-2 text-sm ring-1 ring-border">
-                💬
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                <MessageSquare size={15} strokeWidth={1.75} color="var(--primary-400)" />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text">{truncate(s.title, 24)}</div>

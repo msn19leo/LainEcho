@@ -1,13 +1,25 @@
 /**
- * 聊天窗口：标题栏 + 顶栏（角色卡选择 / 会话标题 / 全部会话按钮）+ 消息流 + 输入框 + 侧边栏。
+ * 聊天窗口（重构后：纯状态管理容器 + FloatingDock 浮动面板）。
+ *
+ * 重构要点：
+ *   - UI 层交由 FloatingDock 承载（非对称浮动、折叠/展开态、JS 拖拽）。
+ *   - 本组件只负责状态管理：角色卡加载、会话列表、跨窗口同步、流式状态。
+ *   - Dock 内部组合：顶栏（角色卡选择/新建/主题切换/设置）+ MessageList + InputArea。
+ *   - SessionSidebar 作为抽屉覆盖层保留。
+ *
+ * 业务逻辑与旧版完全一致（初始化、focus 刷新、session.onChanged 同步、切卡清会话等），
+ * 仅 UI 结构按「反套路设计规范」重组。
  */
 import { useEffect, useState } from 'react'
+import { ChevronDown, Drama, PanelLeft, Plus, Settings as SettingsIcon } from 'lucide-react'
 import { api } from '../api'
-import { WindowTitlebar } from '../components/WindowTitlebar'
+import { DropdownMenu, type MenuItem } from '../components/DropdownMenu'
+import { IconTile } from '../components/IconTile'
+import { FloatingDock } from '../components/FloatingDock'
 import { useCharacterStore } from '../store/characterStore'
 import { useSessionStore } from '../store/sessionStore'
 import { MessageList } from './MessageList'
-import { MessageInput } from './MessageInput'
+import { InputArea } from './InputArea'
 import { SessionSidebar } from './SessionSidebar'
 import { toast } from '../components/toast'
 
@@ -20,27 +32,18 @@ export function ChatWindow() {
   const sessions = useSessionStore((s) => s.sessions)
   const currentSessionId = useSessionStore((s) => s.currentSessionId)
   const loadSessions = useSessionStore((s) => s.loadSessions)
-  const ensureSession = useSessionStore((s) => s.ensureSession)
   const loadSession = useSessionStore((s) => s.loadSession)
-  const createSession = useSessionStore((s) => s.createSession)
+  const resetCurrentSession = useSessionStore((s) => s.resetCurrentSession)
   const streaming = useSessionStore((s) => s.streaming)
 
   const currentCard = cards.find((c) => c.id === currentCardId)
   const currentSession = sessions.find((s) => s.id === currentSessionId)
 
-  // 初始化
+  // 初始化：加载角色卡与会话列表；不预创建会话，保持空会话状态，发送首条消息时才持久化
   useEffect(() => {
     void (async () => {
       await loadCards()
       await loadSessions()
-      const { currentSessionId: cur } = useSessionStore.getState()
-      if (!cur) {
-        const card = useCharacterStore.getState().currentCardId
-        if (card) await ensureSession(card)
-      } else if (!useSessionStore.getState().sessions.some((s) => s.id === cur)) {
-        await loadSessions()
-      }
-      // 存在当前会话则加载其消息
       const state = useSessionStore.getState()
       if (state.currentSessionId) void loadSession(state.currentSessionId)
     })()
@@ -65,83 +68,95 @@ export function ChatWindow() {
     return unsub
   }, [])
 
-  // 切换角色卡：自动新建会话 + 同步桌宠模型
+  // 切换角色卡：同步桌宠模型 + 清空当前会话（首条消息时才新建持久化会话）
   const handleCardChange = async (cardId: string) => {
     setCurrentCard(cardId)
     const card = cards.find((c) => c.id === cardId)
     api.app.setPetModel(card?.modelId ?? null)
-    try {
-      await createSession(cardId)
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '新建会话失败', 'error')
-    }
+    resetCurrentSession()
   }
 
-  const handleNewSession = async () => {
-    if (!currentCardId) return
-    try {
-      await createSession(currentCardId)
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '新建会话失败', 'error')
+  // 新建会话：清空当前会话（首条消息时才新建持久化会话，避免空会话堆积）
+  const handleNewSession = () => {
+    if (!currentCardId) {
+      toast('请先选择角色卡', 'info')
+      return
     }
+    resetCurrentSession()
   }
+
+  const cardItems: MenuItem[] = cards.map((c) => ({
+    key: c.id,
+    label: c.name,
+    icon: Drama,
+    onSelect: () => void handleCardChange(c.id),
+  }))
 
   return (
-    <div className="flex h-screen flex-col bg-surface text-text">
-      <WindowTitlebar title={currentCard?.name ? `${currentCard.name} · 聊天` : 'AI 桌宠 · 聊天'} />
+    <div className="relative h-full w-full overflow-hidden">
+      {/* 浮动 Dock：折叠态头像小球，展开态完整聊天面板 */}
+      <FloatingDock
+        avatarName={currentCard?.name}
+        width={560}
+        height={600}
+        defaultExpanded
+        overlay={<SessionSidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
+      >
+        {/* Dock 内顶栏 */}
+        <div className="glass flex h-12 shrink-0 items-center gap-2 border-b border-t-0 px-3">
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1.5 text-xs text-text-2 transition-colors hover:border-border-strong hover:text-text"
+          >
+            <PanelLeft size={15} strokeWidth={1.75} />
+            <span>会话</span>
+          </button>
 
-      {/* 顶栏 */}
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
-        <button
-          onClick={() => setSidebarOpen(true)}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs text-text-2 transition hover:border-border-strong hover:text-text"
-        >
-          ☰ <span>全部会话</span>
-        </button>
+          <div className="min-w-0 flex-1 text-center">
+            <span className="truncate text-sm font-medium text-text">
+              {currentSession?.title ?? '新会话'}
+            </span>
+          </div>
 
-        <div className="min-w-0 flex-1 text-center">
-          <span className="truncate text-sm font-medium text-text">{currentSession?.title ?? '新会话'}</span>
+          <div className="flex items-center gap-1.5">
+            <DropdownMenu
+              align="end"
+              disabled={streaming}
+              buttonClassName="inline-flex h-8 max-w-[120px] items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2/70 px-2 text-xs text-text transition-colors hover:border-border-strong"
+              panelClassName="w-56"
+              trigger={
+                <>
+                  <IconTile icon={Drama} size="xs" />
+                  <span className="truncate font-medium">{currentCard?.name ?? '选角色'}</span>
+                  <ChevronDown size={13} className="shrink-0 text-text-muted" />
+                </>
+              }
+              items={cardItems}
+            />
+            <button
+              onClick={() => void handleNewSession()}
+              disabled={streaming}
+              title="新建会话"
+              className="bg-brand-gradient glow-primary inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] px-2.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Plus size={14} strokeWidth={2.25} />
+            </button>
+            <button
+              onClick={() => api.app.openSettings()}
+              title="设置"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border text-text-2 transition-colors hover:border-border-strong hover:text-text"
+            >
+              <SettingsIcon size={15} strokeWidth={1.75} />
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
-          <select
-            value={currentCardId ?? ''}
-            onChange={(e) => void handleCardChange(e.target.value)}
-            disabled={streaming}
-            className="cursor-pointer rounded-lg border border-border bg-surface-2 px-2.5 py-1.5 text-xs text-text outline-none transition focus:border-accent disabled:opacity-40"
-            title="切换角色卡将自动新建会话"
-          >
-            {cards.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-          <button
-            onClick={() => void handleNewSession()}
-            disabled={streaming}
-            className="inline-flex items-center gap-1 rounded-lg bg-gradient-to-r from-accent to-accent-2 px-2.5 py-1.5 text-xs font-medium text-white transition hover:brightness-110 disabled:opacity-40"
-            title="新建会话"
-          >
-            ＋
-          </button>
-          <button
-            onClick={() => api.app.openSettings()}
-            className="inline-flex items-center rounded-lg border border-border px-2.5 py-1.5 text-xs text-text-2 transition hover:border-border-strong hover:text-text"
-          >
-            ⚙ 设置
-          </button>
-        </div>
-      </div>
+        {/* 消息流 */}
+        <MessageList />
 
-      {/* 消息区 */}
-      <MessageList />
-
-      {/* 输入框 */}
-      <MessageInput />
-
-      {/* 会话侧边栏 */}
-      <SessionSidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+        {/* 输入区 */}
+        <InputArea />
+      </FloatingDock>
     </div>
   )
 }

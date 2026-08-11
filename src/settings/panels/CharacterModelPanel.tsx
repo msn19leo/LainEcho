@@ -2,6 +2,7 @@
  * 角色模型面板：Cubism Core 引导 + Live2D 模型导入/管理。
  */
 import { useEffect, useState } from 'react'
+import { AlertCircle, CheckCircle2, PersonStanding, Plus } from 'lucide-react'
 import { api } from '../../api'
 import type { Live2DModelMeta } from '../../types'
 import { Button, Card, ConfirmModal, Empty, Loading } from '../../components/ui'
@@ -78,12 +79,12 @@ export function CharacterModelPanel() {
             <div className="flex items-center gap-2 text-sm font-semibold text-text">
               Cubism Core 运行库
               {corePresent ? (
-                <span className="rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-normal text-success ring-1 ring-success/30">
-                  ● 已就绪
+                <span className="inline-flex items-center gap-1 rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-normal text-success ring-1 ring-success/30">
+                  <CheckCircle2 size={11} /> 已就绪
                 </span>
               ) : (
-                <span className="rounded-full bg-warning/15 px-2 py-0.5 text-[10px] font-normal text-warning ring-1 ring-warning/30">
-                  ● 未导入
+                <span className="inline-flex items-center gap-1 rounded-full bg-warning/15 px-2 py-0.5 text-[10px] font-normal text-warning ring-1 ring-warning/30">
+                  <AlertCircle size={11} /> 未导入
                 </span>
               )}
             </div>
@@ -111,7 +112,8 @@ export function CharacterModelPanel() {
       <div className="flex items-center justify-between">
         <span className="text-sm font-semibold text-text">Live2D 模型（{models.length}）</span>
         <Button onClick={() => void handleImportFolder()} disabled={importing}>
-          {importing ? '导入中…' : '＋ 从文件夹导入'}
+          <Plus size={14} strokeWidth={2.25} />
+          {importing ? '导入中…' : '从文件夹导入'}
         </Button>
       </div>
 
@@ -123,8 +125,8 @@ export function CharacterModelPanel() {
         <div className="space-y-2">
           {models.map((m) => (
             <Card key={m.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-surface-2 text-lg ring-1 ring-border">
-                🧸
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                <PersonStanding size={17} strokeWidth={1.75} color="var(--primary-400)" />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text">{m.name}</div>

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { api } from '../api'
-import type { AppSettings } from '../types'
+import type { AppSettings, ThemeMode } from '../types'
+import { applyTheme } from '../lib/theme'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   baseURL: '',
@@ -8,6 +9,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   temperature: 0.8,
   maxTokens: 1024,
   stream: true,
+  theme: 'dark',
 }
 
 interface SettingsState {
@@ -16,6 +18,8 @@ interface SettingsState {
   loaded: boolean
   load: () => Promise<void>
   save: (patch: Partial<AppSettings>) => Promise<void>
+  /** 设置主题并立即应用到当前窗口 */
+  setTheme: (theme: ThemeMode) => Promise<void>
   /** 保存 API Key 成功后刷新 hasApiKey（面板占位符/提示据此更新） */
   markKeyConfigured: () => void
 }
@@ -34,6 +38,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           temperature: data.temperature,
           maxTokens: data.maxTokens,
           stream: data.stream,
+          theme: data.theme,
         },
         hasApiKey: data.hasApiKey,
         loaded: true,
@@ -45,6 +50,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   save: async (patch) => {
     await api.settings.save(patch)
     set({ settings: { ...get().settings, ...patch } })
+  },
+  setTheme: async (theme) => {
+    applyTheme(theme)
+    set({ settings: { ...get().settings, theme } })
+    await api.settings.save({ theme })
   },
   markKeyConfigured: () => set({ hasApiKey: true }),
 }))

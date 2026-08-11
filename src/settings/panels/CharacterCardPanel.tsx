@@ -2,6 +2,7 @@
  * 角色卡面板：列表 + 新建/编辑（名称、人设、绑定模型）/ 删除。
  */
 import { useEffect, useState } from 'react'
+import { Plus } from 'lucide-react'
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
 import type { CharacterCard } from '../../types'
@@ -92,7 +93,9 @@ export function CharacterCardPanel() {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-xs text-text-muted">共 {cards.length} 张角色卡</span>
-        <Button onClick={openCreate}>＋ 新建角色卡</Button>
+        <Button onClick={openCreate}>
+          <Plus size={14} strokeWidth={2.25} /> 新建角色卡
+        </Button>
       </div>
 
       {loading ? (

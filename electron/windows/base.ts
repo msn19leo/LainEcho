@@ -14,6 +14,15 @@ export function isDev(): boolean {
 }
 
 export function loadWindowPage(win: BrowserWindow, page: WindowPage): void {
+  // 转发渲染进程 console 到主进程终端，便于定位渲染层问题
+  win.webContents.on('console-message', (e: unknown, a: unknown, b: unknown) => {
+    const msg =
+      typeof a === 'object' && a !== null && 'message' in (a as object)
+        ? (a as { message?: string }).message
+        : (b as string | undefined) ?? String(a)
+    console.log('[renderer]', msg)
+  })
+
   if (DEV_SERVER_URL) {
     void win.loadURL(`${DEV_SERVER_URL}/${page}`)
   } else {

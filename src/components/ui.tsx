@@ -1,8 +1,18 @@
 /**
- * 通用 UI 原语：Button / Input / Textarea / Select / Switch / Modal / Card
- * 统一 AIRI 风格的深色卡片式设计。
+ * 通用 UI 原语：Button / Input / Textarea / Select / Switch / Card / Modal
+ * 统一 Cyber-Kawaii 风格：毛玻璃 + 品牌渐变 + 主色/粉色光晕。
+ * 颜色全部走 Design Tokens（src/index.css），跟随 data-theme 切换。
+ * 圆角严格对齐规范：输入框 12px、按钮 16px、卡片 24px。
  */
-import { type ReactNode, type ButtonHTMLAttributes, type InputHTMLAttributes, type TextareaHTMLAttributes, type SelectHTMLAttributes, useEffect } from 'react'
+import {
+  type ReactNode,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type TextareaHTMLAttributes,
+  type SelectHTMLAttributes,
+  useEffect,
+} from 'react'
+import { X } from 'lucide-react'
 import { cn } from '../lib/utils'
 
 // ---------------- Button ----------------
@@ -11,11 +21,11 @@ type ButtonVariant = 'primary' | 'ghost' | 'outline' | 'danger' | 'subtle'
 
 const buttonVariants: Record<ButtonVariant, string> = {
   primary:
-    'bg-gradient-to-r from-accent to-accent-2 text-white hover:brightness-110 active:brightness-95 shadow-md shadow-accent/20',
+    'bg-brand-gradient text-[var(--on-brand)] hover:shadow-[var(--shadow-glow-primary)] hover:brightness-110 active:brightness-95 shadow-lg shadow-primary-glow/20',
   ghost: 'text-text-2 hover:text-text hover:bg-card-hover',
-  outline: 'border border-border text-text hover:bg-card-hover hover:border-border-strong',
+  outline: 'border border-border text-text-2 hover:text-text hover:bg-card-hover hover:border-border-strong',
   danger: 'bg-danger/15 text-danger hover:bg-danger/25 border border-danger/30',
-  subtle: 'bg-card text-text-2 hover:bg-card-hover hover:text-text border border-border',
+  subtle: 'bg-card text-text-2 hover:text-text hover:bg-card-hover border border-border',
 }
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -27,8 +37,8 @@ export function Button({ variant = 'primary', size = 'md', className, ...rest }:
   return (
     <button
       className={cn(
-        'inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition disabled:cursor-not-allowed disabled:opacity-50',
-        size === 'sm' ? 'px-2.5 py-1 text-xs' : 'px-3.5 py-1.5 text-sm',
+        'inline-flex items-center justify-center gap-1.5 font-medium transition-all disabled:cursor-not-allowed disabled:opacity-50',
+        size === 'sm' ? 'rounded-[var(--radius-sm)] px-2.5 py-1 text-xs' : 'rounded-[var(--radius-md)] px-4 py-1.5 text-sm',
         buttonVariants[variant],
         className,
       )}
@@ -42,7 +52,7 @@ export function Button({ variant = 'primary', size = 'md', className, ...rest }:
 export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-sm font-medium text-text-2">{label}</span>
+      <span className="mb-1.5 block text-[13px] font-medium text-text-2">{label}</span>
       {children}
       {hint && <span className="mt-1 block text-xs text-text-muted">{hint}</span>}
     </label>
@@ -50,7 +60,7 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 }
 
 const inputClass =
-  'w-full rounded-lg border border-border bg-surface-2 px-3 py-1.5 text-sm text-text placeholder:text-text-muted outline-none transition focus:border-accent focus:ring-1 focus:ring-accent/40'
+  'w-full rounded-[var(--radius-sm)] border border-border bg-surface-2 px-3 py-1.5 text-sm text-text placeholder:text-text-muted outline-none transition-all focus:border-[var(--border-strong)] focus:shadow-[0_0_0_3px_var(--primary-glow)]'
 
 export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(inputClass, className)} {...rest} />
@@ -87,8 +97,8 @@ export function Switch({ checked, onChange, label }: SwitchProps) {
     >
       <span
         className={cn(
-          'relative h-5 w-9 rounded-full transition',
-          checked ? 'bg-accent' : 'bg-border-strong',
+          'relative h-5 w-9 rounded-full transition-colors',
+          checked ? 'bg-brand-gradient shadow-[0_0_12px_var(--primary-glow)]' : 'bg-border-strong',
         )}
       >
         <span
@@ -110,8 +120,8 @@ export function Card({ className, children, onClick }: { className?: string; chi
     <div
       onClick={onClick}
       className={cn(
-        'rounded-xl border border-border bg-card p-4',
-        onClick && 'cursor-pointer transition hover:border-border-strong hover:bg-card-hover',
+        'glass rounded-[var(--radius-lg)] p-4',
+        onClick && 'cursor-pointer transition-all hover:border-border-strong hover:shadow-[var(--shadow-card-hover)]',
         className,
       )}
     >
@@ -144,16 +154,16 @@ export function Modal({ open, onClose, title, children, footer, width = 480 }: M
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
       <div
-        className="max-h-[85vh] overflow-auto rounded-2xl border border-border bg-panel p-5 shadow-2xl"
+        className="glass-strong glow-primary max-h-[85vh] overflow-auto rounded-[var(--radius-xl)] p-6"
         style={{ width }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-base font-semibold text-text">{title}</h3>
           <button onClick={onClose} className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text">
-            ✕
+            <X size={16} strokeWidth={1.75} />
           </button>
         </div>
         <div>{children}</div>
@@ -232,8 +242,8 @@ export function Loading({ text = '加载中…' }: { text?: string }) {
 export function PanelHeader({ title, desc }: { title: string; desc?: string }) {
   return (
     <div className="mb-5">
-      <h2 className="text-lg font-semibold text-text">{title}</h2>
-      {desc && <p className="mt-0.5 text-sm text-text-muted">{desc}</p>}
+      <h2 className="text-xl font-semibold tracking-tight text-text">{title}</h2>
+      {desc && <p className="mt-1 text-[13px] text-text-2">{desc}</p>}
     </div>
   )
 }

@@ -1,8 +1,9 @@
 /**
  * 自定义无边框标题栏（聊天 / 设置窗口共用）。
- * 双击标题栏切换最大化；右侧最小化/最大化/关闭。
+ * 左侧品牌渐变圆点带呼吸光效；底部极细渐变分隔线；右侧最小化/最大化/关闭。
  */
 import { useEffect, useState } from 'react'
+import { motion } from 'framer-motion'
 import { api } from '../api'
 import { cn } from '../lib/utils'
 
@@ -21,14 +22,25 @@ export function WindowTitlebar({ title, onDoubleClick }: { title: string; onDoub
 
   return (
     <div
-      className="app-drag flex h-10 shrink-0 items-center justify-between border-b border-border bg-surface-2/80 pl-4 pr-2"
+      className="glass app-drag relative flex h-10 shrink-0 items-center justify-between border-x-0 border-t-0 pl-4 pr-2"
       onDoubleClick={() => {
         onDoubleClick?.()
         api.win.toggleMaximize()
       }}
     >
-      <div className="flex items-center gap-2 text-sm font-medium text-text-2">
-        <span className="h-2 w-2 rounded-full bg-gradient-to-r from-accent to-accent-2" />
+      <div className="flex items-center gap-2.5 text-sm font-medium text-text-2">
+        <motion.span
+          className="h-2.5 w-2.5 rounded-full"
+          style={{ background: 'var(--gradient-brand)' }}
+          animate={{
+            boxShadow: [
+              '0 0 2px var(--primary-glow)',
+              '0 0 10px var(--primary-glow), 0 0 4px var(--accent-glow)',
+              '0 0 2px var(--primary-glow)',
+            ],
+          }}
+          transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
+        />
         {title}
       </div>
       <div className="app-no-drag flex items-center gap-0.5">
@@ -76,7 +88,7 @@ function TitlebarButton({
       title={label}
       onClick={onClick}
       className={cn(
-        'flex h-7 w-9 items-center justify-center rounded text-text-muted transition',
+        'flex h-7 w-9 items-center justify-center rounded-[var(--radius-md)] text-text-muted transition-colors duration-150',
         close ? 'hover:bg-danger hover:text-white' : 'hover:bg-card-hover hover:text-text',
       )}
     >

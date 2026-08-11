@@ -3,6 +3,7 @@
  */
 import { app } from 'electron'
 import { ensureDataDirs } from './services/storage'
+import { pruneEmptySessions } from './services/repository'
 import { registerPetSchemesPrivileged, registerPetProtocolHandler } from './services/petProtocol'
 import { registerAllIpc } from './ipc'
 import { windowManager } from './windows/windowManager'
@@ -20,6 +21,8 @@ if (!gotLock) {
 } else {
   app.whenReady().then(async () => {
     await ensureDataDirs()
+    // 清理历史遗留的空会话（无消息 = 从未使用）
+    await pruneEmptySessions().catch((err) => console.error('清理空会话失败', err))
     registerPetProtocolHandler()
     registerAllIpc()
     windowManager.init()

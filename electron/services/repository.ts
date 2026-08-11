@@ -159,9 +159,22 @@ export async function getSession(id: string): Promise<SessionDetail> {
   return { id, characterCardId: entry?.characterCardId ?? '', messages: [] }
 }
 
+/** 清理历史遗留的空会话（从未发送过消息），避免空会话在 Data 面板堆积 */
+export async function pruneEmptySessions(): Promise<void> {
+  const index = await readJson<SessionIndexItem[]>(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX)
+  const empties = index.filter((s) => s.messageCount === 0)
+  if (empties.length === 0) return
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (list) =>
+    list.filter((s) => s.messageCount !== 0),
+  )
+  await Promise.all(empties.map((s) => deleteFile(paths.sessionFile(s.id))))
+}
+
 export async function createSession(characterCardId: string): Promise<SessionIndexItem> {
   assertValidResourceId(characterCardId, 'card')
   const card = await getCharacterCard(characterCardId)
+  // 惰性创建：每次新建前先清理遗留空会话（含历史数据）
+  await pruneEmptySessions()
   const now = Date.now()
   const item: SessionIndexItem = {
     id: genId('session'),
@@ -251,6 +264,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   temperature: 0.8,
   maxTokens: 1024,
   stream: true,
+  theme: 'dark',
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -268,6 +282,7 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.temperature !== undefined) next.temperature = patch.temperature
     if (patch.maxTokens !== undefined) next.maxTokens = patch.maxTokens
     if (patch.stream !== undefined) next.stream = patch.stream
+    if (patch.theme !== undefined) next.theme = patch.theme
     return next
   })
   return { ...DEFAULT_SETTINGS, ...result }

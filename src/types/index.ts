@@ -51,6 +51,9 @@ export interface SessionDetail {
   messages: ChatMessage[]
 }
 
+/** 主题模式：dark / light / system（跟随系统 prefers-color-scheme） */
+export type ThemeMode = 'dark' | 'light' | 'system'
+
 /** 非敏感 API 配置（settings.json） */
 export interface AppSettings {
   baseURL: string
@@ -58,6 +61,7 @@ export interface AppSettings {
   temperature: number
   maxTokens: number
   stream: boolean
+  theme: ThemeMode
 }
 
 /** Live2D 模型元信息（models/index.json） */
@@ -189,6 +193,8 @@ export interface WindowApi {
     onModelChanged: (cb: (modelId: string | null) => void) => () => void
     /** 订阅 Live2D 模型列表变化（导入/删除后刷新） */
     onModelsChanged: (cb: () => void) => () => void
+    /** 订阅 Cubism Core 运行库导入事件（导入后桌宠重新初始化） */
+    onCoreChanged: (cb: () => void) => () => void
     /** 获取 Live2D 模型资源的 file:// 前缀（用于拼 model3.json 地址） */
     modelUrl: (modelId: string, model3Path: string) => string
   }

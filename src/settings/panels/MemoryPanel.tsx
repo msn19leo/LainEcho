@@ -2,6 +2,7 @@
  * 记忆体面板：全局固定记忆条目（所有角色卡对话统一拼接进 system prompt）。
  */
 import { useEffect, useState } from 'react'
+import { BrainCircuit, Plus } from 'lucide-react'
 import { useMemoryStore } from '../../store/memoryStore'
 import { Button, Card, Empty, Input, Loading } from '../../components/ui'
 import { toast } from '../../components/toast'
@@ -57,7 +58,7 @@ export function MemoryPanel() {
           }}
         />
         <Button onClick={() => void handleAdd()} disabled={!newContent.trim()}>
-          ＋ 添加
+          <Plus size={14} strokeWidth={2.25} /> 添加
         </Button>
       </div>
 
@@ -73,8 +74,8 @@ export function MemoryPanel() {
         <div className="space-y-2">
           {items.map((item) => (
             <Card key={item.id} className="flex items-center gap-3 py-2.5">
-              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-surface-2 text-sm ring-1 ring-border">
-                🧠
+              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                <BrainCircuit size={15} strokeWidth={1.75} color="var(--primary-400)" />
               </span>
               {editingId === item.id ? (
                 <>

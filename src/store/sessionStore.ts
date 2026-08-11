@@ -14,14 +14,14 @@ interface SessionState {
   streamError: string | null
 
   loadSessions: () => Promise<void>
-  ensureSession: (characterCardId: string) => Promise<string>
   loadSession: (id: string) => Promise<void>
-  createSession: (characterCardId: string) => Promise<void>
   deleteSession: (id: string) => Promise<void>
-  /** 发送消息并驱动流式输出 */
+  /** 新建空会话：清空当前会话与消息；会话在发送首条消息时才真正持久化，避免空会话堆积 */
+  resetCurrentSession: () => void
+  /** 发送消息并驱动流式输出（无会话时先惰性创建再发送） */
   send: (content: string) => Promise<void>
   stop: () => void
-  /** 其他窗口新建/删除会话后的跨窗口同步（刷新列表，当前会话被删则自动新建） */
+  /** 其他窗口新建/删除会话后的跨窗口同步（刷新列表；当前会话被删则回到空会话状态） */
   onSessionsChanged: () => Promise<void>
 }
 
@@ -58,21 +58,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  ensureSession: async (characterCardId) => {
-    const { currentSessionId, sessions } = get()
-    if (currentSessionId && sessions.some((s) => s.id === currentSessionId)) {
-      return currentSessionId
-    }
-    // 没有会话或当前会话已不存在 → 自动新建
-    const item = await api.session.create({ characterCardId })
-    set((s) => ({
-      sessions: [item, ...s.sessions],
-      currentSessionId: item.id,
-      messages: [],
-    }))
-    return item.id
-  },
-
   loadSession: async (id) => {
     const seq = ++loadSeq
     // 切换会话时重置流式状态，避免上一个会话的流式内容串到新会话
@@ -86,15 +71,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  createSession: async (characterCardId) => {
-    const item = await api.session.create({ characterCardId })
-    set((s) => ({
-      sessions: [item, ...s.sessions],
-      currentSessionId: item.id,
-      messages: [],
-      streamError: null,
-    }))
-  },
+  resetCurrentSession: () =>
+    set({ currentSessionId: null, messages: [], streamingContent: '', streamError: null }),
 
   deleteSession: async (id) => {
     await api.session.remove(id)
@@ -107,28 +85,47 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (fallback) {
         await get().loadSession(fallback.id)
       } else {
-        // 全部删光 → 为当前角色卡新建一个（无角色卡时保持空状态）
-        const cardId = useCharacterStore.getState().currentCardId
-        if (cardId) await get().createSession(cardId)
-        else set({ currentSessionId: null, messages: [] })
+        // 全部删光 → 回到空会话状态，发送首条消息时才新建持久化会话
+        set({ currentSessionId: null, messages: [], streamError: null })
       }
     }
   },
 
   send: (content) =>
     new Promise<void>((resolve) => {
-      const { currentSessionId, messages, streaming } = get()
-      const text = content.trim()
-      if (!currentSessionId || !text || streaming) {
-        resolve()
-        return
-      }
+      void (async () => {
+        const text = content.trim()
+        if (!text || get().streaming) {
+          resolve()
+          return
+        }
 
-      const userMsg: ChatMessage = { role: 'user', content: text, timestamp: Date.now() }
-      const nextMessages = [...messages, userMsg]
-      set({ messages: nextMessages, streaming: true, streamingContent: '', streamError: null })
+        // 尚无会话（首次发送 / 点「新建会话」后）→ 先惰性创建持久化会话，避免空会话堆积
+        let { currentSessionId, messages } = get()
+        if (!currentSessionId) {
+          const cardId = useCharacterStore.getState().currentCardId
+          if (!cardId) {
+            resolve()
+            return
+          }
+          try {
+            const item = await api.session.create({ characterCardId: cardId })
+            currentSessionId = item.id
+            set((s) => ({ sessions: [item, ...s.sessions], currentSessionId: item.id }))
+            messages = get().messages
+          } catch (err) {
+            console.error('创建会话失败', err)
+            set({ streamError: err instanceof Error ? err.message : '创建会话失败' })
+            resolve()
+            return
+          }
+        }
 
-      const isStillCurrent = () => get().currentSessionId === currentSessionId
+        const userMsg: ChatMessage = { role: 'user', content: text, timestamp: Date.now() }
+        const nextMessages = [...messages, userMsg]
+        set({ messages: nextMessages, streaming: true, streamingContent: '', streamError: null })
+
+        const isStillCurrent = () => get().currentSessionId === currentSessionId
 
       function cleanup() {
         unsubscribeChunk()
@@ -183,6 +180,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         cleanup()
         resolve()
       })
+      })()
     }),
 
   stop: () => api.ai.cancel(),
@@ -193,10 +191,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const { currentSessionId } = get()
       set({ sessions })
       if (currentSessionId && !sessions.some((s) => s.id === currentSessionId)) {
-        // 当前会话被其他窗口（Data 面板）删除 → 自动新建
-        const cardId = useCharacterStore.getState().currentCardId
-        if (cardId) await get().createSession(cardId)
-        else set({ currentSessionId: null, messages: [] })
+        // 当前会话被其他窗口（Data 面板）删除 → 回到空会话状态，发送首条消息时才新建
+        set({ currentSessionId: null, messages: [], streamError: null })
       }
     } catch {
       // 忽略刷新失败

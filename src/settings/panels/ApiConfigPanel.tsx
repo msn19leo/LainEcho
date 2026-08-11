@@ -6,6 +6,7 @@
  *   - 测试连接：发一条极简请求验证配置
  */
 import { useEffect, useState } from 'react'
+import { CheckCircle2, XCircle } from 'lucide-react'
 import { api } from '../../api'
 import { useSettingsStore } from '../../store/settingsStore'
 import { Button, Card, Field, Input, Loading, Switch } from '../../components/ui'
@@ -129,13 +130,14 @@ export function ApiConfigPanel() {
 
       {testResult && (
         <div
-          className={`rounded-lg border px-3 py-2 text-sm ${
+          className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
             testResult.ok
               ? 'border-success/30 bg-success/10 text-success'
               : 'border-danger/30 bg-danger/10 text-danger'
           }`}
         >
-          {testResult.ok ? '✅ 连接成功' : `❌ ${testResult.message}`}
+          {testResult.ok ? <CheckCircle2 size={15} strokeWidth={1.75} /> : <XCircle size={15} strokeWidth={1.75} />}
+          {testResult.ok ? '连接成功' : testResult.message}
         </div>
       )}
 
