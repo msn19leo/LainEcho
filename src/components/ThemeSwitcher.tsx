@@ -54,7 +54,7 @@ export function ThemeSwitcher({ compact = false, className }: ThemeSwitcherProps
             title={label}
             aria-pressed={active}
             className={cn(
-              'relative z-10 flex items-center gap-1.5 rounded-[var(--radius-full)] px-3 py-1.5 text-xs transition-colors duration-200',
+              'relative z-10 flex items-center gap-2 rounded-[var(--radius-full)] px-3 py-2 text-xs transition-colors duration-200',
               active
                 ? 'text-[var(--on-brand)]'
                 : 'text-text-2 hover:text-text',

@@ -37,8 +37,8 @@ export function Button({ variant = 'primary', size = 'md', className, ...rest }:
   return (
     <button
       className={cn(
-        'inline-flex items-center justify-center gap-1.5 font-medium transition-all disabled:cursor-not-allowed disabled:opacity-50',
-        size === 'sm' ? 'rounded-[var(--radius-sm)] px-2.5 py-1 text-xs' : 'rounded-[var(--radius-md)] px-4 py-1.5 text-sm',
+        'inline-flex items-center justify-center gap-2 font-medium transition-all disabled:cursor-not-allowed disabled:opacity-50',
+        size === 'sm' ? 'rounded-[var(--radius-sm)] px-3 py-1 text-xs' : 'rounded-[var(--radius-md)] px-4 py-2 text-sm',
         buttonVariants[variant],
         className,
       )}
@@ -52,7 +52,7 @@ export function Button({ variant = 'primary', size = 'md', className, ...rest }:
 export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-[13px] font-medium text-text-2">{label}</span>
+      <span className="mb-2 block text-[13px] font-medium text-text-2">{label}</span>
       {children}
       {hint && <span className="mt-1 block text-xs text-text-muted">{hint}</span>}
     </label>
@@ -60,7 +60,7 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 }
 
 const inputClass =
-  'w-full rounded-[var(--radius-sm)] border border-border bg-surface-2 px-3 py-1.5 text-sm text-text placeholder:text-text-muted outline-none transition-all focus:border-[var(--border-strong)] focus:shadow-[0_0_0_3px_var(--primary-glow)]'
+  'w-full rounded-[var(--radius-sm)] border border-border bg-surface-2 px-3 py-2 text-sm text-text placeholder:text-text-muted outline-none transition-all focus:border-[var(--border-strong)] focus:shadow-[0_0_0_3px_var(--primary-glow)]'
 
 export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(inputClass, className)} {...rest} />
@@ -154,7 +154,7 @@ export function Modal({ open, onClose, title, children, footer, width = 480 }: M
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-[20px]" onClick={onClose}>
       <div
         className="glass-strong glow-primary max-h-[85vh] overflow-auto rounded-[var(--radius-xl)] p-6"
         style={{ width }}
@@ -162,7 +162,7 @@ export function Modal({ open, onClose, title, children, footer, width = 480 }: M
       >
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-base font-semibold text-text">{title}</h3>
-          <button onClick={onClose} className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text">
+          <button onClick={onClose} className="rounded-[var(--radius-sm)] p-1 text-text-muted hover:bg-card-hover hover:text-text">
             <X size={16} strokeWidth={1.75} />
           </button>
         </div>

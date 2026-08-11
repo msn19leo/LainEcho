@@ -20,7 +20,7 @@ import { PetStage, type PetStageHandle } from './PetStage'
 /** 桌宠窗口固定尺寸（与主进程 PET_WIDTH/PET_HEIGHT 保持一致）。
  *  用固定像素而非 h-full/w-full：Windows 透明窗口拖动时 CSS 布局尺寸会被报告失真，
  *  百分比尺寸会跟着变大。钉死像素则完全不受影响。 */
-const PET_SIZE = { width: 380, height: 440 }
+const PET_SIZE = { width: 300, height: 440 }
 
 interface MenuPos {
   x: number
@@ -63,7 +63,7 @@ export default function PetApp() {
       <PetStage stageRef={stageRef} onStatus={() => {}} />
 
       {/* 原生拖动区域不接收鼠标事件，聊天/设置改为右上角 no-drag 小按钮 */}
-      <div className="app-no-drag absolute right-2 top-2 flex items-center gap-1.5">
+      <div className="app-no-drag absolute right-2 top-2 flex items-center gap-2">
         <PetQuickButton title="打开聊天" onClick={() => api.app.openChat()}>
           <MessageSquare size={14} strokeWidth={1.75} />
         </PetQuickButton>
@@ -76,7 +76,7 @@ export default function PetApp() {
       <AnimatePresence>
         {scalePct !== null && (
           <motion.div
-            className="app-no-drag pointer-events-none absolute bottom-2 right-2 rounded-full border border-[var(--border-strong)] bg-[var(--bg-panel)]/90 px-2.5 py-1 text-xs font-medium text-text shadow-[var(--shadow-card)] backdrop-blur"
+            className="app-no-drag pointer-events-none absolute bottom-2 right-2 rounded-full border border-[var(--border-strong)] bg-[var(--bg-panel)]/90 px-3 py-1 text-xs font-medium text-text shadow-[var(--shadow-card)] backdrop-blur-[20px]"
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 6 }}

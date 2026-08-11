@@ -59,9 +59,9 @@ export function SettingsLayout() {
       <WindowTitlebar title="AI 桌宠 · 设置" />
       <div className="flex min-h-0 flex-1">
         {/* 左侧导航 */}
-        <nav className="flex w-48 shrink-0 flex-col border-r border-border bg-surface-2/40 p-3">
+        <nav className="flex w-48 shrink-0 flex-col border-r border-border bg-surface-2/40 p-4">
           <Logo />
-          <div className="mt-4 space-y-0.5">
+          <div className="mt-4 space-y-1">
             <NavButton active={view === 'home'} onClick={() => setView('home')} icon={House} label="主页" />
             <div className="my-2 border-t border-border" />
             {MODULES.map((m) => (
@@ -91,8 +91,8 @@ export function SettingsLayout() {
 
 function Logo() {
   return (
-    <div className="flex items-center gap-2.5 rounded-xl border border-border bg-surface/60 p-2.5 backdrop-blur">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl" style={{ background: 'var(--gradient-brand)' }}>
+    <div className="glass flex items-center gap-3 rounded-[var(--radius-md)]">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--gradient-brand)' }}>
         <Sparkles size={18} strokeWidth={2} style={{ color: 'var(--on-brand)' }} />
       </div>
       <div className="min-w-0 leading-tight">
@@ -118,11 +118,11 @@ function NavButton({
     <button
       onClick={onClick}
       className={cn(
-        'relative mb-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] transition-colors',
+        'relative mb-1 flex w-full items-center gap-3 rounded-[var(--radius-md)] px-3 py-2 text-left text-[13px] transition-colors',
         active ? 'text-text' : 'text-text-2 hover:bg-card-hover hover:text-text',
       )}
     >
-      {active && <div className="absolute inset-0 rounded-lg bg-primary-500/10" />}
+      {active && <div className="absolute inset-0 rounded-[var(--radius-md)] bg-primary-500/10" />}
       {active && (
         <motion.div
           layoutId="nav-active-indicator"
@@ -177,7 +177,7 @@ function SettingsCard({
       whileTap={{ scale: 0.98 }}
       transition={springSoft}
       onClick={onClick}
-      className="glass flex w-full items-center gap-4 rounded-[var(--radius-lg)] p-5 text-left transition-all duration-200 hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-glow-primary)]"
+      className="glass flex w-full items-center gap-4 rounded-[var(--radius-lg)] p-6 text-left transition-all duration-200 hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-glow-primary)]"
     >
       <IconTile icon={icon} />
       <div className="min-w-0 flex-1">
@@ -196,7 +196,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       <div className="mb-6 flex items-center gap-3">
         <button
           onClick={onBack}
-          className="flex items-center gap-1 rounded-[var(--radius-sm)] border border-border px-2.5 py-1.5 text-xs text-text-2 transition hover:border-border-strong hover:text-text"
+          className="flex items-center gap-1 rounded-[var(--radius-sm)] border border-border px-3 py-2 text-xs text-text-2 transition hover:border-border-strong hover:text-text"
         >
           <ChevronLeft size={14} /> 返回
         </button>

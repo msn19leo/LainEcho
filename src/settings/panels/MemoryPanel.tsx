@@ -73,8 +73,8 @@ export function MemoryPanel() {
       ) : (
         <div className="space-y-2">
           {items.map((item) => (
-            <Card key={item.id} className="flex items-center gap-3 py-2.5">
-              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+            <Card key={item.id} className="flex items-center gap-3 py-3">
+              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
                 <BrainCircuit size={15} strokeWidth={1.75} color="var(--primary-400)" />
               </span>
               {editingId === item.id ? (

@@ -99,7 +99,7 @@ export function CharacterModelPanel() {
               >
                 Live2D 官网
               </a>{' '}
-              下载 Cubism SDK for Web，并选择其中的 <code className="rounded bg-surface-2 px-1">live2dcubismcore.min.js</code> 文件。
+              下载 Cubism SDK for Web，并选择其中的 <code className="rounded-[var(--radius-sm)] bg-surface-2 px-2">live2dcubismcore.min.js</code> 文件。
             </p>
           </div>
           <Button variant={corePresent ? 'outline' : 'primary'} onClick={() => void handleImportCore()}>
@@ -125,7 +125,7 @@ export function CharacterModelPanel() {
         <div className="space-y-2">
           {models.map((m) => (
             <Card key={m.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
                 <PersonStanding size={17} strokeWidth={1.75} color="var(--primary-400)" />
               </div>
               <div className="min-w-0 flex-1">

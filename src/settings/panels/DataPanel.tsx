@@ -122,13 +122,13 @@ export function DataPanel() {
         <div className="space-y-2">
           {filtered.map((s) => (
             <Card key={s.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
                 <MessageSquare size={15} strokeWidth={1.75} color="var(--primary-400)" />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text">{truncate(s.title, 24)}</div>
-                <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-text-muted">
-                  <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
+                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-muted">
+                  <span className="rounded-full bg-accent/15 px-2 py-1 text-[10px] text-accent">
                     {s.characterCardName}
                   </span>
                   <span>{s.messageCount} 条消息</span>

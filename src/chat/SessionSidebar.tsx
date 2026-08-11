@@ -51,7 +51,7 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
                 <button
                   onClick={handleNew}
                   disabled={streaming}
-                  className="bg-brand-gradient glow-primary inline-flex items-center gap-1 rounded-[var(--radius-md)] px-2.5 py-1.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="bg-brand-gradient glow-primary inline-flex items-center gap-1 rounded-[var(--radius-md)] px-3 py-2 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Plus size={13} strokeWidth={2.25} />
                   新建会话
@@ -59,7 +59,7 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
                 <button
                   onClick={onClose}
                   aria-label="关闭"
-                  className="rounded-[var(--radius-md)] p-1.5 text-text-muted transition-colors hover:bg-card-hover hover:text-text"
+                  className="rounded-[var(--radius-md)] p-2 text-text-muted transition-colors hover:bg-card-hover hover:text-text"
                 >
                   <X size={15} strokeWidth={1.75} />
                 </button>
@@ -82,7 +82,7 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
                     }}
                     disabled={streaming}
                     className={cn(
-                      'relative mb-1 block w-full rounded-[var(--radius-md)] px-3 py-2.5 text-left transition-colors',
+                      'relative mb-1 block w-full rounded-[var(--radius-md)] px-3 py-3 text-left transition-colors',
                       active ? 'bg-primary-500/10' : 'hover:bg-card-hover',
                       streaming && 'cursor-not-allowed opacity-60',
                     )}
@@ -96,7 +96,7 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
                     <div className={cn('truncate pl-1 text-sm font-medium', active ? 'text-text' : 'text-text-2')}>
                       {truncate(s.title, 20)}
                     </div>
-                    <div className="mt-0.5 flex items-center justify-between pl-1 text-xs text-text-muted">
+                    <div className="mt-1 flex items-center justify-between pl-1 text-xs text-text-muted">
                       <span className="max-w-[60%] truncate">{s.characterCardName}</span>
                       <span>{formatRelativeTime(s.updatedAt)}</span>
                     </div>

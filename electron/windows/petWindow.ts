@@ -5,7 +5,7 @@ import { BrowserWindow } from 'electron'
 import path from 'path'
 import { loadWindowPage } from './base'
 
-const PET_WIDTH = 380
+const PET_WIDTH = 300
 const PET_HEIGHT = 440
 
 /** 应用是否正在退出：退出时允许真正关闭窗口，否则关闭=隐藏（常驻托盘） */

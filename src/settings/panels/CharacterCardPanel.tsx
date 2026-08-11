@@ -105,19 +105,19 @@ export function CharacterCardPanel() {
       ) : (
         cards.map((card) => (
           <Card key={card.id} className="flex items-start gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-2 text-sm ring-1 ring-border">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-sm ring-1 ring-border">
               {card.name.slice(0, 1)}
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <span className="font-medium text-text">{card.name}</span>
                 {card.modelId && (
-                  <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent ring-1 ring-accent/30">
+                  <span className="rounded-full bg-accent/15 px-2 py-1 text-[10px] text-accent ring-1 ring-accent/30">
                     绑定模型
                   </span>
                 )}
               </div>
-              <div className="mt-1 space-y-0.5 text-xs leading-relaxed text-text-muted selectable">
+              <div className="mt-1 space-y-1 text-xs leading-relaxed text-text-muted selectable">
                 {card.identity.trim() || card.consciousness.trim() ? (
                   <>
                     {card.identity.trim() && (

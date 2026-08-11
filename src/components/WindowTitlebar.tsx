@@ -28,7 +28,7 @@ export function WindowTitlebar({ title, onDoubleClick }: { title: string; onDoub
         api.win.toggleMaximize()
       }}
     >
-      <div className="flex items-center gap-2.5 text-sm font-medium text-text-2">
+      <div className="flex items-center gap-3 text-sm font-medium text-text-2">
         <motion.span
           className="h-2.5 w-2.5 rounded-full"
           style={{ background: 'var(--gradient-brand)' }}
@@ -43,7 +43,7 @@ export function WindowTitlebar({ title, onDoubleClick }: { title: string; onDoub
         />
         {title}
       </div>
-      <div className="app-no-drag flex items-center gap-0.5">
+      <div className="app-no-drag flex items-center gap-1">
         <TitlebarButton label="最小化" onClick={() => api.win.minimize()}>
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
             <line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" strokeWidth="1.2" />

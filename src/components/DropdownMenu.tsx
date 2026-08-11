@@ -18,7 +18,7 @@ export interface MenuItem {
 }
 
 const PANEL_CLASS =
-  'overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)]/95 py-1 shadow-[var(--shadow-card-hover)] backdrop-blur-xl'
+  'overflow-hidden rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-panel)]/95 py-1 shadow-[var(--shadow-card-hover)] backdrop-blur-[20px]'
 
 export function ItemButton({ item, onDone }: { item: MenuItem; onDone: () => void }) {
   const Icon = item.icon
@@ -30,7 +30,7 @@ export function ItemButton({ item, onDone }: { item: MenuItem; onDone: () => voi
         item.onSelect()
       }}
       className={cn(
-        'flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] transition-colors',
+        'flex w-full items-center gap-3 px-3 py-2 text-left text-[13px] transition-colors',
         item.danger
           ? 'text-[var(--danger)] hover:bg-danger/10'
           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)] hover:text-[var(--text-primary)]',

@@ -102,11 +102,12 @@ export function ChatWindow() {
         defaultExpanded
         overlay={<SessionSidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />}
       >
-        {/* Dock 内顶栏 */}
-        <div className="glass flex h-12 shrink-0 items-center gap-2 border-b border-t-0 px-3">
+        {/* Dock 内顶栏 —— relative z-20 确保顶栏层叠上下文高于消息流，
+            角色卡下拉菜单（z-50）不会被 AI 消息的 glass 层叠上下文覆盖 */}
+        <div className="glass relative z-20 flex h-12 shrink-0 items-center gap-2 border-b border-t-0 px-4">
           <button
             onClick={() => setSidebarOpen(true)}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1.5 text-xs text-text-2 transition-colors hover:border-border-strong hover:text-text"
+            className="inline-flex shrink-0 items-center gap-2 rounded-[var(--radius-md)] border border-border px-3 py-2 text-xs text-text-2 transition-colors hover:border-border-strong hover:text-text"
           >
             <PanelLeft size={15} strokeWidth={1.75} />
             <span>会话</span>
@@ -118,7 +119,7 @@ export function ChatWindow() {
             </span>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             <DropdownMenu
               align="end"
               disabled={streaming}
@@ -137,7 +138,7 @@ export function ChatWindow() {
               onClick={() => void handleNewSession()}
               disabled={streaming}
               title="新建会话"
-              className="bg-brand-gradient glow-primary inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] px-2.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+              className="bg-brand-gradient glow-primary inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] px-3 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Plus size={14} strokeWidth={2.25} />
             </button>

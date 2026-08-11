@@ -53,7 +53,7 @@ export function InputArea() {
   }
 
   return (
-    <div className="glass shrink-0 border-t-0 px-3 pb-3 pt-2">
+    <div className="glass shrink-0 border-t-0 px-4 pb-3 pt-2">
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -62,12 +62,12 @@ export function InputArea() {
           onKeyDown={handleKeyDown}
           rows={1}
           placeholder={streaming ? 'AI 正在回复…' : 'Enter 发送，Shift+Enter 换行'}
-          className="max-h-32 min-h-[40px] flex-1 resize-none rounded-[var(--radius-sm)] border border-border bg-surface-2/70 px-3.5 py-2.5 text-sm leading-relaxed text-text outline-none transition-all placeholder:text-text-muted focus:border-[var(--border-strong)] focus:shadow-[0_0_0_3px_var(--primary-glow)]"
+          className="max-h-32 min-h-[40px] flex-1 resize-none rounded-[var(--radius-sm)] border border-border bg-surface-2/70 px-4 py-3 text-sm leading-relaxed text-text outline-none transition-all placeholder:text-text-muted focus:border-[var(--border-strong)] focus:shadow-[0_0_0_3px_var(--primary-glow)]"
         />
         {streaming ? (
           <button
             onClick={() => stop()}
-            className="inline-flex h-[40px] items-center gap-1.5 rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 px-4 text-sm font-medium text-danger transition-colors hover:bg-danger/20"
+            className="inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 px-4 text-sm font-medium text-danger transition-colors hover:bg-danger/20"
           >
             <Square size={13} fill="currentColor" />
             停止
@@ -76,7 +76,7 @@ export function InputArea() {
           <button
             onClick={handleSend}
             disabled={!canSend}
-            className="bg-accent-gradient glow-accent inline-flex h-[40px] items-center gap-1.5 rounded-[var(--radius-md)] px-5 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+            className="bg-accent-gradient glow-accent inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] px-6 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
           >
             <Send size={15} strokeWidth={2} />
             发送
