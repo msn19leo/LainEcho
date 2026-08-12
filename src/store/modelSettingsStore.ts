@@ -44,6 +44,7 @@ export const DEFAULT_ANIMATION: ModelAnimationSettings = {
   maxFps: 0,
   dropShadow: true,
   expressionEnabled: false,
+  selectedExpression: '',
 }
 
 /** 缩放与位置默认值 */

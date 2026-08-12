@@ -15,7 +15,7 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter } from '../types'
 import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
 
 export interface PetStageHandle {
@@ -60,6 +60,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const blinkRef = useRef(createBlinkState())
   /** 空闲眼神状态 */
   const idleEyeRef = useRef(createIdleEyeState())
+  /** 当前模型的表情列表（模型加载时从主进程读取） */
+  const expressionListRef = useRef<ExpressionMeta[]>([])
+  /** 当前应用的表情参数（从 expressionListRef 中匹配选中表情得到） */
+  const currentExpressionParamsRef = useRef<ExpressionParameter[]>([])
+  /** 表情修改前的参数基础值（每帧还原后再应用新表情，避免叠加残留） */
+  const expressionBaseValuesRef = useRef<Map<string, number>>(new Map())
 
   useImperativeHandle(stageRef, () => ({
     zoom: (factor) => {
@@ -125,6 +131,25 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
     }
     modelRef.current = null
+    // 清空表情状态，防止旧模型的表情基础值残留到新模型
+    expressionListRef.current = []
+    currentExpressionParamsRef.current = []
+    expressionBaseValuesRef.current.clear()
+  }
+
+  /**
+   * 根据当前设置（expressionEnabled + selectedExpression）和已加载的表情列表，
+   * 更新 currentExpressionParamsRef。每帧由 ticker 读取并应用到 coreModel。
+   * 参考 airi 的 expression-controller.ts：不使用 SDK 的 ExpressionManager，直接管理参数。
+   */
+  function updateCurrentExpression() {
+    const anim = settingsRef.current.animation
+    if (!anim.expressionEnabled || !anim.selectedExpression) {
+      currentExpressionParamsRef.current = []
+      return
+    }
+    const expr = expressionListRef.current.find((e) => e.name === anim.selectedExpression)
+    currentExpressionParamsRef.current = expr?.parameters ?? []
   }
 
   /** 加载（或切换）指定模型；不传 modelId 时按优先级选择：角色卡绑定 > 全局选中 > 列表第一个 */
@@ -213,6 +238,17 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       setLoading(false)
       onStatus('ready')
       setBanner(null)
+      // 加载模型的表情列表（参考 airi 的 expression-store.ts：自行解析 exp3.json）
+      try {
+        const expressions = await api.model.expressionList(meta.id)
+        if (gen !== loadGenRef.current || cancelledRef.current) return
+        expressionListRef.current = expressions
+        updateCurrentExpression()
+        console.log('[pet] 表情列表已加载:', expressions.length, expressions.map((e) => e.name))
+      } catch {
+        expressionListRef.current = []
+        currentExpressionParamsRef.current = []
+      }
       // 诊断：等几帧后分析画布上实际渲染出的非透明内容
       setTimeout(() => analyzeRender(app), 500)
     } catch (err) {
@@ -259,17 +295,26 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
       const mouseTrackingActive = animation.mouseTracking && mouseRef.current.active
 
-      // 执行顺序：
+      // 执行顺序（参考 airi：用户参数 → 表情 → 眨眼 → 眼神）：
       // 1. 应用用户参数（写 angleZ + eyeOpen + eyebrow + mouth + body + breath）
       //    鼠标跟踪激活时跳过 angleX/Y（由 updateEyeTracking 覆盖）
       applyModelParameters(coreModel, params, mouseTrackingActive)
 
-      // 2. 眨眼（读回 eyeOpen 值，乘以眨眼系数）
+      // 2. 表情（在用户参数之后、眨眼之前应用，参考 airi 的表情应用顺序）
+      //    每帧先还原上一帧的表情参数基础值，再应用当前表情，避免叠加残留
+      if (animation.expressionEnabled && currentExpressionParamsRef.current.length > 0) {
+        applyExpression(coreModel, currentExpressionParamsRef.current, expressionBaseValuesRef.current)
+      } else if (expressionBaseValuesRef.current.size > 0) {
+        // 表情已关闭或未选中：还原之前被表情修改的参数
+        restoreExpressionBase(coreModel, expressionBaseValuesRef.current)
+      }
+
+      // 3. 眨眼（读回 eyeOpen 值，乘以眨眼系数）
       if (animation.enableBlink) {
         updateBlink(coreModel, blinkRef.current, animation.blinkMode, delta, params)
       }
 
-      // 3. 鼠标跟踪 / 空闲眼神（覆盖 angleX/Y 和 eyeBallX/Y）
+      // 4. 鼠标跟踪 / 空闲眼神（覆盖 angleX/Y 和 eyeBallX/Y）
       if (mouseTrackingActive) {
         updateEyeTracking(coreModel, mouseRef.current, animation, focusRef.current)
       } else if (animation.idleEyeMovement) {
@@ -416,6 +461,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
       // 缩放/位置变化时重新拟合
       fitModel()
+      // 表情设置变化时更新当前表情参数
+      updateCurrentExpression()
       // 选中模型变化且当前角色卡未绑定时，切换到新选中模型
       if (shouldSwitchModel && !currentCardModelIdRef.current && settings.selectedModelId !== currentModelIdRef.current) {
         void loadModel(settings.selectedModelId ?? undefined)
@@ -761,6 +808,7 @@ interface CoreModelLike {
   setParameterValueById?: (id: string, value: number) => void
   getParameterValueById?: (id: string) => number
   addParameterValueById?: (id: string, value: number, weight?: number) => void
+  multiplyParameterValueById?: (id: string, value: number, weight?: number) => void
 }
 
 /** pixi-live2d-display 的 focusController 接口（驱动头部旋转平滑过渡） */
@@ -812,6 +860,65 @@ function applyModelParameters(core: CoreModelLike, p: ModelParameters, mouseTrac
   core.setParameterValueById('ParamBodyAngleZ', p.bodyAngleZ)
   // Breath
   core.setParameterValueById('ParamBreath', p.breath)
+}
+
+// ---------------- 表情参数应用 ----------------
+
+/**
+ * 将 exp3.json 的表情参数应用到 Cubism Core（每帧调用）。
+ * 参考 airi 的 expression-tools.ts：自行实现三种混合模式，不依赖 SDK 的 ExpressionManager。
+ *
+ * 防残留机制（修复切换/关闭表情时旧参数不消失的 bug）：
+ * - 每帧应用表情前，先把上一帧被表情修改过的参数还原到基础值（baseValues）
+ * - 然后重新记录当前帧的基础值（applyModelParameters 设定的值），再叠加表情
+ * - 当表情被关闭或切换为不含某参数的新表情时，该参数自动还原
+ *
+ * 混合模式（对应 exp3.json 的 Blend 字段）：
+ * - Add: 在基础值上叠加（addParameterValueById）
+ * - Multiply: 与基础值相乘（multiplyParameterValueById）
+ * - Overwrite: 直接覆盖（setParameterValueById）
+ *
+ * 注意：airi 有意忽略 FadeInTime / FadeOutTime，此处同样不实现淡入淡出。
+ */
+function applyExpression(
+  core: CoreModelLike,
+  params: ExpressionParameter[],
+  baseValues: Map<string, number>,
+): void {
+  // 1. 还原上一帧被表情修改的参数到基础值
+  for (const [id, val] of baseValues) {
+    core.setParameterValueById?.(id, val)
+  }
+  baseValues.clear()
+
+  // 2. 记录当前帧的基础值，然后应用表情
+  for (const p of params) {
+    const base = core.getParameterValueById?.(p.Id) ?? 0
+    baseValues.set(p.Id, base)
+
+    switch (p.Blend) {
+      case 'Add':
+        core.addParameterValueById?.(p.Id, p.Value, 1)
+        break
+      case 'Multiply':
+        core.multiplyParameterValueById?.(p.Id, p.Value, 1)
+        break
+      case 'Overwrite':
+        core.setParameterValueById?.(p.Id, p.Value)
+        break
+    }
+  }
+}
+
+/**
+ * 还原所有被表情修改过的参数到基础值，并清空记录。
+ * 在表情系统关闭或模型切换时调用，确保表情参数彻底清除。
+ */
+function restoreExpressionBase(core: CoreModelLike, baseValues: Map<string, number>): void {
+  for (const [id, val] of baseValues) {
+    core.setParameterValueById?.(id, val)
+  }
+  baseValues.clear()
 }
 
 // ---------------- 眨眼状态机 ----------------

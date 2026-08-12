@@ -1,20 +1,108 @@
 /**
  * JSON 文件读写封装。
- * 所有数据统一存放在 Electron userData 目录下（Windows: %APPDATA%/ai-desktop-pet/）。
+ * 所有数据统一存放在数据根目录下（默认为 Electron userData：Windows: %APPDATA%/LainEcho/）。
+ * 用户可在设置中修改数据目录位置，修改后数据会迁移到新位置。
+ *
+ * 自定义目录配置文件（data-dir-config.json）始终存放在默认 userData 目录下，
+ * 不随数据迁移——否则迁移后无法找到配置。
  *
  * 原子写策略：先写同名 .tmp 临时文件，再 rename 覆盖目标文件，
  * 避免写一半崩溃导致 JSON 损坏。同一文件名的写入通过内部队列串行化。
  */
 import { app } from 'electron'
-import { promises as fs } from 'fs'
+import { promises as fs, readFileSync, existsSync } from 'fs'
 import path from 'path'
 
+/** 默认 userData 目录（Electron 标准路径，永不改变） */
+let defaultUserData: string | null = null
+/** 实际数据根目录（可能为自定义路径，懒初始化） */
 let userData: string | null = null
 
-/** 获取 userData 根目录（懒初始化，确保 app ready 后调用） */
+/** 获取默认 userData 目录（Electron 标准路径） */
+export function getDefaultUserDataDir(): string {
+  if (!defaultUserData) defaultUserData = app.getPath('userData')
+  return defaultUserData
+}
+
+/** 自定义数据目录配置文件路径（始终在默认 userData 下） */
+export function getDataDirConfigFile(): string {
+  return path.join(getDefaultUserDataDir(), 'data-dir-config.json')
+}
+
+/** 读取自定义数据目录配置（同步，因为 getRootDir 在热点路径调用） */
+function readCustomDataDir(): string | null {
+  try {
+    const raw = readFileSync(getDataDirConfigFile(), 'utf-8')
+    const config = JSON.parse(raw) as { customDataDir?: string | null }
+    if (config.customDataDir && existsSync(config.customDataDir)) {
+      return config.customDataDir
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 获取数据根目录（优先使用自定义目录，否则回退到默认 userData） */
 export function getRootDir(): string {
-  if (!userData) userData = app.getPath('userData')
+  if (!userData) {
+    const custom = readCustomDataDir()
+    userData = custom ?? getDefaultUserDataDir()
+  }
   return userData
+}
+
+/**
+ * 将所有数据迁移到新目录。
+ * 复制 data/、models/、live2d-core/ 三个子目录到目标路径，
+ * 成功后写入配置文件，调用方负责 relaunch 应用。
+ */
+export async function migrateDataDir(newDir: string): Promise<void> {
+  const srcRoot = getRootDir()
+  // 确保目标目录存在
+  await fs.mkdir(newDir, { recursive: true })
+
+  // 需要迁移的子目录
+  const subDirs = ['data', 'models', 'live2d-core']
+  for (const sub of subDirs) {
+    const src = path.join(srcRoot, sub)
+    const dest = path.join(newDir, sub)
+    try {
+      await fs.access(src)
+      // 递归复制（覆盖已存在文件）
+      await fs.cp(src, dest, { recursive: true, force: true })
+    } catch {
+      // 源目录不存在则跳过（如尚未导入 Core）
+    }
+  }
+
+  // 写入配置文件（始终在默认 userData 下）
+  const configPath = getDataDirConfigFile()
+  const config = { customDataDir: newDir }
+  const tmpPath = `${configPath}.tmp`
+  await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), 'utf-8')
+  await fs.rename(tmpPath, configPath)
+}
+
+/** 重置数据目录为默认位置（清除自定义配置，不删除数据） */
+export async function resetDataDir(): Promise<void> {
+  const configPath = getDataDirConfigFile()
+  try {
+    await fs.unlink(configPath)
+  } catch {
+    // 配置文件不存在，无需处理
+  }
+}
+
+/** 获取当前数据目录信息 */
+export function getDataDirInfo(): { current: string; default: string; isCustom: boolean } {
+  const current = getRootDir()
+  const defaultDir = getDefaultUserDataDir()
+  return {
+    current,
+    default: defaultDir,
+    isCustom: current !== defaultDir,
+  }
 }
 
 export const paths = {

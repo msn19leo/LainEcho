@@ -133,7 +133,7 @@ class WindowManager {
     // Windows 托盘建议 16x16
     icon = icon.resize({ width: 16, height: 16 })
     this.tray = new Tray(icon)
-    this.tray.setToolTip('AI 桌宠')
+    this.tray.setToolTip('LainEcho')
 
     const menu = Menu.buildFromTemplate([
       {

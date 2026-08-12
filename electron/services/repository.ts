@@ -321,6 +321,7 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
     maxFps: 0,
     dropShadow: true,
     expressionEnabled: false,
+    selectedExpression: '',
   },
   view: { scale: 1, x: 0, y: 0 },
   selectedModelId: null,

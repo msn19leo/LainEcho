@@ -56,7 +56,7 @@ export function SettingsLayout() {
 
   return (
     <div className="app-window flex h-screen flex-col">
-      <WindowTitlebar title="AI 桌宠 · 设置" />
+      <WindowTitlebar title="LainEcho · 设置" />
       <div className="flex min-h-0 flex-1">
         {/* 左侧导航 */}
         <nav className="flex w-48 shrink-0 flex-col border-r border-border bg-surface-2/40 p-4">
@@ -96,8 +96,8 @@ function Logo() {
         <Sparkles size={18} strokeWidth={2} style={{ color: 'var(--on-brand)' }} />
       </div>
       <div className="min-w-0 leading-tight">
-        <div className="truncate text-[13px] font-semibold text-text">AI 桌宠</div>
-        <div className="text-[11px] text-text-muted">LainEcho</div>
+        <div className="truncate text-[13px] font-semibold text-text">LainEcho</div>
+        <div className="text-[11px] text-text-muted">AI 桌宠</div>
       </div>
     </div>
   )

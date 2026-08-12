@@ -56,6 +56,7 @@ const api: WindowApi = {
   model: {
     list: () => ipcRenderer.invoke('model:list'),
     motionGroups: (modelId) => ipcRenderer.invoke('model:motion-groups', modelId),
+    expressionList: (modelId) => ipcRenderer.invoke('model:expression-list', modelId),
     importFromFolder: () => ipcRenderer.invoke('model:import-from-folder'),
     remove: (modelId) => ipcRenderer.invoke('model:remove', modelId),
     coreStatus: () => ipcRenderer.invoke('model:core-status'),
@@ -66,6 +67,9 @@ const api: WindowApi = {
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
     saveApiKey: (key) => ipcRenderer.invoke('settings:save-api-key', key),
     hasApiKey: () => ipcRenderer.invoke('settings:has-api-key'),
+    getDataDir: () => ipcRenderer.invoke('settings:get-data-dir'),
+    changeDataDir: () => ipcRenderer.invoke('settings:change-data-dir'),
+    resetDataDir: () => ipcRenderer.invoke('settings:reset-data-dir'),
   },
   win: {
     minimize: () => ipcRenderer.send('win:minimize'),

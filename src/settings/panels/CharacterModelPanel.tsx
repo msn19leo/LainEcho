@@ -10,9 +10,10 @@ import {
   PersonStanding,
   Play,
   Plus,
+  Smile,
 } from 'lucide-react'
 import { api } from '../../api'
-import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode } from '../../types'
+import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode, ExpressionMeta } from '../../types'
 import {
   AccordionItem,
   Button,
@@ -40,6 +41,8 @@ export function CharacterModelPanel() {
   const [deleting, setDeleting] = useState<Live2DModelMeta | null>(null)
   /** 可用的动作组列表（从模型 model3.json 读取） */
   const [motionGroups, setMotionGroups] = useState<string[]>([])
+  /** 可用的表情列表（从选中模型的 exp3.json 读取） */
+  const [expressions, setExpressions] = useState<ExpressionMeta[]>([])
 
   const { settings, loaded, load, save } = useModelSettingsStore()
 
@@ -65,6 +68,20 @@ export function CharacterModelPanel() {
     void refresh()
     void load()
   }, [load])
+
+  /** 当选中模型变化时，加载该模型的表情列表 */
+  useEffect(() => {
+    if (models.length === 0) {
+      setExpressions([])
+      return
+    }
+    const modelId = settings.selectedModelId ?? models[0]?.id
+    if (!modelId) {
+      setExpressions([])
+      return
+    }
+    void api.model.expressionList(modelId).then(setExpressions).catch(() => setExpressions([]))
+  }, [models, settings.selectedModelId])
 
   const handleImportCore = async () => {
     try {
@@ -366,6 +383,50 @@ export function CharacterModelPanel() {
               </Select>
               {motionGroups.length === 0 && (
                 <p className="mt-1 text-xs text-text-muted">未检测到可用动作组</p>
+              )}
+            </div>
+          </AccordionItem>
+
+          {/* 3. 表情 */}
+          <AccordionItem title="表情" icon={<Smile size={15} strokeWidth={1.75} />}>
+            <div className="border-b border-border py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[13px] font-medium text-text-2">表情系统</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                    解析模型文件夹下的 exp3.json 文件，应用表情参数到 Live2D 模型。
+                    支持 Add / Multiply / Overwrite 三种混合模式。
+                  </div>
+                </div>
+                <Switch
+                  checked={settings.animation.expressionEnabled}
+                  onChange={(v) => updateAnim('expressionEnabled', v)}
+                />
+              </div>
+              {settings.animation.expressionEnabled && (
+                <div className="mt-3">
+                  <div className="mb-2 text-xs font-medium text-text-muted">选择表情</div>
+                  <Select
+                    value={settings.animation.selectedExpression}
+                    onChange={(e) => updateAnim('selectedExpression', e.target.value)}
+                  >
+                    <option value="">不应用表情</option>
+                    {expressions.map((expr) => (
+                      <option key={expr.name} value={expr.name}>
+                        {expr.name}（{expr.parameters.length} 个参数）
+                      </option>
+                    ))}
+                  </Select>
+                  {expressions.length === 0 ? (
+                    <p className="mt-1 text-xs text-text-muted">
+                      当前模型未检测到可用的 exp3.json 表情文件
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-xs text-text-muted">
+                      共 {expressions.length} 个表情可用
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           </AccordionItem>

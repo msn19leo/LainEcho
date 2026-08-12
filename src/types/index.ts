@@ -79,6 +79,29 @@ export interface Live2DModelMeta {
 /** 眨眼模式：Auto = SDK 内置眨眼曲线，Force = 自定义状态机 */
 export type BlinkMode = 'auto' | 'force'
 
+/** 表情混合模式（对应 exp3.json 的 Blend 字段） */
+export type ExpressionBlend = 'Add' | 'Multiply' | 'Overwrite'
+
+/** exp3.json 中的单个表情参数 */
+export interface ExpressionParameter {
+  /** Cubism 参数 ID，如 ParamMouthForm */
+  Id: string
+  /** 参数值 */
+  Value: number
+  /** 混合模式 */
+  Blend: ExpressionBlend
+}
+
+/** 表情元信息（从 model3.json 的 FileReferences.Expressions 解析） */
+export interface ExpressionMeta {
+  /** 表情名称（model3.json 中的 Name 字段） */
+  name: string
+  /** exp3.json 相对路径 */
+  file: string
+  /** 表情参数列表 */
+  parameters: ExpressionParameter[]
+}
+
 /** 模型参数（对应 Cubism 标准参数 ID） */
 export interface ModelParameters {
   // Head Rotation（-30~30）
@@ -134,6 +157,8 @@ export interface ModelAnimationSettings {
   dropShadow: boolean
   /** 表情系统 */
   expressionEnabled: boolean
+  /** 选中的表情名称（空字符串 = 不应用表情） */
+  selectedExpression: string
 }
 
 /** 缩放与位置 */
@@ -229,6 +254,8 @@ export interface WindowApi {
     list: () => Promise<Live2DModelMeta[]>
     /** 读取指定模型的动作组名列表（从 model3.json 的 FileReferences.Motions 解析） */
     motionGroups: (modelId: string) => Promise<string[]>
+    /** 读取指定模型的表情列表（从 model3.json 的 FileReferences.Expressions + exp3.json 解析） */
+    expressionList: (modelId: string) => Promise<ExpressionMeta[]>
     /** 弹原生文件夹选择框并导入 Live2D 模型 */
     importFromFolder: () => Promise<Live2DModelMeta | null>
     remove: (modelId: string) => Promise<void>
@@ -243,6 +270,12 @@ export interface WindowApi {
     save: (settings: Partial<AppSettings>) => Promise<void>
     saveApiKey: (key: string) => Promise<void>
     hasApiKey: () => Promise<boolean>
+    /** 获取当前数据目录信息（当前路径、默认路径、是否自定义） */
+    getDataDir: () => Promise<{ current: string; default: string; isCustom: boolean }>
+    /** 选择新目录并迁移数据，成功后需手动重启应用 */
+    changeDataDir: () => Promise<{ success: boolean; error?: string; needRestart?: boolean }>
+    /** 重置数据目录为默认位置，成功后需手动重启应用 */
+    resetDataDir: () => Promise<{ success: boolean; error?: string; needRestart?: boolean }>
   }
   /** 窗口控制（自定义标题栏、桌宠拖动缩放等） */
   win: {

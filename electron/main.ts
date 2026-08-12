@@ -12,7 +12,7 @@ import { windowManager } from './windows/windowManager'
 registerPetSchemesPrivileged()
 
 // Windows 通知/任务栏归属
-app.setAppUserModelId('com.aidesktop.pet')
+app.setAppUserModelId('com.lainecho.pet')
 
 // 单实例：重复启动时唤醒已有实例的桌宠
 const gotLock = app.requestSingleInstanceLock()

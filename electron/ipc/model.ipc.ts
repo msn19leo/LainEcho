@@ -8,7 +8,7 @@
 import { dialog, ipcMain } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
-import type { Live2DModelMeta } from '../../src/types'
+import type { Live2DModelMeta, ExpressionMeta, ExpressionParameter, ExpressionBlend } from '../../src/types'
 import { addModel, genId, listModels, removeModel, isCorePresent } from '../services/repository'
 import { paths, fileExists } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
@@ -41,6 +41,52 @@ export function registerModelIpc(): void {
       const motions = json.FileReferences?.Motions
       if (!motions || typeof motions !== 'object') return []
       return Object.keys(motions).sort()
+    } catch {
+      return []
+    }
+  })
+
+  /**
+   * 读取指定模型的表情列表：从 model3.json 的 FileReferences.Expressions 获取表情条目，
+   * 再逐个读取 exp3.json 解析 Parameters（Id / Value / Blend）。
+   * 参考 airi 的 expression-store.ts：自行解析而非依赖 SDK 的 ExpressionManager。
+   */
+  ipcMain.handle('model:expression-list', async (_e, modelId: string): Promise<ExpressionMeta[]> => {
+    try {
+      const models = await listModels()
+      const meta = models.find((m) => m.id === modelId)
+      if (!meta) return []
+      const model3Path = path.join(paths.modelDir(modelId), meta.model3Path)
+      const model3Dir = path.dirname(model3Path)
+      const raw = await fs.readFile(model3Path, 'utf-8')
+      const json = JSON.parse(raw) as {
+        FileReferences?: { Expressions?: Array<{ Name: string; File: string }> }
+      }
+      const expressions = json.FileReferences?.Expressions
+      if (!expressions || !Array.isArray(expressions)) return []
+
+      const result: ExpressionMeta[] = []
+      for (const expr of expressions) {
+        if (!expr.Name || !expr.File) continue
+        try {
+          const exprPath = path.join(model3Dir, expr.File)
+          const exprRaw = await fs.readFile(exprPath, 'utf-8')
+          const exprJson = JSON.parse(exprRaw) as {
+            Parameters?: Array<{ Id: string; Value: number; Blend: string }>
+          }
+          const parameters: ExpressionParameter[] = (exprJson.Parameters ?? [])
+            .filter((p) => p.Id && typeof p.Value === 'number' && p.Blend)
+            .map((p) => ({
+              Id: p.Id,
+              Value: p.Value,
+              Blend: p.Blend as ExpressionBlend,
+            }))
+          result.push({ name: expr.Name, file: expr.File, parameters })
+        } catch {
+          // 跳过读取失败的 exp3.json
+        }
+      }
+      return result
     } catch {
       return []
     }

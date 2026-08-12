@@ -1,9 +1,9 @@
 {
-  "name": "ai-desktop-pet",
+  "name": "LainEcho",
   "version": "0.1.0",
-  "description": "AI 桌宠 —— Live2D 形象 + 大模型对话的桌面宠物（参考 moeru-ai/airi 风格）",
+  "description": "AI 桌宠 —— Live2D 形象 + 大模型对话的桌面宠物",
   "main": "dist-electron/main.js",
-  "author": "AI Desktop Pet",
+  "author": "msn19leo <3417029178@qq.com> (https://github.com/msn19leo)",
   "license": "MIT",
   "private": true,
   "scripts": {
