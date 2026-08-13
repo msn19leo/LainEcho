@@ -7,7 +7,7 @@ import path from 'path'
 import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWindow'
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
-import type { ModelSettings } from '../../src/types'
+import type { ModelSettings, CharacterModelOverride, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -59,10 +59,10 @@ class WindowManager {
     }
   }
 
-  /** 角色卡切换后同步桌宠的 Live2D 模型 */
-  setPetModel(modelId: string | null): void {
+  /** 角色卡切换后同步桌宠的 Live2D 模型 + 表情/待机动作覆盖 */
+  setPetCard(payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }): void {
     if (this.pet && !this.pet.isDestroyed()) {
-      this.pet.webContents.send('pet:set-model', modelId)
+      this.pet.webContents.send('pet:set-card', payload)
     }
   }
 
@@ -84,6 +84,17 @@ class WindowManager {
   notifyModelSettingsChanged(settings: ModelSettings): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:model-settings-changed', settings)
+    }
+  }
+
+  /**
+   * 通知桌宠窗口播放语音（由聊天窗口 AI 回复后调用）。
+   * 桌宠窗口收到 pet:speak 事件后：调用 TTS 合成 → 播放音频 → 口型同步。
+   * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
+   */
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:speak', { text, voiceId, languageOverride: languageOverride ?? null })
     }
   }
 

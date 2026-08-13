@@ -8,6 +8,7 @@ import { registerModelIpc } from './model.ipc'
 import { registerModelSettingsIpc } from './modelSettings.ipc'
 import { registerSessionIpc } from './session.ipc'
 import { registerSettingsIpc } from './settings.ipc'
+import { registerTtsIpc } from './tts.ipc'
 import { registerWindowIpc } from './window.ipc'
 
 export function registerAllIpc(): void {
@@ -18,5 +19,6 @@ export function registerAllIpc(): void {
   registerModelSettingsIpc()
   registerSessionIpc()
   registerSettingsIpc()
+  registerTtsIpc()
   registerWindowIpc()
 }

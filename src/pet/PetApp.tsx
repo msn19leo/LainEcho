@@ -10,7 +10,7 @@
  * 因此右上角提供 no-drag 小按钮（聊天 / 设置）。滚轮缩放仍由 wheel 事件处理。
  * 右键唤起自绘上下文菜单（打开聊天 / 打开设置 / 退出）。
  */
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { LogOut, MessageSquare, Settings } from 'lucide-react'
 import { api } from '../api'
@@ -32,6 +32,84 @@ export default function PetApp() {
   const [menu, setMenu] = useState<MenuPos | null>(null)
   const [scalePct, setScalePct] = useState<number | null>(null)
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ============ TTS 双队列架构 ============
+  // 合成和播放完全解耦：合成循环持续从文本队列取句合成，
+  // 播放循环持续从音频队列取音频播放。两条流水线并行运行。
+  // 效果：播放第 1 句时，合成循环已在合成第 2 句 → 句间几乎无间隔。
+  // 旧串行架构间隔 = 合成时间 + 播放时间；新架构间隔 ≈ max(合成时间, 播放时间)。
+
+  /** 待合成的文本队列（入队顺序 = 播放顺序） */
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string; languageOverride: import('../types').TTSLanguage | null }>>([])
+  /** 已合成待播放的音频队列 */
+  const audioQueueRef = useRef<Array<ArrayBuffer>>([])
+  /** 合成锁：同时只合成一句，避免 MiMo API 并发请求 */
+  const isSynthesizingRef = useRef(false)
+  /** 播放锁：同时只播放一段音频，避免叠加 */
+  const isPlayingRef = useRef(false)
+
+  /**
+   * 合成循环：从文本队列取一句合成，结果放入音频队列。
+   * 合成完成后继续合成下一句（如果队列中还有），实现预合成。
+   */
+  const synthesizeLoop = async () => {
+    if (isSynthesizingRef.current) return
+    const next = textQueueRef.current.shift()
+    if (!next) return
+
+    isSynthesizingRef.current = true
+    try {
+      const audio = await api.tts.synthesize({ text: next.text, voiceId: next.voiceId, languageOverride: next.languageOverride })
+      if (audio) {
+        audioQueueRef.current.push(audio)
+        // 有新音频了，尝试触发播放
+        void playLoop()
+      }
+    } catch (err) {
+      console.error('[pet] TTS 合成失败', err)
+    } finally {
+      isSynthesizingRef.current = false
+      // 继续合成下一句（预合成），不等播放
+      if (textQueueRef.current.length > 0) {
+        void synthesizeLoop()
+      }
+    }
+  }
+
+  /**
+   * 播放循环：从音频队列取一段播放，播放完成后继续播放下一段。
+   * 与合成循环并行运行，互不阻塞。
+   */
+  const playLoop = async () => {
+    if (isPlayingRef.current) return
+    const next = audioQueueRef.current.shift()
+    if (!next) return
+
+    isPlayingRef.current = true
+    try {
+      await stageRef.current?.speak(next)
+    } catch (err) {
+      console.error('[pet] TTS 播放失败', err)
+    } finally {
+      isPlayingRef.current = false
+      // 继续播放下一段（如果队列中还有）
+      if (audioQueueRef.current.length > 0) {
+        void playLoop()
+      }
+    }
+  }
+
+  // 订阅"说话"事件：聊天窗口流式分句触发，入文本队列并启动合成+播放流水线
+  useEffect(() => {
+    const unsub = api.pet.onSpeak((payload) => {
+      const { text, voiceId, languageOverride } = payload ?? {}
+      if (!voiceId || !text?.trim()) return
+      textQueueRef.current.push({ text: text.trim(), voiceId, languageOverride: languageOverride ?? null })
+      void synthesizeLoop()
+      void playLoop()
+    })
+    return unsub
+  }, [])
 
   const onWheel = (e: React.WheelEvent) => {
     e.preventDefault()

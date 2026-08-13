@@ -56,6 +56,8 @@ export function getRootDir(): string {
  * 将所有数据迁移到新目录。
  * 复制 data/、models/、live2d-core/ 三个子目录到目标路径，
  * 成功后写入配置文件，调用方负责 relaunch 应用。
+ *
+ * 注：参考音频存放于 data/voices/ 下，会随 data 子目录一起迁移。
  */
 export async function migrateDataDir(newDir: string): Promise<void> {
   const srcRoot = getRootDir()
@@ -121,6 +123,10 @@ export const paths = {
   get coreDir() {
     return path.join(getRootDir(), 'live2d-core')
   },
+  /** 参考音频目录（用于 TTS 声音克隆） */
+  get voicesDir() {
+    return path.join(this.dataDir, 'voices')
+  },
   get characterCardsFile() {
     return path.join(this.dataDir, 'characterCards.json')
   },
@@ -130,8 +136,20 @@ export const paths = {
   get settingsFile() {
     return path.join(this.dataDir, 'settings.json')
   },
+  /** TTS 非敏感配置（语言、自动播放） */
+  get voiceSettingsFile() {
+    return path.join(this.dataDir, 'voice-settings.json')
+  },
+  /** 参考音频索引文件 */
+  get voicesIndexFile() {
+    return path.join(this.voicesDir, 'index.json')
+  },
   get apiKeyFile() {
     return path.join(this.secureDir, 'apiKey.enc')
+  },
+  /** MiMo TTS API Key 加密存储文件（与 LLM API Key 隔离） */
+  get voiceApiKeyFile() {
+    return path.join(this.secureDir, 'voiceApiKey.enc')
   },
   get sessionsIndexFile() {
     return path.join(this.sessionsDir, 'index.json')
@@ -165,6 +183,7 @@ export async function ensureDataDirs() {
     ensureDir(paths.sessionsDir),
     ensureDir(paths.modelsDir),
     ensureDir(paths.coreDir),
+    ensureDir(paths.voicesDir),
   ])
 }
 

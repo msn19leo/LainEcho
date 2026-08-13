@@ -2,7 +2,7 @@
  * Data 面板：会话管理（搜索、按角色卡筛选、导出为 Markdown 后删除）+ 数据目录设置。
  */
 import { useEffect, useMemo, useState } from 'react'
-import { FolderOpen, MessageSquare, RotateCcw, Search } from 'lucide-react'
+import { FolderOpen, MessageSquare, Pencil, RotateCcw, Search } from 'lucide-react'
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
 import type { SessionIndexItem } from '../../types'
@@ -22,6 +22,8 @@ export function DataPanel() {
   const [query, setQuery] = useState('')
   const [filterCard, setFilterCard] = useState('')
   const [pending, setPending] = useState<PendingDelete | null>(null)
+  /** 重命名弹窗状态：目标会话 + 编辑中的标题 */
+  const [renaming, setRenaming] = useState<{ session: SessionIndexItem; title: string } | null>(null)
   /** 数据目录信息 */
   const [dataDir, setDataDir] = useState<{ current: string; default: string; isCustom: boolean } | null>(null)
   const [migrating, setMigrating] = useState(false)
@@ -103,6 +105,28 @@ export function DataPanel() {
     }
   }
 
+  /** 保存修改后的会话标题 */
+  const handleRename = async () => {
+    if (!renaming) return
+    const title = renaming.title.trim()
+    if (!title) {
+      toast('标题不能为空', 'info')
+      return
+    }
+    if (title === renaming.session.title) {
+      setRenaming(null)
+      return
+    }
+    try {
+      await api.session.rename(renaming.session.id, title)
+      toast('标题已更新')
+      setRenaming(null)
+      await refresh()
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '重命名失败', 'error')
+    }
+  }
+
   /** 导出为 Markdown 并删除 */
   const handleExportAndDelete = async () => {
     if (!pending) return
@@ -178,9 +202,18 @@ export function DataPanel() {
                   <span className="selectable">{formatTimeFull(s.createdAt)}</span>
                 </div>
               </div>
-              <Button variant="danger" size="sm" onClick={() => setPending({ session: s, exporting: false })}>
-                删除
-              </Button>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setRenaming({ session: s, title: s.title })}
+                >
+                  <Pencil size={12} strokeWidth={2} /> 重命名
+                </Button>
+                <Button variant="danger" size="sm" onClick={() => setPending({ session: s, exporting: false })}>
+                  删除
+                </Button>
+              </div>
             </Card>
           ))}
         </div>
@@ -218,6 +251,33 @@ export function DataPanel() {
           是否将会话「{truncate(pending?.session.title ?? '', 20)}」导出为 Markdown 后再删除？
           建议先导出备份，避免误删无法恢复。
         </p>
+      </Modal>
+
+      {/* 重命名会话标题 */}
+      <Modal
+        open={!!renaming}
+        onClose={() => setRenaming(null)}
+        title="重命名会话"
+        width={420}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRenaming(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void handleRename()}>保存</Button>
+          </>
+        }
+      >
+        <Input
+          autoFocus
+          value={renaming?.title ?? ''}
+          onChange={(e) => setRenaming((r) => (r ? { ...r, title: e.target.value } : r))}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void handleRename()
+          }}
+          placeholder="输入新的会话标题"
+          maxLength={60}
+        />
       </Modal>
 
       {/* 数据存放位置 */}

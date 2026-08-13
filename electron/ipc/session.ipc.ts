@@ -4,7 +4,7 @@
 import { dialog, ipcMain } from 'electron'
 import type { SessionDetail, SessionIndexItem } from '../../src/types'
 import { sessionToMarkdown } from '../services/markdownExporter'
-import { createSession, getSession, listSessions, removeSession } from '../services/repository'
+import { createSession, getSession, listSessions, removeSession, renameSession } from '../services/repository'
 import { windowManager } from '../windows/windowManager'
 
 export function registerSessionIpc(): void {
@@ -21,6 +21,11 @@ export function registerSessionIpc(): void {
 
   ipcMain.handle('session:remove', async (_e, id: string) => {
     await removeSession(id)
+    windowManager.notifySessionsChanged()
+  })
+
+  ipcMain.handle('session:rename', async (_e, id: string, title: string) => {
+    await renameSession(id, title)
     windowManager.notifySessionsChanged()
   })
 

@@ -7,10 +7,10 @@ import { bindWindowStateEvents, loadWindowPage } from './base'
 
 export function createSettingsWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width: 1000,
-    height: 700,
-    minWidth: 780,
-    minHeight: 540,
+    width: 780,
+    height: 540,
+    minWidth: 760,
+    minHeight: 520,
     frame: false,
     show: false,
     backgroundColor: '#0f1115',

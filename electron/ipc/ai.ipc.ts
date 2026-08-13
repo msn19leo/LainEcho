@@ -38,13 +38,13 @@ export function registerAiIpc(): void {
       if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
       if (!settings.model.trim()) throw new Error('未配置模型名（model）')
 
-      // 组装 system prompt：身份 + 意识 + 全局记忆体（每次请求前实时读取，保证记忆更新即时生效）
+      // 组装 system prompt：人设字段 + 示例对话 + 全局记忆体（每次请求前实时读取，保证记忆更新即时生效）
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
       const memories = await listMemories()
       const systemMessage: ChatMessage = {
         role: 'system',
-        content: buildSystemPrompt(card?.identity ?? '', card?.consciousness ?? '', memories),
+        content: buildSystemPrompt(card, memories),
       }
       const fullMessages: ChatMessage[] = [systemMessage, ...messages]
 

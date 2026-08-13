@@ -15,8 +15,9 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, CharacterModelOverride } from '../types'
 import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
+import { LipSyncController } from './lipSync'
 
 export interface PetStageHandle {
   zoom: (factor: number) => void
@@ -24,6 +25,10 @@ export interface PetStageHandle {
   switchModel: (modelId: string) => void
   /** 当前模型缩放比例（缩放百分比徽标读取） */
   getScale: () => number
+  /** 播放语音并驱动口型同步：传入 wav ArrayBuffer */
+  speak: (audio: ArrayBuffer) => Promise<void>
+  /** 停止播放语音并清零口型参数 */
+  stopSpeak: () => void
 }
 
 interface PetStageProps {
@@ -45,6 +50,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const currentModelIdRef = useRef<string | null>(null)
   /** 当前角色卡绑定的模型 id（null 表示未绑定，应使用全局选中模型） */
   const currentCardModelIdRef = useRef<string | null>(null)
+  /** 当前角色卡的模型设置覆盖（表情/待机动作），null 表示无覆盖，跟随全局 */
+  const cardModelOverrideRef = useRef<CharacterModelOverride | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
@@ -66,6 +73,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const currentExpressionParamsRef = useRef<ExpressionParameter[]>([])
   /** 表情修改前的参数基础值（每帧还原后再应用新表情，避免叠加残留） */
   const expressionBaseValuesRef = useRef<Map<string, number>>(new Map())
+  /** 口型同步控制器：播放音频并驱动 ParamMouthOpen */
+  const lipSyncRef = useRef<LipSyncController>(new LipSyncController())
 
   useImperativeHandle(stageRef, () => ({
     zoom: (factor) => {
@@ -75,6 +84,14 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     getScale: () => currentScaleRef.current,
     switchModel: (modelId) => {
       void loadModel(modelId)
+    },
+    /** 播放音频并启动口型同步 */
+    speak: async (audio: ArrayBuffer) => {
+      await lipSyncRef.current.play(audio)
+    },
+    /** 停止播放并清零口型 */
+    stopSpeak: () => {
+      lipSyncRef.current.stop()
     },
   }))
 
@@ -138,17 +155,44 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   }
 
   /**
-   * 根据当前设置（expressionEnabled + selectedExpression）和已加载的表情列表，
+   * 获取当前生效的表情名：角色卡覆盖优先，否则跟随全局设置。
+   * 返回空串表示不应用表情。
+   */
+  function getEffectiveExpression(): string {
+    const override = cardModelOverrideRef.current
+    if (override && override.selectedExpression !== null) return override.selectedExpression
+    return settingsRef.current.animation.selectedExpression
+  }
+
+  /**
+   * 获取当前生效的待机动作组：角色卡覆盖优先，否则跟随全局设置。
+   * 返回空串表示无指定动作组（随机选择）。
+   */
+  function getEffectiveIdleAnimation(): string {
+    const override = cardModelOverrideRef.current
+    if (override && override.idleAnimation !== null) return override.idleAnimation
+    return settingsRef.current.animation.idleAnimation
+  }
+
+  /**
+   * 根据当前设置（expressionEnabled + 生效表情名）和已加载的表情列表，
    * 更新 currentExpressionParamsRef。每帧由 ticker 读取并应用到 coreModel。
-   * 参考 airi 的 expression-controller.ts：不使用 SDK 的 ExpressionManager，直接管理参数。
+   * 参考 airi 的 expression-controller.ts：不使用 SDK 的 Expression Manager，直接管理参数。
+   * 角色卡 modelOverride.selectedExpression 非 null 时覆盖全局 selectedExpression。
    */
   function updateCurrentExpression() {
     const anim = settingsRef.current.animation
-    if (!anim.expressionEnabled || !anim.selectedExpression) {
+    // 角色卡覆盖表情：若 override.selectedExpression 非 null，强制启用表情（即使全局 expressionEnabled=false）
+    const override = cardModelOverrideRef.current
+    const expressionEnabled = override?.selectedExpression !== null && override?.selectedExpression !== undefined
+      ? true
+      : anim.expressionEnabled
+    const selectedExpression = getEffectiveExpression()
+    if (!expressionEnabled || !selectedExpression) {
       currentExpressionParamsRef.current = []
       return
     }
-    const expr = expressionListRef.current.find((e) => e.name === anim.selectedExpression)
+    const expr = expressionListRef.current.find((e) => e.name === selectedExpression)
     currentExpressionParamsRef.current = expr?.parameters ?? []
   }
 
@@ -301,8 +345,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applyModelParameters(coreModel, params, mouseTrackingActive)
 
       // 2. 表情（在用户参数之后、眨眼之前应用，参考 airi 的表情应用顺序）
-      //    每帧先还原上一帧的表情参数基础值，再应用当前表情，避免叠加残留
-      if (animation.expressionEnabled && currentExpressionParamsRef.current.length > 0) {
+      //    每帧先还原上一帧的表情参数基础值，再应用当前表情，避免叠加残留。
+      //    currentExpressionParamsRef 由 updateCurrentExpression 维护，已合并角色卡覆盖。
+      if (currentExpressionParamsRef.current.length > 0) {
         applyExpression(coreModel, currentExpressionParamsRef.current, expressionBaseValuesRef.current)
       } else if (expressionBaseValuesRef.current.size > 0) {
         // 表情已关闭或未选中：还原之前被表情修改的参数
@@ -319,6 +364,18 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         updateEyeTracking(coreModel, mouseRef.current, animation, focusRef.current)
       } else if (animation.idleEyeMovement) {
         updateIdleEyes(internal!, idleEyeRef.current, delta)
+      }
+
+      // 5. 口型同步（最后应用，覆盖嘴巴开合参数）
+      //    执行顺序：用户参数 → 表情 → 眨眼 → 眼神 → 口型同步
+      //    口型放在最后，确保说话时嘴巴开合优先于其他参数对口型的修改。
+      //    同时设置 ParamMouthOpen 和 ParamMouthOpenY：
+      //    不同 Live2D 模型使用的嘴巴参数名不同（有的只有 ParamMouthOpenY，
+      //    有的只有 ParamMouthOpen），两个都设置确保兼容。
+      if (lipSyncRef.current.isPlaying) {
+        const mouthOpen = lipSyncRef.current.getMouthOpen()
+        coreModel.setParameterValueById?.('ParamMouthOpen', mouthOpen)
+        coreModel.setParameterValueById?.('ParamMouthOpenY', mouthOpen)
       }
     }
 
@@ -420,9 +477,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         // ---- 3. 加载模型 ----
         await loadModel()
 
-        // 随机待机动作（根据设置决定播放指定动作组或随机）
+        // 随机待机动作（角色卡覆盖优先，否则跟随全局设置）
         idleTimer = setInterval(() => {
-          const idleAnim = settingsRef.current.animation.idleAnimation
+          const idleAnim = getEffectiveIdleAnimation()
           playRandomIdle(modelRef.current, idleAnim || undefined)
         }, IDLE_MS)
       } finally {
@@ -433,8 +490,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     void init()
 
     // 订阅始终注册（即使 core 缺失也会收到导入事件后重试）：
-    // 角色卡切换 → 换模型；模型列表变化 / Cubism Core 导入 → 重新初始化
-    unsubModel = api.pet.onModelChanged((modelId) => {
+    // 角色卡切换 → 换模型 + 应用表情/待机动作覆盖；模型列表变化 / Cubism Core 导入 → 重新初始化
+    unsubModel = api.pet.onCardChanged((payload) => {
+      const { modelId, modelOverride } = payload ?? {}
+      // 记录角色卡的模型覆盖配置，触发表情参数刷新
+      cardModelOverrideRef.current = modelOverride ?? null
+      updateCurrentExpression()
       if (modelId) {
         // 角色卡绑定了模型：记录并加载该模型
         currentCardModelIdRef.current = modelId
@@ -488,6 +549,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       unsubSettings()
       unsubCursor()
       ro?.disconnect()
+      // 停止口型同步并释放 AudioContext
+      lipSyncRef.current.stop()
       clearModel()
       appRef.current?.destroy(true, { children: true, texture: true })
       appRef.current = null

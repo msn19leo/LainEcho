@@ -2,7 +2,7 @@
  * 消息流（airi 风格竖向对话流）。
  *
  * 设计：
- *   - 用户消息靠右：填充主色调渐变（深色青→深青，浅色蓝→深蓝）+ 主色光晕。
+ *   - 用户消息靠右（气泡右对齐）：填充主色调渐变（深色青→深青，浅色蓝→深蓝）+ 主色光晕，文字左对齐。
  *   - AI 消息靠左：毛玻璃卡片 + 主色调边框。
  *   - 流式输出带流光打字机光标（.streaming-cursor，见 index.css）。
  *   - 消息出现使用 popSlideUp 弹性入场（scale 0.96 + y 12，0.4s 弹性曲线），逐条轻微错落。
@@ -65,8 +65,8 @@ export function MessageList() {
             transition={{ ...popSlideUp.transition, delay: Math.min(i * 0.04, 0.32) }}
             className={cn('flex', isUser ? 'justify-end' : 'justify-start')}
           >
-            <div className={cn('max-w-[80%]', isUser ? 'text-right' : 'text-left')}>
-              <div className="mb-1 flex items-center gap-2 px-1 text-xs text-text-muted">
+            <div className="max-w-[80%] text-left">
+              <div className={cn('mb-1 flex items-center gap-2 px-1 text-xs text-text-muted', isUser && 'justify-end')}>
                 <span>{isUser ? '你' : currentCardName || 'AI'}</span>
                 {msg.timestamp && <span>{formatTime(msg.timestamp)}</span>}
               </div>

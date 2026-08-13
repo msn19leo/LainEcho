@@ -5,6 +5,7 @@
  * - 应用级操作（打开聊天/设置、同步桌宠模型、退出）
  */
 import { app, BrowserWindow, ipcMain } from 'electron'
+import type { CharacterModelOverride, TTSLanguage } from '../../src/types'
 import { markPetWindowQuitting } from '../windows/petWindow'
 import { windowManager } from '../windows/windowManager'
 
@@ -91,8 +92,13 @@ export function registerWindowIpc(): void {
   ipcMain.on('app:open-chat', () => windowManager.showChat())
   ipcMain.on('app:open-settings', () => windowManager.showSettings())
 
-  ipcMain.on('app:set-pet-model', (_e, modelId: string | null) => {
-    windowManager.setPetModel(modelId)
+  ipcMain.on('app:set-pet-card', (_e, payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => {
+    windowManager.setPetCard(payload)
+  })
+
+  /** 通知桌宠窗口播放语音（聊天窗口 AI 回复后调用，触发 TTS + 口型同步） */
+  ipcMain.on('app:speak', (_e, text: string, voiceId: string | null, languageOverride?: TTSLanguage | null) => {
+    windowManager.speak(text, voiceId, languageOverride)
   })
 
   ipcMain.on('app:quit', () => {

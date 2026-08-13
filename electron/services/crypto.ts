@@ -56,3 +56,29 @@ export async function hasApiKey(): Promise<boolean> {
 export async function clearApiKey(): Promise<void> {
   await deleteFile(paths.apiKeyFile)
 }
+
+// ---------------- 通用加解密（支持自定义文件路径，用于多个 Key 隔离） ----------------
+
+/** 保存密钥到指定文件（密文落盘） */
+export async function saveSecret(filePath: string, key: string): Promise<void> {
+  const encrypted = encryptSecret(key)
+  await writeBuffer(filePath, encrypted)
+}
+
+/** 读取指定文件的密钥明文（仅主进程内存中使用） */
+export async function readSecret(filePath: string): Promise<string | null> {
+  if (!(await fileExists(filePath))) return null
+  const encrypted = await readBuffer(filePath)
+  if (!encrypted) return null
+  try {
+    return decryptSecret(encrypted)
+  } catch {
+    return null
+  }
+}
+
+/** 判断指定文件是否已配置密钥 */
+export async function hasSecret(filePath: string): Promise<boolean> {
+  if (!(await fileExists(filePath))) return false
+  return (await readSecret(filePath)) !== null
+}

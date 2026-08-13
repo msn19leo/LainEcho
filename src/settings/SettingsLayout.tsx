@@ -15,6 +15,7 @@ import {
   KeyRound,
   PersonStanding,
   Sparkles,
+  AudioLines,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -28,8 +29,9 @@ import { CharacterCardPanel } from './panels/CharacterCardPanel'
 import { CharacterModelPanel } from './panels/CharacterModelPanel'
 import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
+import { VoicePanel } from './panels/VoicePanel'
 
-export type ModuleId = 'character-card' | 'model' | 'api' | 'memory' | 'data'
+export type ModuleId = 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice'
 
 interface ModuleDef {
   id: ModuleId
@@ -42,6 +44,7 @@ const MODULES: ModuleDef[] = [
   { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Bot },
   { id: 'model', title: '角色模型', desc: 'Live2D 模型导入与管理。', icon: PersonStanding },
   { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
+  { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。', icon: AudioLines },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
   { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
 ]
@@ -209,6 +212,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       {id === 'character-card' && <CharacterCardPanel />}
       {id === 'model' && <CharacterModelPanel />}
       {id === 'api' && <ApiConfigPanel />}
+      {id === 'voice' && <VoicePanel />}
       {id === 'memory' && <MemoryPanel />}
       {id === 'data' && <DataPanel />}
     </div>

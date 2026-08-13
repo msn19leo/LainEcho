@@ -12,18 +12,114 @@ export interface ChatMessage {
   timestamp?: number
 }
 
-/** 角色卡：AI 桌宠的“身份”与“意识”，分开配置 */
+/** 角色卡 schema 版本，用于未来迁移 */
+export const CHARACTER_CARD_VERSION = 1
+
+/** 角色级 TTS 配置覆盖：解决日文/中文角色共用全局 language 的问题。null 字段表示跟随全局 */
+export interface CharacterTTSOverride {
+  /** null = 跟随全局；'zh'/'ja' = 角色强制语言 */
+  language: TTSLanguage | null
+  /** null = 跟随全局 */
+  autoPlay: boolean | null
+}
+
+/** 角色级模型设置覆盖：让同一 Live2D 模型在不同角色下有不同表情/待机动作。null 字段表示跟随全局 */
+export interface CharacterModelOverride {
+  /** null = 跟随全局；空串 = 清除表情 */
+  selectedExpression: string | null
+  /** null = 跟随全局；空串 = 无待机动作 */
+  idleAnimation: string | null
+}
+
+/** 角色卡：AI 桌宠的"身份"与"意识"，借鉴 CCv3 分层（description/personality/scenario） */
 export interface CharacterCard {
   id: string
   name: string
-  /** 身份：角色是什么（身份设定），作为 system prompt 的一部分注入 */
-  identity: string
-  /** 意识：角色的思维、行为方式、说话习惯，作为 system prompt 的一部分注入 */
-  consciousness: string
-  /** 可选：绑定的 Live2D 模型 id（不绑定则使用全局当前模型） */
+  /** schema 版本号，迁移用 */
+  version: number
+
+  // --- 人设字段（借鉴 CCv3，分层清晰）---
+  /** 角色描述：身份设定——角色是什么，作为 system prompt 的一部分注入 */
+  description: string
+  /** 性格特征：思维方式、说话习惯——角色怎么表现，作为 system prompt 的一部分注入 */
+  personality: string
+  /** 场景设定：角色所处的情境（可选，如"住在用户电脑里"），作为 system prompt 的一部分注入 */
+  scenario: string
+
+  // --- 对话增强 ---
+  /** 开场白：新会话首条 AI 消息（空 = 不发送） */
+  greeting: string
+  /** 备选开场白（与 greeting 合并后随机选一条，或用户手动切换） */
+  alternateGreetings: string[]
+  /** 示例对话 few-shot，格式 "{{char}}: xxx\n{{user}}: yyy"，作为 system prompt 的一部分注入 */
+  messageExample: string
+
+  // --- 绑定 ---
+  /** 绑定的 Live2D 模型 id（null = 使用全局当前模型） */
   modelId: string | null
+  /** 绑定的参考音频 id（null = 不启用 TTS） */
+  voiceId: string | null
+
+  // --- 角色级配置覆盖（null = 跟随全局）---
+  /** TTS 配置覆盖：解决日文/中文角色共用全局 language 的问题 */
+  ttsOverride: CharacterTTSOverride | null
+  /** 模型设置覆盖：让同模型不同角色有不同表情/待机动作 */
+  modelOverride: CharacterModelOverride | null
+
+  // --- 元数据 ---
+  /** 标签/分类 */
+  tags: string[]
+  /** 头像文件名（相对 avatars/，null = 用首字占位） */
+  avatar: string | null
+  creator: string
+  notes: string
   createdAt: number
   updatedAt: number
+}
+
+/** 角色卡创建/更新时的业务输入字段（不含 id/时间戳/版本，由主进程生成） */
+export type CharacterCardInput = Pick<
+  CharacterCard,
+  | 'name'
+  | 'description'
+  | 'personality'
+  | 'scenario'
+  | 'greeting'
+  | 'alternateGreetings'
+  | 'messageExample'
+  | 'modelId'
+  | 'voiceId'
+  | 'ttsOverride'
+  | 'modelOverride'
+  | 'tags'
+  | 'avatar'
+  | 'creator'
+  | 'notes'
+>
+
+/** 参考音频元信息（voices/index.json，用于 MiMo 声音克隆） */
+export interface VoiceReference {
+  id: string
+  /** 用户起名，如"小夜子声线" */
+  name: string
+  /** 相对 voices/ 的文件名（如 voice_xxx.wav） */
+  filePath: string
+  /** 音频时长（秒），0 表示未解析 */
+  durationSec: number
+  createdAt: number
+}
+
+/** TTS 输出语言（影响 MiMo 合成的语言指令） */
+export type TTSLanguage = 'zh' | 'ja'
+
+/** TTS 全局配置（voice-settings.json，非敏感） */
+export interface TTSConfig {
+  /** 输出语言：中文 / 日文 */
+  language: TTSLanguage
+  /** AI 回复完成后是否自动播放语音 */
+  autoPlay: boolean
+  /** MiMo 模型名（如 mimo-v2.5-tts-voiceclone） */
+  model: string
 }
 
 /** 记忆体：用户手动维护的全局固定记忆条目 */
@@ -228,12 +324,13 @@ export interface WindowApi {
   }
   characterCard: {
     list: () => Promise<CharacterCard[]>
-    create: (card: Omit<CharacterCard, 'id' | 'createdAt' | 'updatedAt'>) => Promise<CharacterCard>
-    update: (
-      id: string,
-      patch: Partial<Pick<CharacterCard, 'name' | 'identity' | 'consciousness' | 'modelId'>>,
-    ) => Promise<void>
+    /** 创建角色卡：传业务字段，id/时间戳/版本由主进程生成 */
+    create: (card: CharacterCardInput) => Promise<CharacterCard>
+    /** 更新角色卡：传部分业务字段 */
+    update: (id: string, patch: Partial<CharacterCardInput>) => Promise<void>
     remove: (id: string) => Promise<void>
+    /** 订阅角色卡列表变化（其他窗口增删改时），返回取消订阅函数 */
+    onChanged: (cb: () => void) => () => void
   }
   memory: {
     list: () => Promise<MemoryItem[]>
@@ -246,8 +343,10 @@ export interface WindowApi {
     get: (id: string) => Promise<SessionDetail>
     create: (params: { characterCardId: string }) => Promise<SessionIndexItem>
     remove: (id: string) => Promise<void>
+    /** 修改会话标题（Data 面板重命名） */
+    rename: (id: string, title: string) => Promise<void>
     exportMarkdown: (id: string) => Promise<ExportResult | null>
-    /** 订阅会话列表变化（其他窗口新建/删除会话时），返回取消订阅函数 */
+    /** 订阅会话列表变化（其他窗口新建/删除/重命名会话时），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }
   model: {
@@ -296,14 +395,15 @@ export interface WindowApi {
   app: {
     openChat: () => void
     openSettings: () => void
-    /** 通知桌宠窗口切换 Live2D 模型 */
-    setPetModel: (modelId: string | null) => void
-    /** 通知桌宠窗口切换角色卡（刷新人设提示，可选） */
+    /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖） */
+    setPetCard: (payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => void
     quit: () => void
+    /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
+    speak: (text: string, voiceId: string | null, languageOverride?: TTSLanguage | null) => void
   }
   pet: {
-    /** 订阅角色卡切换事件（chat 窗口切卡后同步到桌宠） */
-    onModelChanged: (cb: (modelId: string | null) => void) => () => void
+    /** 订阅角色卡切换事件（chat 窗口切卡后同步模型 + 覆盖配置到桌宠） */
+    onCardChanged: (cb: (payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => void) => () => void
     /** 订阅 Live2D 模型列表变化（导入/删除后刷新） */
     onModelsChanged: (cb: () => void) => () => void
     /** 订阅 Cubism Core 运行库导入事件（导入后桌宠重新初始化） */
@@ -314,6 +414,31 @@ export interface WindowApi {
     onModelSettingsChanged: (cb: (settings: ModelSettings) => void) => () => void
     /** 订阅全局鼠标坐标变化（窗口相对坐标，由主进程轮询 screen.getCursorScreenPoint） */
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
+    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null }) => void) => () => void
+  }
+  /** 语音合成（TTS）：MiMo 声音克隆 */
+  tts: {
+    /** 读取 TTS 配置（含 API Key 是否已配置，不回显明文） */
+    getConfig: () => Promise<TTSConfig & { hasApiKey: boolean }>
+    /** 保存 TTS 配置（语言、自动播放），返回保存后的完整配置 */
+    saveConfig: (patch: Partial<TTSConfig>) => Promise<TTSConfig>
+    /** 单独保存 MiMo API Key（加密存储，与 LLM Key 隔离） */
+    saveApiKey: (key: string) => Promise<void>
+    /** MiMo API Key 是否已配置 */
+    hasApiKey: () => Promise<boolean>
+    /** 弹原生文件选择框并导入参考音频（wav/mp3，建议 5-30 秒）。
+     *  返回 voice + 质量警告（时长不在推荐范围时非空）。 */
+    importReference: () => Promise<{ voice: VoiceReference; warning: string | null } | null>
+    /** 列出所有已导入的参考音频 */
+    listReferences: () => Promise<VoiceReference[]>
+    /** 删除指定参考音频（同时删除文件与索引条目） */
+    removeReference: (id: string) => Promise<void>
+    /** 合成语音：传入文本与参考音频 id，返回 wav 格式的 ArrayBuffer。
+     *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）。 */
+    synthesize: (params: { text: string; voiceId: string; languageOverride?: TTSLanguage | null }) => Promise<ArrayBuffer | null>
+    /** 重命名参考音频，返回更新后的对象 */
+    renameReference: (id: string, name: string) => Promise<VoiceReference>
   }
   /** 模型设置（缩放/位置/动画/参数） */
   modelSettings: {

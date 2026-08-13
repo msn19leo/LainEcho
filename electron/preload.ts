@@ -34,6 +34,11 @@ const api: WindowApi = {
     create: (card) => ipcRenderer.invoke('character-card:create', card),
     update: (id, patch) => ipcRenderer.invoke('character-card:update', id, patch),
     remove: (id) => ipcRenderer.invoke('character-card:remove', id),
+    onChanged: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('character-cards-changed', listener)
+      return () => ipcRenderer.removeListener('character-cards-changed', listener)
+    },
   },
   memory: {
     list: () => ipcRenderer.invoke('memory:list'),
@@ -46,6 +51,7 @@ const api: WindowApi = {
     get: (id) => ipcRenderer.invoke('session:get', id),
     create: (params) => ipcRenderer.invoke('session:create', params),
     remove: (id) => ipcRenderer.invoke('session:remove', id),
+    rename: (id, title) => ipcRenderer.invoke('session:rename', id, title),
     exportMarkdown: (id) => ipcRenderer.invoke('session:export-markdown', id),
     onChanged: (cb) => {
       const listener = () => cb()
@@ -90,14 +96,16 @@ const api: WindowApi = {
   app: {
     openChat: () => ipcRenderer.send('app:open-chat'),
     openSettings: () => ipcRenderer.send('app:open-settings'),
-    setPetModel: (modelId) => ipcRenderer.send('app:set-pet-model', modelId),
+    setPetCard: (payload) => ipcRenderer.send('app:set-pet-card', payload),
     quit: () => ipcRenderer.send('app:quit'),
+    /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
+    speak: (text, voiceId, languageOverride) => ipcRenderer.send('app:speak', text, voiceId, languageOverride),
   },
   pet: {
-    onModelChanged: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, modelId: string | null) => cb(modelId)
-      ipcRenderer.on('pet:set-model', listener)
-      return () => ipcRenderer.removeListener('pet:set-model', listener)
+    onCardChanged: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { modelId: string | null; modelOverride: import('../src/types').CharacterModelOverride | null }) => cb(payload)
+      ipcRenderer.on('pet:set-card', listener)
+      return () => ipcRenderer.removeListener('pet:set-card', listener)
     },
     onModelsChanged: (cb) => {
       const listener = () => cb()
@@ -120,7 +128,25 @@ const api: WindowApi = {
       ipcRenderer.on('cursor:move', listener)
       return () => ipcRenderer.removeListener('cursor:move', listener)
     },
+    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
+    onSpeak: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null }) => cb(payload)
+      ipcRenderer.on('pet:speak', listener)
+      return () => ipcRenderer.removeListener('pet:speak', listener)
+    },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
+  },
+  /** 语音合成（TTS）：MiMo 声音克隆 */
+  tts: {
+    getConfig: () => ipcRenderer.invoke('tts:get-config'),
+    saveConfig: (patch) => ipcRenderer.invoke('tts:save-config', patch),
+    saveApiKey: (key) => ipcRenderer.invoke('tts:save-api-key', key),
+    hasApiKey: () => ipcRenderer.invoke('tts:has-api-key'),
+    importReference: () => ipcRenderer.invoke('tts:import-reference'),
+    listReferences: () => ipcRenderer.invoke('tts:list-references'),
+    removeReference: (id) => ipcRenderer.invoke('tts:remove-reference', id),
+    renameReference: (id, name) => ipcRenderer.invoke('tts:rename-reference', id, name),
+    synthesize: (params) => ipcRenderer.invoke('tts:synthesize', params),
   },
   modelSettings: {
     get: () => ipcRenderer.invoke('model-settings:get'),

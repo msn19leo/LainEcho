@@ -1,29 +1,39 @@
 /**
  * 角色卡 CRUD IPC。
+ * 增删改后通过 windowManager 广播 character-cards-changed 事件，
+ * 实现跨窗口同步（替代旧版依赖 window.focus 轮询的机制）。
  */
 import { ipcMain } from 'electron'
-import type { CharacterCard } from '../../src/types'
+import type { CharacterCardInput } from '../../src/types'
 import {
   createCharacterCard,
   listCharacterCards,
   removeCharacterCard,
   updateCharacterCard,
 } from '../services/repository'
+import { windowManager } from '../windows/windowManager'
 
 export function registerCharacterCardIpc(): void {
   ipcMain.handle('character-card:list', () => listCharacterCards())
 
-  ipcMain.handle(
-    'character-card:create',
-    (_e, input: Pick<CharacterCard, 'name' | 'identity' | 'consciousness' | 'modelId'>) =>
-      createCharacterCard(input),
-  )
+  ipcMain.handle('character-card:create', async (_e, input: CharacterCardInput) => {
+    const card = await createCharacterCard(input)
+    notifyCharacterCardsChanged()
+    return card
+  })
 
-  ipcMain.handle(
-    'character-card:update',
-    (_e, id: string, patch: Partial<Pick<CharacterCard, 'name' | 'identity' | 'consciousness' | 'modelId'>>) =>
-      updateCharacterCard(id, patch),
-  )
+  ipcMain.handle('character-card:update', async (_e, id: string, patch: Partial<CharacterCardInput>) => {
+    await updateCharacterCard(id, patch)
+    notifyCharacterCardsChanged()
+  })
 
-  ipcMain.handle('character-card:remove', (_e, id: string) => removeCharacterCard(id))
+  ipcMain.handle('character-card:remove', async (_e, id: string) => {
+    await removeCharacterCard(id)
+    notifyCharacterCardsChanged()
+  })
+}
+
+/** 角色卡增删改后广播到所有窗口，触发跨窗口同步刷新 */
+export function notifyCharacterCardsChanged(): void {
+  windowManager.broadcast('character-cards-changed')
 }

@@ -66,6 +66,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const detail = await api.session.get(id)
       if (seq !== loadSeq) return // 已有更新的切换请求，丢弃本次响应
       set({ currentSessionId: id, messages: detail.messages })
+      // 切换会话时同步角色卡：根据会话绑定的 characterCardId 切换当前角色卡，
+      // 并通知桌宠窗口同步模型 + 表情/待机动作覆盖
+      const charStore = useCharacterStore.getState()
+      if (detail.characterCardId && detail.characterCardId !== charStore.currentCardId) {
+        charStore.setCurrentCard(detail.characterCardId)
+        const card = charStore.cards.find((c) => c.id === detail.characterCardId)
+        api.app.setPetCard({
+          modelId: card?.modelId ?? null,
+          modelOverride: card?.modelOverride ?? null,
+        })
+      }
     } catch (err) {
       if (seq === loadSeq) console.error('加载会话失败', err)
     }
