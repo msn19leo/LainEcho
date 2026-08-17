@@ -7,8 +7,10 @@
  *
  * framer-motion 滑入滑出；当前会话左侧品牌渐变竖条标识。
  */
+import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { MessageSquareText, Plus, X } from 'lucide-react'
+import { Check, MessageSquareText, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { api } from '../api'
 import { useCharacterStore } from '../store/characterStore'
 import { useSessionStore } from '../store/sessionStore'
 import { cn, formatRelativeTime, truncate } from '../lib/utils'
@@ -25,7 +27,19 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
   const streaming = useSessionStore((s) => s.streaming)
   const loadSession = useSessionStore((s) => s.loadSession)
   const resetCurrentSession = useSessionStore((s) => s.resetCurrentSession)
+  const deleteSession = useSessionStore((s) => s.deleteSession)
   const characterCards = useCharacterStore((s) => s.cards)
+
+  /** 正在重命名的会话 id；null = 无重命名进行中 */
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  /** 重命名输入框当前值 */
+  const [renameValue, setRenameValue] = useState('')
+  const renameInputRef = useRef<HTMLInputElement>(null)
+
+  // 进入重命名态时自动聚焦并全选原标题，方便直接覆盖输入
+  useEffect(() => {
+    if (renamingId) renameInputRef.current?.select()
+  }, [renamingId])
 
   const handleNew = () => {
     const cardId = useCharacterStore.getState().currentCardId
@@ -34,6 +48,29 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
     resetCurrentSession()
     onClose()
   }
+
+  /** 进入行内重命名：记录目标会话并载入原标题 */
+  const startRename = (s: { id: string; title: string }) => {
+    setRenamingId(s.id)
+    setRenameValue(s.title)
+  }
+
+  /** 提交重命名：空标题则放弃；成功后刷新列表（主进程会广播通知其他窗口） */
+  const commitRename = async () => {
+    const id = renamingId
+    setRenamingId(null)
+    const title = renameValue.trim()
+    if (!id || !title) return
+    try {
+      await api.session.rename(id, title)
+      await useSessionStore.getState().onSessionsChanged()
+    } catch (err) {
+      console.error('重命名会话失败', err)
+    }
+  }
+
+  /** 取消重命名 */
+  const cancelRename = () => setRenamingId(null)
 
   return (
     <AnimatePresence>
@@ -72,19 +109,14 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
               )}
               {sessions.map((s) => {
                 const active = s.id === currentSessionId
+                const renaming = renamingId === s.id
                 return (
-                  <button
+                  <div
                     key={s.id}
-                    onClick={() => {
-                      if (streaming) return // 流式中禁止切换会话，防止串台
-                      if (!active) void loadSession(s.id)
-                      onClose()
-                    }}
-                    disabled={streaming}
                     className={cn(
-                      'relative mb-1 block w-full rounded-[var(--radius-md)] px-3 py-3 text-left transition-colors',
+                      'group relative mb-1 flex w-full items-center rounded-[var(--radius-md)] transition-colors',
                       active ? 'bg-primary-500/10' : 'hover:bg-card-hover',
-                      streaming && 'cursor-not-allowed opacity-60',
+                      (streaming || renaming) && 'cursor-not-allowed opacity-60',
                     )}
                   >
                     {active && (
@@ -93,14 +125,82 @@ export function SessionSidebar({ open, onClose }: SessionSidebarProps) {
                         style={{ background: 'var(--gradient-brand)', boxShadow: '0 0 8px var(--primary-glow)' }}
                       />
                     )}
-                    <div className={cn('truncate pl-1 text-sm font-medium', active ? 'text-text' : 'text-text-2')}>
-                      {truncate(s.title, 20)}
-                    </div>
-                    <div className="mt-1 flex items-center justify-between pl-1 text-xs text-text-muted">
-                      <span className="max-w-[60%] truncate">{s.characterCardName}</span>
-                      <span>{formatRelativeTime(s.updatedAt)}</span>
-                    </div>
-                  </button>
+                    {renaming ? (
+                      /* 行内重命名编辑态：输入框 + 确认按钮 */
+                      <div className="relative min-w-0 flex-1 px-3 py-3">
+                        <input
+                          ref={renameInputRef}
+                          value={renameValue}
+                          onChange={(e) => setRenameValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void commitRename()
+                            if (e.key === 'Escape') cancelRename()
+                          }}
+                          autoFocus
+                          placeholder="会话标题"
+                          className="w-full rounded-[var(--radius)] border border-[var(--primary-400)] bg-transparent px-2 py-1 text-sm font-medium text-text outline-none"
+                        />
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          if (streaming) return // 流式中禁止切换会话，防止串台
+                          if (!active) void loadSession(s.id)
+                          onClose()
+                        }}
+                        disabled={streaming}
+                        className="relative min-w-0 flex-1 px-3 py-3 text-left"
+                      >
+                        <div className={cn('truncate pl-1 text-sm font-medium', active ? 'text-text' : 'text-text-2')}>
+                          {truncate(s.title, 20)}
+                        </div>
+                        <div className="mt-1 flex items-center justify-between pl-1 text-xs text-text-muted">
+                          <span className="max-w-[60%] truncate">{s.characterCardName}</span>
+                          <span>{formatRelativeTime(s.updatedAt)}</span>
+                        </div>
+                      </button>
+                    )}
+                    {renaming ? (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation() // 阻止冒泡触发切换会话
+                          void commitRename()
+                        }}
+                        aria-label="确认重命名"
+                        title="确认"
+                        className="mr-2 rounded-[var(--radius)] p-1.5 text-[var(--success)] hover:bg-success/10"
+                      >
+                        <Check size={14} strokeWidth={2.5} />
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation() // 阻止冒泡触发切换会话
+                            startRename(s)
+                          }}
+                          disabled={streaming}
+                          aria-label={`重命名会话「${s.title}」`}
+                          title="重命名"
+                          className="rounded-[var(--radius)] p-1.5 text-text-muted opacity-45 transition-all hover:bg-card-hover hover:text-text focus:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100"
+                        >
+                          <Pencil size={14} strokeWidth={2} />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation() // 阻止冒泡触发切换会话
+                            void deleteSession(s.id)
+                          }}
+                          disabled={streaming}
+                          aria-label={`删除会话「${s.title}」`}
+                          title="删除会话"
+                          className="mr-2 rounded-[var(--radius)] p-1.5 text-text-muted opacity-45 transition-all hover:bg-danger/10 hover:text-danger focus:opacity-100 disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100"
+                        >
+                          <Trash2 size={14} strokeWidth={2} />
+                        </button>
+                      </>
+                    )}
+                  </div>
                 )
               })}
             </div>

@@ -24,19 +24,19 @@ import { SessionSidebar } from './SessionSidebar'
 import { toast } from '../components/toast'
 
 /**
- * 流式分句配置（方案 B）：
+ * 流式分句配置（平衡版）：
  * - SENTENCE_BOUNDARY：匹配到第一个句子结束标点为止（中文/日文标点 + 换行）
- * - MIN_FLUSH_LENGTH：最小触发长度。短于此长度的句子会累积到下一个标点，
- *   避免短句（如"嗯。""好。"）单独合成导致 MiMo 情感断裂、语速不稳。
- *   提高至 25，让每句更长，单次合成内容更完整，情感更连贯，同时减少合成请求次数。
- * - LONG_REPLY_THRESHOLD：方案 B 阈值。流式初期先缓冲累积文本，
- *   超过此长度才判定为「长回复」并切换到分句模式（边流式边合成，低延迟）；
- *   未超过则一直缓冲，流式结束时整段合成（情感更连贯）。
- *   提高至 100，让更多中等长度回复整段合成（情感连贯），真正长回复才分句降延迟。
+ * - MIN_FLUSH_LENGTH：合并触发长度。短于此长度的句子会累积到下一个标点，合并到足够长再合成。
+ *   MiMo 是非流式、逐请求合成，每次请求有固定延迟且独立无上下文——
+ *   段太短会：请求过多变慢、单段语速/情感随机波动（一句快一句慢）、
+ *   播放时长 < 下一段合成时长导致句间空档。
+ *   调到 40（约 1~2 个完整句子）：
+ *     - 长回复：首段 ~40 字即开口（不用等流式结束），后续段更少更连贯；
+ *     - 短回复：整段合成一次，情感连贯；
+ *     - 每段播放时长能覆盖下一段合成，消除句间空档。
  */
 const SENTENCE_BOUNDARY = /^(.+?[。！？；\n])/
-const MIN_FLUSH_LENGTH = 25
-const LONG_REPLY_THRESHOLD = 100
+const MIN_FLUSH_LENGTH = 40
 
 export function ChatWindow() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -102,14 +102,16 @@ export function ChatWindow() {
     let consumedPos = 0
     // 已提取但太短未发送的累积句子（等待合并到足够长度）
     const pendingShortRef = { text: '' }
-    // 方案 B：当前模式。buffering = 缓冲累积；streaming = 已切换分句
-    let mode: 'buffering' | 'streaming' = 'buffering'
     // 本轮流式的 TTS 上下文（首次 chunk 时惰性初始化）
     let ttsCtx: { voiceId: string; languageOverride: import('../types').TTSLanguage | null } | null = null
+    // V2：是否已尝试初始化 TTS 上下文。即使结果为空（未配置语音/autoPlay 关闭）也只查一次，
+    // 避免每 chunk 都重复走 getConfig IPC。
+    let ttsChecked = false
 
-    // 初始化 TTS 上下文：读取角色卡 voiceId / ttsOverride 和 TTS autoPlay 配置（每轮流式只读一次）
+    // 初始化 TTS 上下文：读取角色卡 voiceId / ttsOverride 和 TTS autoPlay 配置（每轮流式只查一次）
     async function ensureTtsCtx(): Promise<{ voiceId: string; languageOverride: import('../types').TTSLanguage | null } | null> {
-      if (ttsCtx) return ttsCtx
+      if (ttsChecked) return ttsCtx
+      ttsChecked = true
       const state = useCharacterStore.getState()
       const card = state.cards.find((c) => c.id === state.currentCardId)
       if (!card?.voiceId) return null
@@ -151,50 +153,48 @@ export function ChatWindow() {
       return stripBrackets(text).length >= MIN_FLUSH_LENGTH
     }
 
+    // 从已消费位置开始，循环提取完整句子并发送（一次 chunk 可能含多个标点）。
+    // V1 快速优先：收到完整句子即按 MIN_FLUSH_LENGTH 判定发送，不再缓冲等待。
+    const processAccumulated = () => {
+      while (true) {
+        const remaining = accRef.text.slice(consumedPos)
+        const match = remaining.match(SENTENCE_BOUNDARY)
+        if (!match || !match[1]) break
+
+        const sentence = match[1]
+        // 合并之前累积的短句
+        const candidate = pendingShortRef.text + sentence
+
+        // 长度判断用清洗后的文本（剔除括号动作描写），避免"（笑）"等纯动作
+        // 被单独触发合成，也避免括号内长内容污染长度的判断
+        if (isFlushedCandidate(candidate)) {
+          // 达到最小长度，发送
+          flush(candidate)
+          pendingShortRef.text = ''
+        } else {
+          // 太短或纯括号动作，累积等待下一次
+          pendingShortRef.text = candidate
+        }
+        // 无论是否发送，这段文本都已从 accRef 中消费
+        consumedPos += match[0].length
+      }
+    }
+
     // 监听流式 chunk：累积文本，按标点切句，短句累积到 MIN_FLUSH_LENGTH 再发送。
-    // 方案 B：流式初期先缓冲（buffering 模式），累积超过 LONG_REPLY_THRESHOLD 才切换分句模式。
     const unsubChunk = api.ai.onStreamChunk((chunk: string) => {
       accRef.text += chunk
-      void ensureTtsCtx().then((ctx) => {
-        if (!ctx) return
-        // 方案 B：缓冲模式。短回复（< 阈值）一直缓冲，流式结束时整段合成；
-        // 累积超过阈值才切换到分句模式（边流式边合成，降低长回复延迟）。
-        if (mode === 'buffering') {
-          const buffered = accRef.text.slice(consumedPos)
-          if (buffered.length < LONG_REPLY_THRESHOLD) {
-            return // 继续缓冲，不分句
-          }
-          // 切换到分句模式：consumedPos 未变，下方 while 会从头切分已累积文本
-          mode = 'streaming'
-        }
-        // 从已消费位置开始，循环提取完整句子（一次 chunk 可能含多个标点）
-        while (true) {
-          const remaining = accRef.text.slice(consumedPos)
-          const match = remaining.match(SENTENCE_BOUNDARY)
-          if (!match || !match[1]) break
-
-          const sentence = match[1]
-          // 合并之前累积的短句
-          const candidate = pendingShortRef.text + sentence
-
-          // 长度判断用清洗后的文本（剔除括号动作描写），避免"（笑）"等纯动作
-          // 被单独触发合成，也避免括号内长内容污染长度的判断
-          if (isFlushedCandidate(candidate)) {
-            // 达到最小长度，发送
-            flush(candidate)
-            pendingShortRef.text = ''
-          } else {
-            // 太短或纯括号动作，累积等待下一次
-            pendingShortRef.text = candidate
-          }
-          // 无论是否发送，这段文本都已从 accRef 中消费
-          consumedPos += match[0].length
-        }
-      })
+      // 已初始化上下文直接同步处理；首 chunk 未初始化时异步初始化一次；
+      // 若已检查过且未启用语音（ttsChecked 后 ctx 为空）则无需处理。
+      if (ttsCtx) {
+        processAccumulated()
+      } else if (!ttsChecked) {
+        void ensureTtsCtx().then((ctx) => {
+          if (ctx) processAccumulated()
+        })
+      }
     })
 
     // 流式完成：把所有剩余未发送的文本（累积的短句 + 无标点的尾巴）一起发送。
-    // 方案 B 兜底：短回复（一直 buffering）此处整段合成；长回复（streaming）发送最后尾巴。
     const unsubDone = api.ai.onStreamDone(() => {
       if (ttsCtx) {
         const remaining = accRef.text.slice(consumedPos)
@@ -207,8 +207,9 @@ export function ChatWindow() {
       // 重置本轮状态
       accRef.text = ''
       consumedPos = 0
-      mode = 'buffering'
+      pendingShortRef.text = ''
       ttsCtx = null
+      ttsChecked = false
     })
 
     // 流式错误/取消：清空状态
@@ -216,8 +217,8 @@ export function ChatWindow() {
       accRef.text = ''
       consumedPos = 0
       pendingShortRef.text = ''
-      mode = 'buffering'
       ttsCtx = null
+      ttsChecked = false
     })
 
     return () => {

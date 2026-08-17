@@ -6,9 +6,12 @@
  *   - AI 消息靠左：毛玻璃卡片 + 主色调边框。
  *   - 流式输出带流光打字机光标（.streaming-cursor，见 index.css）。
  *   - 消息出现使用 popSlideUp 弹性入场（scale 0.96 + y 12，0.4s 弹性曲线），逐条轻微错落。
- *   - 新消息/流式更新自动滚动到底部。
+ *   - 滚动优化（T3）：新消息/流式更新仅在用户接近底部时自动滚到底，且用瞬时滚动替代
+ *     smooth，避免每个 token 都做一次平滑滚动造成卡顿。
+ *   - 流式气泡抽成独立组件（StreamingBubble）单独订阅 streamingContent，流式更新时
+ *     不再触发整个 MessageList 的 messages.map 重渲染。
  */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
@@ -16,18 +19,31 @@ import { useCharacterStore } from '../store/characterStore'
 import { cn, formatTime } from '../lib/utils'
 import { popSlideUp, springElastic } from '../lib/motion'
 
+/** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
+const NEAR_BOTTOM_THRESHOLD = 80
+
 export function MessageList() {
   const messages = useSessionStore((s) => s.messages)
   const streaming = useSessionStore((s) => s.streaming)
-  const streamingContent = useSessionStore((s) => s.streamingContent)
   const streamError = useSessionStore((s) => s.streamError)
   const currentCardName = useCurrentCardName()
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const nearBottomRef = useRef(true)
 
-  // 新消息 / 流式内容更新时滚动到底部
+  // 监听滚动：用户上翻看历史时不强制拉回底部
+  const onScroll = () => {
+    const el = listRef.current
+    if (!el) return
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD
+  }
+
+  // 新消息 / 流式更新：仅在接近底部时瞬时滚到底（替代每 token 的 smooth，降低渲染开销）
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-  }, [messages, streamingContent, streaming, streamError])
+    const el = listRef.current
+    if (el && nearBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [messages, streaming, streamError])
 
   if (messages.length === 0 && !streaming) {
     return (
@@ -55,7 +71,7 @@ export function MessageList() {
   }
 
   return (
-    <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+    <div ref={listRef} onScroll={onScroll} className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
       {messages.map((msg, i) => {
         const isUser = msg.role === 'user'
         return (
@@ -88,16 +104,11 @@ export function MessageList() {
       })}
 
       {streaming && (
-        <motion.div {...popSlideUp} className="flex justify-start">
-          <div className="max-w-[80%] text-left">
-            <div className="mb-1 px-1 text-xs text-text-muted">{currentCardName || 'AI'}</div>
-            <div className="glass selectable rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] px-4 py-2.5 text-sm leading-relaxed text-text">
-              <span className="streaming-cursor whitespace-pre-wrap break-words">
-                {streamingContent}
-              </span>
-            </div>
-          </div>
-        </motion.div>
+        <StreamingBubble
+          name={currentCardName || 'AI'}
+          listRef={listRef}
+          nearBottomRef={nearBottomRef}
+        />
       )}
 
       {streamError && !streaming && (
@@ -108,9 +119,45 @@ export function MessageList() {
           </div>
         </div>
       )}
-
-      <div ref={bottomRef} />
     </div>
+  )
+}
+
+/**
+ * 流式气泡（T3）：独立组件单独订阅 streamingContent。
+ * 这样流式 token 逐帧刷新只重渲染本气泡，不会触发 MessageList 里整条 messages.map 重渲染。
+ * 同时在内容增长时驱动父级列表滚动（仅在接近底部时瞬时滚到底）。
+ */
+function StreamingBubble({
+  name,
+  listRef,
+  nearBottomRef,
+}: {
+  name: string
+  listRef: RefObject<HTMLDivElement | null>
+  nearBottomRef: RefObject<boolean>
+}) {
+  const streamingContent = useSessionStore((s) => s.streamingContent)
+
+  // 流式内容更新时跟随滚动（复用父级列表，仅在接近底部时瞬时滚动）
+  useEffect(() => {
+    const el = listRef.current
+    if (el && nearBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [streamingContent, listRef, nearBottomRef])
+
+  return (
+    <motion.div {...popSlideUp} className="flex justify-start">
+      <div className="max-w-[80%] text-left">
+        <div className="mb-1 px-1 text-xs text-text-muted">{name}</div>
+        <div className="glass selectable rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] px-4 py-2.5 text-sm leading-relaxed text-text">
+          <span className="streaming-cursor whitespace-pre-wrap break-words">
+            {streamingContent}
+          </span>
+        </div>
+      </div>
+    </motion.div>
   )
 }
 

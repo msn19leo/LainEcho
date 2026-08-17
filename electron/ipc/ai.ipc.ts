@@ -19,6 +19,16 @@ import {
 
 let currentAbort: AbortController | null = null
 
+/**
+ * 上下文收窄（降低首 token / 逐 token 延迟）：
+ * - MAX_CONTEXT_MESSAGES：只发送最近 N 条历史消息，更早的截断，避免请求体随对话无限膨胀。
+ * - MAX_MEMORIES：只注入最近 N 条记忆体，防止 system prompt 过长拖慢生成。
+ */
+const MAX_CONTEXT_MESSAGES = 16
+const MAX_MEMORIES = 8
+/** 主进程合并 chunk 的 flush 间隔（毫秒）：多个 delta 合并为一次 IPC 推送，减少消息数 */
+const CHUNK_FLUSH_MS = 16
+
 export function registerAiIpc(): void {
   ipcMain.handle('ai:send-message', async (event, params: { sessionId: string; messages: ChatMessage[] }) => {
     const { sessionId, messages } = params ?? {}
@@ -29,6 +39,17 @@ export function registerAiIpc(): void {
     let partial = ''
     let cancelled = false
 
+    // 合并推送：累积待发送文本，按 CHUNK_FLUSH_MS 窗口一次性 send，减少 IPC 往返
+    let pendingChunk = ''
+    let chunkTimer: NodeJS.Timeout | null = null
+    const flushChunks = () => {
+      chunkTimer = null
+      if (pendingChunk && !sender.isDestroyed()) {
+        sender.send('ai:stream-chunk', pendingChunk)
+      }
+      pendingChunk = ''
+    }
+
     const abort = new AbortController()
     currentAbort = abort
     try {
@@ -38,15 +59,18 @@ export function registerAiIpc(): void {
       if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
       if (!settings.model.trim()) throw new Error('未配置模型名（model）')
 
-      // 组装 system prompt：人设字段 + 示例对话 + 全局记忆体（每次请求前实时读取，保证记忆更新即时生效）
+      // 组装 system prompt：人设字段 + 示例对话 + 最近 MAX_MEMORIES 条全局记忆体
+      // （每次请求前实时读取，保证记忆更新即时生效）
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
-      const memories = await listMemories()
+      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
       const systemMessage: ChatMessage = {
         role: 'system',
         content: buildSystemPrompt(card, memories),
       }
-      const fullMessages: ChatMessage[] = [systemMessage, ...messages]
+      // 截断历史：仅保留最近 MAX_CONTEXT_MESSAGES 条（含当前用户消息），降低 TTFT
+      const recentMessages = messages.slice(-MAX_CONTEXT_MESSAGES)
+      const fullMessages: ChatMessage[] = [systemMessage, ...recentMessages]
 
       const content = await sendChatCompletion(fullMessages, {
         model: settings.model,
@@ -58,9 +82,17 @@ export function registerAiIpc(): void {
         signal: abort.signal,
         onChunk: (chunk) => {
           partial += chunk
-          if (!sender.isDestroyed()) sender.send('ai:stream-chunk', chunk)
+          pendingChunk += chunk
+          if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
         },
       })
+
+      // 流式结束：清空定时器并 flush 残余文本，保证最后一段也送达
+      if (chunkTimer) {
+        clearTimeout(chunkTimer)
+        chunkTimer = null
+      }
+      flushChunks()
 
       // 持久化：user 消息 + assistant 完整回复
       const now = Date.now()
@@ -81,6 +113,13 @@ export function registerAiIpc(): void {
       } catch {
         // 持久化失败不影响错误上报
       }
+
+      // 出错/取消前 flush 残余文本，让已流出的部分也上屏
+      if (chunkTimer) {
+        clearTimeout(chunkTimer)
+        chunkTimer = null
+      }
+      flushChunks()
 
       if (!sender.isDestroyed()) sender.send('ai:stream-error', { sessionId, error: message, cancelled })
       throw err

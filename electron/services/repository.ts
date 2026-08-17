@@ -8,6 +8,7 @@ import type {
   AppSettings,
   CharacterCard,
   CharacterCardInput,
+  CharacterPersona,
   ChatMessage,
   Live2DModelMeta,
   MemoryItem,
@@ -36,9 +37,68 @@ export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'c
 
 const DEFAULT_CARDS: CharacterCard[] = []
 
+/** 空人设（所有子字段默认空串/空数组），用于归一化缺失数据 */
+const EMPTY_PERSONA: CharacterPersona = {
+  anchor: '',
+  inner: { desire: '', fear: '', conflict: '', selfView: '' },
+  perception: { attention: '', emotion: '', worldview: '' },
+  relation: { approach: '', intimacy: '', boundary: '', need: '' },
+  you: { identity: '', bond: '', stance: '', memories: [] },
+  language: { rhythm: '', words: '', neverSay: [], habits: '' },
+  state: { daily: '', triggers: '', situations: '' },
+  worldview: [],
+  prohibitions: [],
+  extra: '',
+}
+
+/** 归一化人设：用空结构补全缺失字段，保证旧数据/部分写入的数据结构完整 */
+function normalizePersona(raw?: Partial<CharacterPersona> | null): CharacterPersona {
+  const p: Partial<CharacterPersona> = raw ?? {}
+  return {
+    anchor: p.anchor ?? '',
+    inner: {
+      desire: p.inner?.desire ?? '',
+      fear: p.inner?.fear ?? '',
+      conflict: p.inner?.conflict ?? '',
+      selfView: p.inner?.selfView ?? '',
+    },
+    perception: {
+      attention: p.perception?.attention ?? '',
+      emotion: p.perception?.emotion ?? '',
+      worldview: p.perception?.worldview ?? '',
+    },
+    relation: {
+      approach: p.relation?.approach ?? '',
+      intimacy: p.relation?.intimacy ?? '',
+      boundary: p.relation?.boundary ?? '',
+      need: p.relation?.need ?? '',
+    },
+    you: {
+      identity: p.you?.identity ?? '',
+      bond: p.you?.bond ?? '',
+      stance: p.you?.stance ?? '',
+      memories: p.you?.memories ?? [],
+    },
+    language: {
+      rhythm: p.language?.rhythm ?? '',
+      words: p.language?.words ?? '',
+      neverSay: p.language?.neverSay ?? [],
+      habits: p.language?.habits ?? '',
+    },
+    state: {
+      daily: p.state?.daily ?? '',
+      triggers: p.state?.triggers ?? '',
+      situations: p.state?.situations ?? '',
+    },
+    worldview: p.worldview ?? [],
+    prohibitions: p.prohibitions ?? [],
+    extra: p.extra ?? '',
+  }
+}
+
 /**
  * 归一化角色卡：补全缺失字段，保证旧数据/部分写入的数据结构完整。
- * 新版结构废弃了 identity/consciousness，改用 description/personality/scenario 分层。
+ * 新版结构废弃了 description/personality/scenario，改用 CharacterPersona（动漫角色复刻结构）。
  */
 function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
   const now = Date.now()
@@ -46,20 +106,13 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     id: raw.id ?? genId('card'),
     name: raw.name ?? '未命名角色',
     version: raw.version ?? CHARACTER_CARD_VERSION,
-    description: raw.description ?? '',
-    personality: raw.personality ?? '',
-    scenario: raw.scenario ?? '',
-    greeting: raw.greeting ?? '',
-    alternateGreetings: raw.alternateGreetings ?? [],
+    persona: normalizePersona(raw.persona),
     messageExample: raw.messageExample ?? '',
     modelId: raw.modelId ?? null,
     voiceId: raw.voiceId ?? null,
     ttsOverride: raw.ttsOverride ?? null,
     modelOverride: raw.modelOverride ?? null,
-    tags: raw.tags ?? [],
     avatar: raw.avatar ?? null,
-    creator: raw.creator ?? '',
-    notes: raw.notes ?? '',
     createdAt: raw.createdAt ?? now,
     updatedAt: raw.updatedAt ?? now,
   }
@@ -81,20 +134,13 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     id: genId('card'),
     version: CHARACTER_CARD_VERSION,
     name: input.name.trim() || '未命名角色',
-    description: input.description ?? '',
-    personality: input.personality ?? '',
-    scenario: input.scenario ?? '',
-    greeting: input.greeting ?? '',
-    alternateGreetings: input.alternateGreetings ?? [],
+    persona: normalizePersona(input.persona),
     messageExample: input.messageExample ?? '',
     modelId: input.modelId || null,
     voiceId: input.voiceId || null,
     ttsOverride: input.ttsOverride ?? null,
     modelOverride: input.modelOverride ?? null,
-    tags: input.tags ?? [],
     avatar: input.avatar ?? null,
-    creator: input.creator ?? '',
-    notes: input.notes ?? '',
     createdAt: now,
     updatedAt: now,
   }
@@ -156,21 +202,92 @@ export async function removeMemory(id: string): Promise<void> {
 
 /**
  * 分段组装 system prompt（借鉴 airi resolveSystemPrompt）。
- * 把 description / personality / scenario / messageExample / 长期记忆 按顺序 join。
+ * 把 人设结构（CharacterPersona）/ 示例对话 / 长期记忆 按顺序 join。
+ *
+ * 记忆/规则的增强处理（提高模型遵从度）：
+ * 1. 前置：记忆置于 system prompt 开头，而非排在末尾（长 prompt 中后段指令遵从度更低）。
+ * 2. 强约束标题：用「必须记住并严格遵守」这类独立 section 头，让 LLM 把它当硬规则而非普通句子。
+ * 3. 措辞建议：记忆内容尽量写成肯定句（「回复中不出现 emoji」优于「不要发 emoji」），
+ *    LLM 对「做什么」的遵从远高于「不做什么」。此处仅负责注入结构，不改写内容。
  * @param card 角色卡（取人设字段）
  * @param memories 全局记忆体
  */
 export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryItem[]): string {
   const parts: string[] = []
-  if (card?.description?.trim()) parts.push(`【身份】\n${card.description.trim()}`)
-  if (card?.personality?.trim()) parts.push(`【性格】\n${card.personality.trim()}`)
-  if (card?.scenario?.trim()) parts.push(`【场景】\n${card.scenario.trim()}`)
-  if (card?.messageExample?.trim()) parts.push(`【示例对话】\n${card.messageExample.trim()}`)
   if (memories.length > 0) {
     const memLines = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
-    parts.push(`【长期记忆】\n${memLines}`)
+    parts.push(`## 用户长期记忆（必须记住并严格遵守）\n${memLines}`)
   }
+  parts.push(...buildPersonaSections(card?.persona))
+  if (card?.messageExample?.trim()) parts.push(`【示例对话】\n${card.messageExample.trim()}`)
   return parts.join('\n\n')
+}
+
+/**
+ * 将人设结构转换为按优先级排序的 system prompt 文本段。
+ * 顺序（遵从度从高到低）：存在锚点 → 内心结构 → 感知方式 → 关系模式 → 语言质感 →
+ * 状态系统 → 世界观碎片 → 禁止项 → 自由补充。
+ * 只注入非空字段，避免 system prompt 因空白段膨胀。
+ */
+export function buildPersonaSections(persona?: Partial<CharacterPersona> | null): string[] {
+  if (!persona) return []
+  const parts: string[] = []
+
+  if (persona.anchor?.trim()) parts.push(`【存在锚点】\n${persona.anchor.trim()}`)
+
+  const inner: string[] = []
+  if (persona.inner?.desire?.trim()) inner.push(`核心渴望：${persona.inner.desire.trim()}`)
+  if (persona.inner?.fear?.trim()) inner.push(`内在恐惧：${persona.inner.fear.trim()}`)
+  if (persona.inner?.conflict?.trim()) inner.push(`核心矛盾：${persona.inner.conflict.trim()}`)
+  if (persona.inner?.selfView?.trim()) inner.push(`自我认知状态：${persona.inner.selfView.trim()}`)
+  if (inner.length > 0) parts.push(`【内心结构】\n${inner.join('\n')}`)
+
+  const perception: string[] = []
+  if (persona.perception?.attention?.trim()) perception.push(`注意什么：${persona.perception.attention.trim()}`)
+  if (persona.perception?.emotion?.trim()) perception.push(`情绪处理机制：${persona.perception.emotion.trim()}`)
+  if (persona.perception?.worldview?.trim()) perception.push(`对外部世界的态度：${persona.perception.worldview.trim()}`)
+  if (perception.length > 0) parts.push(`【感知方式】\n${perception.join('\n')}`)
+
+  const relation: string[] = []
+  if (persona.relation?.approach?.trim()) relation.push(`靠近人的方式：${persona.relation.approach.trim()}`)
+  if (persona.relation?.intimacy?.trim()) relation.push(`亲密建立的节奏：${persona.relation.intimacy.trim()}`)
+  if (persona.relation?.boundary?.trim()) relation.push(`她/他的边界：${persona.relation.boundary.trim()}`)
+  if (persona.relation?.need?.trim()) relation.push(`对"被需要"的态度：${persona.relation.need.trim()}`)
+  if (relation.length > 0) parts.push(`【关系模式】\n${relation.join('\n')}`)
+
+  const you: string[] = []
+  if (persona.you?.identity?.trim()) you.push(`你是谁：${persona.you.identity.trim()}`)
+  if (persona.you?.bond?.trim()) you.push(`你们之间的关系：${persona.you.bond.trim()}`)
+  if (persona.you?.stance?.trim()) you.push(`AI 角色怎么看你：${persona.you.stance.trim()}`)
+  const memories = (persona.you?.memories ?? []).filter((s) => s.trim())
+  if (memories.length > 0) you.push(`特殊约定或记忆：\n${memories.map((s) => `- ${s.trim()}`).join('\n')}`)
+  if (you.length > 0) parts.push(`【你的身份】\n${you.join('\n')}`)
+
+  const language: string[] = []
+  if (persona.language?.rhythm?.trim()) language.push(`说话节奏：${persona.language.rhythm.trim()}`)
+  if (persona.language?.words?.trim()) language.push(`用词特征：${persona.language.words.trim()}`)
+  const neverSay = (persona.language?.neverSay ?? []).filter((s) => s.trim())
+  if (neverSay.length > 0) language.push(`绝不会说出口的（出戏表达）：\n${neverSay.map((s) => `- ${s.trim()}`).join('\n')}`)
+  if (persona.language?.habits?.trim()) language.push(`特殊语言行为：${persona.language.habits.trim()}`)
+  if (language.length > 0) parts.push(`【语言质感】\n${language.join('\n')}`)
+
+  const state: string[] = []
+  if (persona.state?.daily?.trim()) state.push(`日常状态：${persona.state.daily.trim()}`)
+  if (persona.state?.triggers?.trim()) state.push(`触发变化的开关：\n${persona.state.triggers.trim()}`)
+  if (persona.state?.situations?.trim()) state.push(`不同情境下的状态变化：\n${persona.state.situations.trim()}`)
+  if (state.length > 0) parts.push(`【状态系统】\n${state.join('\n')}`)
+
+  const worldview = (persona.worldview ?? []).filter((s) => s.trim())
+  if (worldview.length > 0) parts.push(`【世界观碎片】\n${worldview.map((s) => `- ${s.trim()}`).join('\n')}`)
+
+  const prohibitions = (persona.prohibitions ?? []).filter((s) => s.trim())
+  if (prohibitions.length > 0) {
+    parts.push(`【禁止项（必须严格遵守，最高优先级）】\n${prohibitions.map((s) => `- ${s.trim()}`).join('\n')}`)
+  }
+
+  if (persona.extra?.trim()) parts.push(`【补充设定】\n${persona.extra.trim()}`)
+
+  return parts
 }
 
 // ---------------- 会话 ----------------
@@ -220,22 +337,8 @@ export async function createSession(characterCardId: string): Promise<SessionInd
   }
   await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => [item, ...index])
 
-  // 开场白注入：若角色卡配置了 greeting，写入首条 assistant 消息（含备选开场白随机选）
-  const greetings = [card?.greeting, ...(card?.alternateGreetings ?? [])].filter((g): g is string => !!g?.trim())
-  const initialMessages: ChatMessage[] = []
-  if (greetings.length > 0) {
-    const greeting = greetings[Math.floor(Math.random() * greetings.length)]!
-    initialMessages.push({ role: 'assistant', content: greeting, timestamp: now })
-    item.messageCount = 1
-    // 更新索引的 messageCount
-    await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => {
-      const idx = index.findIndex((s) => s.id === item.id)
-      if (idx !== -1) index[idx]!.messageCount = 1
-      return index
-    })
-  }
-
-  const detail: SessionDetail = { id: item.id, characterCardId, messages: initialMessages }
+  // 新会话初始为空消息列表（已废弃角色卡开场白自动注入）
+  const detail: SessionDetail = { id: item.id, characterCardId, messages: [] }
   await writeJson(paths.sessionFile(item.id), detail)
   return item
 }

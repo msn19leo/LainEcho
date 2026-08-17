@@ -13,7 +13,7 @@ export interface ChatMessage {
 }
 
 /** 角色卡 schema 版本，用于未来迁移 */
-export const CHARACTER_CARD_VERSION = 1
+export const CHARACTER_CARD_VERSION = 2
 
 /** 角色级 TTS 配置覆盖：解决日文/中文角色共用全局 language 的问题。null 字段表示跟随全局 */
 export interface CharacterTTSOverride {
@@ -31,26 +31,96 @@ export interface CharacterModelOverride {
   idleAnimation: string | null
 }
 
-/** 角色卡：AI 桌宠的"身份"与"意识"，借鉴 CCv3 分层（description/personality/scenario） */
+/**
+ * 角色卡 · 人设结构（动漫角色复刻模板，混合式）。
+ * 全部为可选字段，运行时只注入非空字段，控制 system prompt 长度。
+ * 组装顺序（优先级从高到低）：存在锚点 → 内心结构 → 感知方式 → 关系模式 →
+ * 语言质感 → 状态系统 → 世界观碎片 → 禁止项 → 自由补充。
+ */
+export interface CharacterPersona {
+  /** 〇 存在锚点：1-3 句话定义角色的本质（不是介绍，是定性），注入最前、优先级最高 */
+  anchor: string
+  /** 〇 内心结构 */
+  inner: {
+    /** 核心渴望：真正想要什么（最深的驱动） */
+    desire: string
+    /** 内在恐惧：本能回避什么、什么会让她/他动摇 */
+    fear: string
+    /** 核心矛盾：A，但同时又 B 的张力，以及如何体现在行为中 */
+    conflict: string
+    /** 自我认知状态：她/他怎么看自己，认知是否准确、盲区在哪 */
+    selfView: string
+  }
+  /** 〇 感知方式 */
+  perception: {
+    /** 她/他注意什么：对什么敏感、会忽略什么 */
+    attention: string
+    /** 情绪处理机制：表达还是内化、爆发还是沉默 */
+    emotion: string
+    /** 对外部世界的态度：世界在她/他眼里什么样，人是否可信 */
+    worldview: string
+  }
+  /** 〇 关系模式 */
+  relation: {
+    /** 靠近人的方式：主动还是被动、直接还是迂回 */
+    approach: string
+    /** 亲密建立的节奏：怎么从陌生到熟悉、何时真正打开 */
+    intimacy: string
+    /** 她/他的边界：不可触碰之物、被越界时的反应 */
+    boundary: string
+    /** 对"被需要"的态度：喜欢还是抗拒、怎么回应依赖 */
+    need: string
+  }
+  /** 〇 你的身份：角色与"你"的具体关系设定（承接关系模式，引出语言质感） */
+  you: {
+    /** 你是谁：在角色世界里你的身份定位（原作角色/原创/无身份观察者），含名字/年龄/相识时长 */
+    identity: string
+    /** 你们之间的关系：是什么连接彼此、处于什么阶段（写"是什么让我们走到现在"，不写"我们是好朋友"类结论） */
+    bond: string
+    /** AI 角色怎么看你：从角色视角写如何感知你，允许"还没搞清楚"的不确定性 */
+    stance: string
+    /** 特殊约定或记忆：只属于你们的细节，每行一条，越小越好 */
+    memories: string[]
+  }
+  /** 〇 语言质感 */
+  language: {
+    /** 说话节奏：快/慢、停顿、留白 */
+    rhythm: string
+    /** 用词特征：正式/口语、习惯句式 */
+    words: string
+    /** 不会说的话：5-8 句"出戏"的表达（比正面描述更有效） */
+    neverSay: string[]
+    /** 特殊的语言行为：反问、自言自语、重复、口头禅等 */
+    habits: string
+  }
+  /** 〇 状态系统 */
+  state: {
+    /** 日常状态：默认的样子 */
+    daily: string
+    /** 触发变化的开关：什么会让她/他突然不一样 */
+    triggers: string
+    /** 不同情境下的状态变化：开心/难过/被激怒/感到安全/感到危险 */
+    situations: string
+  }
+  /** 〇 世界观碎片：3-6 条角色会真实说出口的观点（角色口吻） */
+  worldview: string[]
+  /** 〇 禁止项：精简为 3-5 条最高优先级的硬性边界 */
+  prohibitions: string[]
+  /** 〇 自由补充：模板之外的自定义内容 */
+  extra: string
+}
+
+/** 角色卡：AI 桌宠的"身份"与"意识"，人设采用动漫角色复刻结构（CharacterPersona） */
 export interface CharacterCard {
   id: string
   name: string
   /** schema 版本号，迁移用 */
   version: number
 
-  // --- 人设字段（借鉴 CCv3，分层清晰）---
-  /** 角色描述：身份设定——角色是什么，作为 system prompt 的一部分注入 */
-  description: string
-  /** 性格特征：思维方式、说话习惯——角色怎么表现，作为 system prompt 的一部分注入 */
-  personality: string
-  /** 场景设定：角色所处的情境（可选，如"住在用户电脑里"），作为 system prompt 的一部分注入 */
-  scenario: string
+  /** 人设结构（存在锚点/内心结构/感知方式/关系模式/语言质感/状态系统/世界观碎片/禁止项/自由补充） */
+  persona: CharacterPersona
 
   // --- 对话增强 ---
-  /** 开场白：新会话首条 AI 消息（空 = 不发送） */
-  greeting: string
-  /** 备选开场白（与 greeting 合并后随机选一条，或用户手动切换） */
-  alternateGreetings: string[]
   /** 示例对话 few-shot，格式 "{{char}}: xxx\n{{user}}: yyy"，作为 system prompt 的一部分注入 */
   messageExample: string
 
@@ -66,13 +136,8 @@ export interface CharacterCard {
   /** 模型设置覆盖：让同模型不同角色有不同表情/待机动作 */
   modelOverride: CharacterModelOverride | null
 
-  // --- 元数据 ---
-  /** 标签/分类 */
-  tags: string[]
   /** 头像文件名（相对 avatars/，null = 用首字占位） */
   avatar: string | null
-  creator: string
-  notes: string
   createdAt: number
   updatedAt: number
 }
@@ -81,21 +146,20 @@ export interface CharacterCard {
 export type CharacterCardInput = Pick<
   CharacterCard,
   | 'name'
-  | 'description'
-  | 'personality'
-  | 'scenario'
-  | 'greeting'
-  | 'alternateGreetings'
+  | 'persona'
   | 'messageExample'
   | 'modelId'
   | 'voiceId'
   | 'ttsOverride'
   | 'modelOverride'
-  | 'tags'
   | 'avatar'
-  | 'creator'
-  | 'notes'
 >
+
+/** AI 生成角色人设的入参：角色名（可选）+ 角色来源描述（必填，可贴原作设定/台词/简介） */
+export interface PersonaGenerateInput {
+  name: string
+  source: string
+}
 
 /** 参考音频元信息（voices/index.json，用于 MiMo 声音克隆） */
 export interface VoiceReference {
@@ -329,6 +393,8 @@ export interface WindowApi {
     /** 更新角色卡：传部分业务字段 */
     update: (id: string, patch: Partial<CharacterCardInput>) => Promise<void>
     remove: (id: string) => Promise<void>
+    /** 用 AI 按角色来源描述生成人设草稿（返回结构化的 CharacterPersona，不入库） */
+    generate: (input: PersonaGenerateInput) => Promise<CharacterPersona>
     /** 订阅角色卡列表变化（其他窗口增删改时），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }

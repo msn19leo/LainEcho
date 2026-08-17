@@ -138,15 +138,41 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
         const isStillCurrent = () => get().currentSessionId === currentSessionId
 
+        // 流式上屏合并（T2）：把多次 chunk 累积到本地缓冲，按 ~40ms 合并 flush 到
+        // streamingContent，避免每个 token 都触发一次 React 全量重渲染，显著降低渲染开销。
+        let streamBuffer = ''
+        let streamFlushTimer: ReturnType<typeof setTimeout> | null = null
+        const scheduleStreamFlush = () => {
+          if (streamFlushTimer) return
+          streamFlushTimer = setTimeout(() => {
+            streamFlushTimer = null
+            if (streamBuffer) {
+              const buffered = streamBuffer
+              streamBuffer = ''
+              if (isStillCurrent()) set((s) => ({ streamingContent: s.streamingContent + buffered }))
+            }
+          }, 40)
+        }
+        // 清空定时器并立即 flush（流结束/错误/清理时调用，避免残留定时器触发过期 set）
+        const flushStreamNow = () => {
+          if (streamFlushTimer) {
+            clearTimeout(streamFlushTimer)
+            streamFlushTimer = null
+          }
+          streamBuffer = ''
+        }
+
       function cleanup() {
         unsubscribeChunk()
         unsubscribeDone()
         unsubscribeError()
+        flushStreamNow()
       }
 
       const unsubscribeChunk = api.ai.onStreamChunk((chunk) => {
         if (!isStillCurrent()) return
-        set((s) => ({ streamingContent: s.streamingContent + chunk }))
+        streamBuffer += chunk
+        scheduleStreamFlush()
       })
 
       const unsubscribeDone = api.ai.onStreamDone((payload) => {

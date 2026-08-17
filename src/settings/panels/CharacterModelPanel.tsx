@@ -46,28 +46,42 @@ export function CharacterModelPanel() {
 
   const { settings, loaded, load, save } = useModelSettingsStore()
 
+  /** 加载指定模型的动作组（用于空闲动作下拉框）。不传 modelId 时按选中模型优先，其次列表第一个 */
+  const loadMotionGroups = async (modelId?: string | null) => {
+    if (!modelId) {
+      setMotionGroups([])
+      return
+    }
+    try {
+      const groups = await api.model.motionGroups(modelId)
+      setMotionGroups(groups)
+    } catch {
+      setMotionGroups([])
+    }
+  }
+
   const refresh = async () => {
     const [core, list] = await Promise.all([api.model.coreStatus(), api.model.list()])
     setCorePresent(core.present)
     setModels(list)
     setLoading(false)
-    // 读取第一个模型的动作组（用于空闲动作下拉框）
-    if (list.length > 0) {
-      try {
-        const groups = await api.model.motionGroups(list[0]!.id)
-        setMotionGroups(groups)
-      } catch {
-        setMotionGroups([])
-      }
-    } else {
-      setMotionGroups([])
-    }
+    // 动作组取自当前选中模型（若尚未选中则用列表第一个）
+    void loadMotionGroups(settings.selectedModelId ?? list[0]?.id)
   }
 
   useEffect(() => {
     void refresh()
     void load()
   }, [load])
+
+  /** 选中模型变化时，重新加载该模型的动作组（保证下拉框与实际展示的模型一致） */
+  useEffect(() => {
+    if (models.length === 0) {
+      setMotionGroups([])
+      return
+    }
+    void loadMotionGroups(settings.selectedModelId ?? models[0]?.id)
+  }, [models, settings.selectedModelId])
 
   /** 当选中模型变化时，加载该模型的表情列表 */
   useEffect(() => {

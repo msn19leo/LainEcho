@@ -4,13 +4,14 @@
  * 实现跨窗口同步（替代旧版依赖 window.focus 轮询的机制）。
  */
 import { ipcMain } from 'electron'
-import type { CharacterCardInput } from '../../src/types'
+import type { CharacterCardInput, PersonaGenerateInput } from '../../src/types'
 import {
   createCharacterCard,
   listCharacterCards,
   removeCharacterCard,
   updateCharacterCard,
 } from '../services/repository'
+import { generatePersona } from '../services/personaGenerator'
 import { windowManager } from '../windows/windowManager'
 
 export function registerCharacterCardIpc(): void {
@@ -30,6 +31,11 @@ export function registerCharacterCardIpc(): void {
   ipcMain.handle('character-card:remove', async (_e, id: string) => {
     await removeCharacterCard(id)
     notifyCharacterCardsChanged()
+  })
+
+  // 用 AI 生成人设草稿：不入库，仅返回结构化数据供编辑器回填
+  ipcMain.handle('character-card:ai-generate', async (_e, input: PersonaGenerateInput) => {
+    return generatePersona(input)
   })
 }
 

@@ -34,6 +34,7 @@ const api: WindowApi = {
     create: (card) => ipcRenderer.invoke('character-card:create', card),
     update: (id, patch) => ipcRenderer.invoke('character-card:update', id, patch),
     remove: (id) => ipcRenderer.invoke('character-card:remove', id),
+    generate: (input) => ipcRenderer.invoke('character-card:ai-generate', input),
     onChanged: (cb) => {
       const listener = () => cb()
       ipcRenderer.on('character-cards-changed', listener)

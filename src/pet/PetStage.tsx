@@ -229,12 +229,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     try {
       let model: Live2DModel
       try {
-        model = await cls.from(url, { autoInteract: false })
+        model = await cls.from(url, { autoInteract: false, autoUpdate: false })
       } catch (err) {
         // 导入后首次加载偶尔因文件尚未完全就绪而失败，短暂等待后重试一次
         console.warn('[pet] 首次加载失败，600ms 后重试:', err instanceof Error ? err.message : err)
         await new Promise((r) => setTimeout(r, 600))
-        model = await cls.from(url, { autoInteract: false })
+        model = await cls.from(url, { autoInteract: false, autoUpdate: false })
       }
       if (gen !== loadGenRef.current || cancelledRef.current) {
         model.destroy()
@@ -332,6 +332,14 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }).internalModel
       const coreModel = internal?.coreModel
       if (!coreModel) return
+
+      // 驱动模型自身的内部更新（动作/呼吸/SDK 眨眼/物理）。
+      // 模型以 autoUpdate:false 创建，脱离 PIXI 共享 ticker；这里在本应用 ticker 上
+      // 手动累计 deltaMS，供稍后 _render 的 internalModel.update() 消费，否则动作冻结。
+      const app = appRef.current
+      if (app) {
+        model.update(app.ticker.deltaMS || 16.667)
+      }
 
       // 判断鼠标跟踪是否激活（鼠标超过 1 秒未移动则切换到空闲眼神，参考 airi 的 1s 超时）
       if (mouseRef.current.active && performance.now() - mouseRef.current.lastMoveAt > 1000) {
@@ -515,6 +523,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     /** 应用模型设置（更新 ticker、拟合，并在必要时切换模型） */
     const applySettings = (settings: ModelSettings, shouldSwitchModel: boolean) => {
+      const prevIdle = settingsRef.current.animation.idleAnimation
       settingsRef.current = settings
       // FPS 变化时更新 ticker
       if (appRef.current) {
@@ -524,6 +533,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       fitModel()
       // 表情设置变化时更新当前表情参数
       updateCurrentExpression()
+      // 空闲动作组变化时立即播放一次，第一时间看到效果（无需等待 10s 定时器）
+      if (prevIdle !== settings.animation.idleAnimation) {
+        playRandomIdle(modelRef.current, settings.animation.idleAnimation || undefined)
+      }
       // 选中模型变化且当前角色卡未绑定时，切换到新选中模型
       if (shouldSwitchModel && !currentCardModelIdRef.current && settings.selectedModelId !== currentModelIdRef.current) {
         void loadModel(settings.selectedModelId ?? undefined)
@@ -696,14 +709,19 @@ function playRandomIdle(model: Live2DModel | null, preferredGroup?: string) {
         model.motion(preferredGroup, 0, PRIORITY_IDLE)
         return
       }
+      // 选中的动作组名与模型实际加载的动作组不匹配（常见于下拉框取自别的模型）时给出提示
+      console.warn('[pet] 空闲动作组不存在于当前展示模型:', preferredGroup, '实际可用:', groups)
     }
     // 否则从非 Tap 开头的动作组中随机选择
     const groups = getMotionGroups(model).filter((g) => !g.toLowerCase().startsWith('tap'))
-    if (groups.length === 0) return
+    if (groups.length === 0) {
+      console.warn('[pet] 当前模型没有可播放的空闲动作组（model3.json 未声明 Motions 或动作文件缺失）')
+      return
+    }
     const pick = groups[Math.floor(Math.random() * groups.length)] as string
     model.motion(pick, 0, PRIORITY_IDLE)
-  } catch {
-    // 忽略
+  } catch (err) {
+    console.warn('[pet] 播放空闲动作失败:', err instanceof Error ? err.message : err)
   }
 }
 
