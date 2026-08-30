@@ -153,6 +153,49 @@ const api: WindowApi = {
     get: () => ipcRenderer.invoke('model-settings:get'),
     save: (patch) => ipcRenderer.invoke('model-settings:save', patch),
   },
+  /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
+  updater: {
+    /** 触发「检查更新」（仅打包版可用，开发模式抛错） */
+    check: () => ipcRenderer.invoke('updater:check'),
+    /** 读取当前应用版本号 */
+    getVersion: () => ipcRenderer.invoke('updater:get-version') as Promise<string>,
+    /** 用户确认「开始下载」 */
+    download: () => ipcRenderer.invoke('updater:download'),
+    /** 用户放弃本次更新 */
+    skip: () => ipcRenderer.invoke('updater:skip'),
+    /** 用户确认「立即重启安装」 */
+    install: () => ipcRenderer.invoke('updater:install'),
+    /** 订阅「发现新版本」事件 */
+    onAvailable: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, version: string) => cb(version)
+      ipcRenderer.on('updater:available', listener)
+      return () => ipcRenderer.removeListener('updater:available', listener)
+    },
+    /** 订阅「下载完成」事件 */
+    onDownloaded: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('updater:downloaded', listener)
+      return () => ipcRenderer.removeListener('updater:downloaded', listener)
+    },
+    /** 订阅「下载进度」事件（0-100） */
+    onProgress: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, percent: number) => cb(percent)
+      ipcRenderer.on('updater:progress', listener)
+      return () => ipcRenderer.removeListener('updater:progress', listener)
+    },
+    /** 订阅「检查/下载出错」事件 */
+    onError: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, message: string) => cb(message)
+      ipcRenderer.on('updater:error', listener)
+      return () => ipcRenderer.removeListener('updater:error', listener)
+    },
+    /** 订阅「托盘触发检查更新」事件（设置窗已打开，等待弹窗） */
+    onCheckRequest: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('updater:check-request', listener)
+      return () => ipcRenderer.removeListener('updater:check-request', listener)
+    },
+  },
 }
 
 contextBridge.exposeInMainWorld('api', api)

@@ -2,10 +2,25 @@ node_modules/
 dist/
 dist-electron/
 release/
+coverage/
+
 *.log
+*.tsbuildinfo
+*.swp
+*.swo
+
 .DS_Store
+Thumbs.db
+
 .vscode/
 .idea/
+
+# CI 工作流必须提交（GitHub Actions 依赖），禁止忽略 .github/
+
+# 环境变量 / 密钥，绝不纳入版本控制
+.env
+.env.*
+*.local
 
 # 本地工具链 / 索引，不纳入版本控制
 .serena/

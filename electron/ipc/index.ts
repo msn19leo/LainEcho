@@ -10,6 +10,8 @@ import { registerSessionIpc } from './session.ipc'
 import { registerSettingsIpc } from './settings.ipc'
 import { registerTtsIpc } from './tts.ipc'
 import { registerWindowIpc } from './window.ipc'
+import { registerUpdaterIpc } from './updater.ipc'
+import { windowManager } from '../windows/windowManager'
 
 export function registerAllIpc(): void {
   registerAiIpc()
@@ -21,4 +23,6 @@ export function registerAllIpc(): void {
   registerSettingsIpc()
   registerTtsIpc()
   registerWindowIpc()
+  // 更新：广播目标为所有窗口（桌宠/聊天/设置）
+  registerUpdaterIpc(() => windowManager.getAllWindows())
 }

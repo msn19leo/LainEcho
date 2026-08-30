@@ -16,6 +16,7 @@ import {
   PersonStanding,
   Sparkles,
   AudioLines,
+  Info,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -30,8 +31,9 @@ import { CharacterModelPanel } from './panels/CharacterModelPanel'
 import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { VoicePanel } from './panels/VoicePanel'
+import { AboutPanel } from './panels/AboutPanel'
 
-export type ModuleId = 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice'
+export type ModuleId = 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice' | 'about'
 
 interface ModuleDef {
   id: ModuleId
@@ -47,6 +49,7 @@ const MODULES: ModuleDef[] = [
   { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。', icon: AudioLines },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
   { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
+  { id: 'about', title: '关于与更新', desc: '检查并安装新版本，查看应用信息。', icon: Info },
 ]
 
 export function SettingsLayout() {
@@ -215,6 +218,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       {id === 'voice' && <VoicePanel />}
       {id === 'memory' && <MemoryPanel />}
       {id === 'data' && <DataPanel />}
+      {id === 'about' && <AboutPanel />}
     </div>
   )
 }

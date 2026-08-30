@@ -105,6 +105,11 @@ class WindowManager {
     }
   }
 
+  /** 返回当前全部活跃窗口（供 updater IPC 广播更新状态） */
+  getAllWindows(): BrowserWindow[] {
+    return BrowserWindow.getAllWindows()
+  }
+
   /** 会话新建/删除后广播，聊天窗口据此刷新并处理「当前会话被删」的情况 */
   notifySessionsChanged(): void {
     this.broadcast('sessions-changed')
@@ -132,6 +137,14 @@ class WindowManager {
     this.settings.focus()
   }
 
+  // ---------------- 更新 ----------------
+
+  /** 托盘触发「检查更新」：同时弹出设置窗（若未开）并广播 updater:check-request */
+  checkForUpdates(): void {
+    this.showSettings()
+    this.broadcast('updater:check-request')
+  }
+
   // ---------------- 托盘 ----------------
 
   private setupTray(): void {
@@ -154,6 +167,8 @@ class WindowManager {
       { type: 'separator' },
       { label: '打开聊天窗口', click: () => this.showChat() },
       { label: '打开设置', click: () => this.showSettings() },
+      { type: 'separator' },
+      { label: '检查更新…', click: () => this.checkForUpdates() },
       { type: 'separator' },
       {
         label: '退出',

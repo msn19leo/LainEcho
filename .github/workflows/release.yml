@@ -1,0 +1,34 @@
+# 发版工作流：push 一个 v*（如 v0.2.0）标签时触发，
+# 在 Windows 上构建并发布到 GitHub Releases（含 .exe 安装包与 latest.yml）。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 打包并发布
+        # -p always：无条件创建/更新 GitHub Release 并上传产物
+        # GH_TOKEN 为 CI 内置令牌，electron-builder 用其鉴权上传
+        run: npm run build:win -- -p always
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -496,7 +496,7 @@ export function CharacterCardPanel() {
                       <Input
                         value={editor.name}
                         onChange={(e) => setEditor({ ...editor, name: e.target.value })}
-                        placeholder="如：小艾"
+                        placeholder="如：玲音"
                         maxLength={20}
                       />
                     </Field>
@@ -790,7 +790,7 @@ export function CharacterCardPanel() {
                       rows={4}
                       value={editor.messageExample}
                       onChange={(e) => setEditor({ ...editor, messageExample: e.target.value })}
-                      placeholder={"{{user}}: 今天天气怎么样？\n{{char}}: 唔……小艾看不到外面的天气呢，但主人的声音听起来心情不错哦～"}
+                      placeholder={"{{user}}: 你是谁？为什么会在我的电脑里？\n{{char}}: ……我是玲音。也是你记忆中的一段杂讯。你记得我的，只是忘了。"}
                     />
                   </Field>
                 </AccordionItem>

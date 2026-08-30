@@ -1,5 +1,5 @@
 appId: com.lainecho.pet
-productName: AI桌宠
+productName: LainEcho
 directories:
   buildResources: build
   output: release
@@ -25,8 +25,13 @@ nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
+  differentialPackage: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: AI桌宠
-  deleteAppDataOnUninstall: false
-publish: null
+  shortcutName: LainEcho
+  deleteAppDataOnUninstall: true
+publish:
+  provider: github
+  owner: msn19leo
+  repo: LainEcho
+  releaseType: release

@@ -513,4 +513,27 @@ export interface WindowApi {
     /** 保存模型设置（部分合并），并广播到桌宠窗口 */
     save: (patch: Partial<ModelSettings>) => Promise<void>
   }
+  /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
+  updater: {
+    /** 触发「检查更新」（仅打包版可用，开发模式抛错） */
+    check: () => Promise<void>
+    /** 读取当前应用版本号 */
+    getVersion: () => Promise<string>
+    /** 用户确认「开始下载」 */
+    download: () => Promise<void>
+    /** 用户放弃本次更新 */
+    skip: () => Promise<void>
+    /** 用户确认「立即重启安装」 */
+    install: () => Promise<void>
+    /** 订阅「发现新版本」事件（传新版本号），返回取消订阅函数 */
+    onAvailable: (cb: (version: string) => void) => () => void
+    /** 订阅「下载完成」事件，返回取消订阅函数 */
+    onDownloaded: (cb: () => void) => () => void
+    /** 订阅「下载进度」事件（0-100），返回取消订阅函数 */
+    onProgress: (cb: (percent: number) => void) => () => void
+    /** 订阅「检查/下载出错」事件，返回取消订阅函数 */
+    onError: (cb: (message: string) => void) => () => void
+    /** 订阅「托盘触发检查更新」事件（设置窗已打开，等待弹窗），返回取消订阅函数 */
+    onCheckRequest: (cb: () => void) => () => void
+  }
 }
