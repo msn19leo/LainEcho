@@ -527,6 +527,8 @@ export interface WindowApi {
     install: () => Promise<void>
     /** 订阅「发现新版本」事件（传新版本号），返回取消订阅函数 */
     onAvailable: (cb: (version: string) => void) => () => void
+    /** 订阅「检查完成且无新版本」事件（结束"检查中"状态），返回取消订阅函数 */
+    onNotAvailable: (cb: () => void) => () => void
     /** 订阅「下载完成」事件，返回取消订阅函数 */
     onDownloaded: (cb: () => void) => () => void
     /** 订阅「下载进度」事件（0-100），返回取消订阅函数 */

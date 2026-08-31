@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "icon": "node scripts/make-icon.mjs",
+    "icon": "node scripts/png-to-ico.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "postinstall": "electron-builder install-app-deps"

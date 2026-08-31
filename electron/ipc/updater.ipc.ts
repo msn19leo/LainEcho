@@ -21,6 +21,7 @@ export function registerUpdaterIpc(getWindows: () => BrowserWindow[]): void {
   // 初始化自动更新服务，把主进程事件转发给渲染进程
   initAutoUpdater({
     onAvailable: (version) => broadcast('updater:available', version),
+    onNotAvailable: () => broadcast('updater:not-available'),
     onDownloaded: () => broadcast('updater:downloaded'),
     onProgress: (percent) => broadcast('updater:progress', percent),
     onError: (message) => broadcast('updater:error', message),

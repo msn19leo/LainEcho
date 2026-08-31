@@ -171,6 +171,12 @@ const api: WindowApi = {
       ipcRenderer.on('updater:available', listener)
       return () => ipcRenderer.removeListener('updater:available', listener)
     },
+    /** 订阅「检查完成且无新版本」事件（结束"检查中"状态） */
+    onNotAvailable: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('updater:not-available', listener)
+      return () => ipcRenderer.removeListener('updater:not-available', listener)
+    },
     /** 订阅「下载完成」事件 */
     onDownloaded: (cb) => {
       const listener = () => cb()

@@ -9,6 +9,8 @@ import { autoUpdater } from 'electron-updater'
 type UpdateHandlers = {
   /** 发现新版本（通知前端弹窗，传新版本号） */
   onAvailable: (version: string) => void
+  /** 检查完成且无新版本（通知前端结束"检查中"状态） */
+  onNotAvailable: () => void
   /** 更新包下载完成 */
   onDownloaded: () => void
   /** 下载进度（0-100） */
@@ -32,6 +34,7 @@ export function initAutoUpdater(handlers: UpdateHandlers): void {
 
   // 事件转发给调用方（windowManager / IPC）
   autoUpdater.on('update-available', (info) => handlers.onAvailable(info.version))
+  autoUpdater.on('update-not-available', () => handlers.onNotAvailable())
   autoUpdater.on('update-downloaded', () => handlers.onDownloaded())
   autoUpdater.on('download-progress', (p) => handlers.onProgress(Math.round(p.percent)))
   autoUpdater.on('error', (err) => handlers.onError(err.message))

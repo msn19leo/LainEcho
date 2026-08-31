@@ -7,6 +7,7 @@ files:
   - dist-electron/**
   - dist/**
   - build/icon.png
+  - build/icon.ico
   - package.json
   - "!node_modules/**"
 asar: true
@@ -19,7 +20,7 @@ win:
     - target: nsis
       arch:
         - x64
-  icon: build/icon.png
+  icon: build/icon.ico
   artifactName: ${productName}-${version}-setup.${ext}
 nsis:
   oneClick: false

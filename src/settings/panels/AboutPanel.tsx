@@ -7,9 +7,8 @@ import { useEffect, useState } from 'react'
 import { ArrowUpCircle, RefreshCw, RotateCw } from 'lucide-react'
 import { api } from '../../api'
 import { Button, Card, Modal } from '../../components/ui'
-import { toast } from '../../components/toast'
 
-type UpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error'
+type UpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error' | 'latest'
 
 export function AboutPanel() {
   const [phase, setPhase] = useState<UpdatePhase>('idle')
@@ -18,8 +17,6 @@ export function AboutPanel() {
   const [error, setError] = useState('')
   /** 应用当前版本号（从主进程动态读取） */
   const [version, setVersion] = useState('')
-  /** 是否由托盘触发，用于「提醒已是最新」的差异化提示 */
-  const [asked, setAsked] = useState(false)
 
   useEffect(() => {
     // 读取当前应用版本号用于展示
@@ -28,6 +25,10 @@ export function AboutPanel() {
     const offAvailable = api.updater.onAvailable((v) => {
       setAvailableVersion(v)
       setPhase('available')
+    })
+    // 检查完成且无新版本：结束"检查中"，提示已是最新
+    const offNotAvailable = api.updater.onNotAvailable(() => {
+      setPhase('latest')
     })
     const offDownloaded = api.updater.onDownloaded(() => setPhase('downloaded'))
     const offProgress = api.updater.onProgress((p) => {
@@ -40,11 +41,11 @@ export function AboutPanel() {
     })
     // 托盘「检查更新」触发：进入检查态并主动发起检查
     const offRequest = api.updater.onCheckRequest(async () => {
-      setAsked(true)
       await handleCheck()
     })
     return () => {
       offAvailable()
+      offNotAvailable()
       offDownloaded()
       offProgress()
       offError()
@@ -83,7 +84,8 @@ export function AboutPanel() {
   }
 
   const checking = phase === 'checking'
-  const currentPhrase = phase === 'idle' ? '检查是否有新版本可更新' : phase === 'error' ? '检查出错' : ''
+  const currentPhrase =
+    phase === 'idle' ? '检查是否有新版本可更新' : phase === 'error' ? '检查出错' : phase === 'latest' ? '当前已是最新版本' : ''
 
   return (
     <Card className="space-y-4">
@@ -101,6 +103,11 @@ export function AboutPanel() {
           '检查更新'
         )}
       </Button>
+      {phase === 'latest' && (
+        <div className="rounded-[var(--radius-sm)] bg-primary-500/10 px-3 py-2">
+          <p className="text-xs leading-relaxed text-primary-400">当前已是最新版本。</p>
+        </div>
+      )}
 
       {phase === 'idle' && <p className="text-xs leading-relaxed text-text-muted">{currentPhrase}</p>}
 
@@ -163,14 +170,11 @@ export function AboutPanel() {
         </p>
       </Modal>
 
-      {/* 检查出错 / 已是最新的落点 */}
+      {/* 检查出错 */}
       {phase === 'error' && (
         <div className="rounded-[var(--radius-sm)] bg-danger/10 px-3 py-2">
           <p className="text-xs leading-relaxed text-danger">{error}</p>
         </div>
-      )}
-      {phase === 'error' && asked && error.includes('最新') && (
-        <p className="text-xs leading-relaxed text-text-muted">当前已是最新版本。</p>
       )}
 
       <div className="border-t border-border pt-3">
