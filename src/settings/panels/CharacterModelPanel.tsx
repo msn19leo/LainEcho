@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react'
 import {
   AlertCircle,
   CheckCircle2,
+  Images,
   Maximize2,
   PersonStanding,
   Play,
@@ -13,14 +14,17 @@ import {
   Smile,
 } from 'lucide-react'
 import { api } from '../../api'
-import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode, ExpressionMeta } from '../../types'
+import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode, ExpressionMeta, CharacterSprite, StandardEmotion } from '../../types'
+import { EmotionMapEditor, emotionMapToEditor, editorToEmotionMap } from '../../components/EmotionMapEditor'
 import {
   AccordionItem,
   Button,
   Card,
   ConfirmModal,
   Empty,
+  Field,
   Loading,
+  Modal,
   SegmentedControl,
   Select,
   Slider,
@@ -39,6 +43,18 @@ export function CharacterModelPanel() {
   const [loading, setLoading] = useState(true)
   const [importing, setImporting] = useState(false)
   const [deleting, setDeleting] = useState<Live2DModelMeta | null>(null)
+  /** 2D 立绘集列表 */
+  const [sprites, setSprites] = useState<CharacterSprite[]>([])
+  const [importingSprite, setImportingSprite] = useState(false)
+  const [deletingSprite, setDeletingSprite] = useState<CharacterSprite | null>(null)
+  /** 正在编辑情绪映射的立绘集（非空 = 弹窗打开） */
+  const [emotionEditing, setEmotionEditing] = useState<CharacterSprite | null>(null)
+  /** 情绪映射编辑草稿（空串 = 不配置） */
+  const [emotionDraft, setEmotionDraft] = useState<Record<StandardEmotion, string>>(emotionMapToEditor(null))
+  /** 说话立绘编辑草稿（空串 = 不配置） */
+  const [speakingDraft, setSpeakingDraft] = useState('')
+  /** 思考立绘编辑草稿（空串 = 不配置） */
+  const [thinkingDraft, setThinkingDraft] = useState('')
   /** 可用的动作组列表（从模型 model3.json 读取） */
   const [motionGroups, setMotionGroups] = useState<string[]>([])
   /** 可用的表情列表（从选中模型的 exp3.json 读取） */
@@ -72,7 +88,11 @@ export function CharacterModelPanel() {
   useEffect(() => {
     void refresh()
     void load()
+    void loadSprites()
   }, [load])
+
+  // 立绘集变化（导入/删除）时刷新
+  useEffect(() => api.sprite.onChanged(() => void loadSprites()), [])
 
   /** 选中模型变化时，重新加载该模型的动作组（保证下拉框与实际展示的模型一致） */
   useEffect(() => {
@@ -140,12 +160,88 @@ export function CharacterModelPanel() {
     }
   }
 
-  /** 选择当前全局使用的 Live2D 模型 */
+  /** 加载 2D 立绘集列表 */
+  const loadSprites = async () => {
+    try {
+      setSprites(await api.sprite.list())
+    } catch {
+      setSprites([])
+    }
+  }
+
+  /** 导入立绘集（文件夹，含多张情绪切图） */
+  const handleImportSprite = async () => {
+    setImportingSprite(true)
+    try {
+      const meta = await api.sprite.importFromFolder()
+      if (meta) {
+        toast(`立绘集「${meta.name}」导入成功（${meta.images.length} 张图）`)
+        await loadSprites()
+      } else {
+        toast('已取消', 'info')
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '导入失败', 'error')
+    } finally {
+      setImportingSprite(false)
+    }
+  }
+
+  /** 删除立绘集 */
+  const handleDeleteSprite = async () => {
+    if (!deletingSprite) return
+    try {
+      await api.sprite.remove(deletingSprite.id)
+      toast('已删除')
+      setDeletingSprite(null)
+      await loadSprites()
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '删除失败', 'error')
+    }
+  }
+
+  /** 打开立绘集的"情绪 → 立绘图"映射 + 说话/思考立绘 编辑弹窗 */
+  const openEmotionMap = (s: CharacterSprite) => {
+    setEmotionEditing(s)
+    setEmotionDraft(emotionMapToEditor(s.emotionMap))
+    setSpeakingDraft(s.speakingImage ?? '')
+    setThinkingDraft(s.thinkingImage ?? '')
+  }
+
+  /** 保存立绘集的展示资产（情绪映射 + 说话/思考立绘） */
+  const handleSaveEmotionMap = async () => {
+    if (!emotionEditing) return
+    try {
+      await api.sprite.update(emotionEditing.id, {
+        emotionMap: editorToEmotionMap(emotionDraft),
+        speakingImage: speakingDraft || null,
+        thinkingImage: thinkingDraft || null,
+      })
+      toast('已保存')
+      setEmotionEditing(null)
+      await loadSprites()
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '保存失败', 'error')
+    }
+  }
+
+  /** 选择当前全局使用的 Live2D 模型（互斥：清除全局立绘选中） */
   const handleSelectModel = async (modelId: string) => {
     if (settings.selectedModelId === modelId) return
     try {
-      await save({ selectedModelId: modelId })
+      await save({ selectedModelId: modelId, selectedSpriteId: null })
       toast('已切换当前模型')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '切换失败', 'error')
+    }
+  }
+
+  /** 选择当前全局使用的 2D 立绘集（互斥：清除全局模型选中），并驱动桌面切为立绘 */
+  const handleSelectSprite = async (spriteId: string) => {
+    if (settings.selectedSpriteId === spriteId) return
+    try {
+      await save({ selectedSpriteId: spriteId, selectedModelId: null })
+      toast('已切换当前立绘集')
     } catch (err) {
       toast(err instanceof Error ? err.message : '切换失败', 'error')
     }
@@ -256,6 +352,67 @@ export function CharacterModelPanel() {
               </Card>
             )
           })}
+        </div>
+      )}
+
+      {/* ==================== 2D 立绘分区 ==================== */}
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold text-text">2D 立绘集（{sprites.length}）</span>
+        <Button onClick={() => void handleImportSprite()} disabled={importingSprite}>
+          <Images size={14} strokeWidth={2.25} />
+          {importingSprite ? '导入中…' : '从文件夹导入'}
+        </Button>
+      </div>
+      <p className="text-xs leading-relaxed text-text-muted">
+        立绘集 = 一个含多张情绪切图的文件夹（png/jpg/webp）。导入后在「角色卡 → 外观」中把立绘集与情绪映射绑定到角色。
+      </p>
+
+      {sprites.length === 0 ? (
+        <Card>
+          <div className="flex items-center gap-3 py-2">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+              <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
+            </div>
+            <div className="flex-1 text-sm text-text-muted">还没有立绘集。导入包含情绪切图的文件夹即可。</div>
+          </div>
+        </Card>
+      ) : (
+        <div className="space-y-2">
+          {sprites.map((s) => (
+            <Card
+              key={s.id}
+              className={cn(
+                'flex items-center gap-3 py-3',
+                settings.selectedSpriteId === s.id &&
+                  'ring-2 ring-[var(--primary-400)] ring-offset-2 ring-offset-[var(--bg-base)] shadow-[0_0_16px_var(--primary-glow)]',
+              )}
+              onClick={() => void handleSelectSprite(s.id)}
+            >
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <div className="truncate text-sm font-medium text-text">{s.name}</div>
+                  {settings.selectedSpriteId === s.id && (
+                    <span className="inline-flex shrink-0 items-center rounded-full bg-[var(--primary-400)]/15 px-2 py-0.5 text-[10px] text-[var(--primary-400)] ring-1 ring-[var(--primary-400)]/30">
+                      当前选择
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 truncate text-xs text-text-muted selectable">
+                  {s.images.length} 张图 · {formatRelativeTime(s.createdAt)} 导入
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openEmotionMap(s) }}>
+                <Smile size={14} strokeWidth={2} />
+                情绪映射
+              </Button>
+              <Button variant="danger" size="sm" onClick={(e) => { e.stopPropagation(); setDeletingSprite(s) }}>
+                删除
+              </Button>
+            </Card>
+          ))}
         </div>
       )}
 
@@ -456,6 +613,62 @@ export function CharacterModelPanel() {
         onConfirm={() => void handleDelete()}
         onClose={() => setDeleting(null)}
       />
+
+      <ConfirmModal
+        open={!!deletingSprite}
+        title="删除立绘集"
+        message={`确定删除立绘集「${deletingSprite?.name}」吗？其文件夹将被移除，绑定该立绘集的角色卡将不再显示立绘。`}
+        confirmText="删除"
+        danger
+        onConfirm={() => void handleDeleteSprite()}
+        onClose={() => setDeletingSprite(null)}
+      />
+
+      {/* 情绪 → 立绘图 映射编辑弹窗 */}
+      <Modal
+        open={!!emotionEditing}
+        onClose={() => setEmotionEditing(null)}
+        title={`情绪映射 · ${emotionEditing?.name ?? ''}`}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setEmotionEditing(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void handleSaveEmotionMap()}>保存</Button>
+          </>
+        }
+      >
+        <EmotionMapEditor
+          title="情绪 → 立绘图映射"
+          hint="AI 回复带有该立绘集的情绪时，切换到对应立绘图。缺项回退 neutral / 立绘集首图。"
+          options={(emotionEditing?.images ?? []).map((i) => ({ value: i.filePath, label: i.filePath }))}
+          map={emotionDraft}
+          onChange={setEmotionDraft}
+          placeholder="不配置（回退 neutral/首图）"
+        />
+
+        {/* 说话 / 思考 立绘 */}
+        <Field label="说话立绘" hint="情绪为平静且正在说话时使用（口型场景）。">
+          <Select value={speakingDraft} onChange={(e) => setSpeakingDraft(e.target.value)}>
+            <option value="">不配置</option>
+            {(emotionEditing?.images ?? []).map((i) => (
+              <option key={i.filePath} value={i.filePath}>
+                {i.filePath}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="思考立绘" hint="AI 开始准备回答到输出文本前使用。">
+          <Select value={thinkingDraft} onChange={(e) => setThinkingDraft(e.target.value)}>
+            <option value="">不配置</option>
+            {(emotionEditing?.images ?? []).map((i) => (
+              <option key={i.filePath} value={i.filePath}>
+                {i.filePath}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </Modal>
     </div>
   )
 }

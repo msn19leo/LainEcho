@@ -50,6 +50,15 @@ export function ChatWindow() {
   const loadSession = useSessionStore((s) => s.loadSession)
   const resetCurrentSession = useSessionStore((s) => s.resetCurrentSession)
   const streaming = useSessionStore((s) => s.streaming)
+  /** 当前朗读到的合成分段索引（pet 段级播放时上报，用于聊天窗高亮当前段） */
+  const [activeChunk, setActiveChunk] = useState<number | null>(null)
+
+  // 订阅"当前朗读合成分段"（桌宠段级播放时经主进程转发），用于聊天窗高亮该段
+  useEffect(() => api.pet.onChunkActive(setActiveChunk), [])
+  // 新一轮回复开始时清空高亮，避免上一轮（尤其无语音时）的高亮残留
+  useEffect(() => {
+    if (streaming) setActiveChunk(null)
+  }, [streaming])
 
   const currentCard = cards.find((c) => c.id === currentCardId)
   const currentSession = sessions.find((s) => s.id === currentSessionId)
@@ -140,11 +149,9 @@ export function ChatWindow() {
         .trim()
     }
 
-    // 将文本发送给桌宠窗口合成播放
-    function flush(text: string): void {
-      const cleaned = stripBrackets(text)
-      if (!cleaned || !ttsCtx) return
-      api.app.speak(cleaned, ttsCtx.voiceId, ttsCtx.languageOverride)
+    // 将语音统一在 onStreamDone 按主进程句子表触发；流式中只即时显示文本，不逐句合成
+    function flush(_text: string): void {
+      if (!ttsCtx) return
     }
 
     // 判断文本是否值得发送：过滤括号后还有足够长度
@@ -194,15 +201,22 @@ export function ChatWindow() {
       }
     })
 
-    // 流式完成：把所有剩余未发送的文本（累积的短句 + 无标点的尾巴）一起发送。
-    const unsubDone = api.ai.onStreamDone(() => {
-      if (ttsCtx) {
-        const remaining = accRef.text.slice(consumedPos)
-        const combined = pendingShortRef.text + remaining
-        if (combined.trim()) {
-          flush(combined)
+    // 流式完成：整段回复按主进程切好的句子表交给桌宠逐句合成播放（不再流式中分句合成）
+    const unsubDone = api.ai.onStreamDone((payload: { message: import('../types').ChatMessage } | undefined) => {
+      const msg = payload?.message
+      const ensureSpeak = (ctx: { voiceId: string; languageOverride: import('../types').TTSLanguage | null } | null) => {
+        if (ctx && msg) {
+          api.app.speak(msg.content, ctx.voiceId, ctx.languageOverride, {
+            chunks: msg.chunks,
+          })
         }
-        pendingShortRef.text = ''
+      }
+      // 语音上下文优先用流式中已初始化的；未初始化（如短回复无流式块）时兜底初始化一次
+      if (ttsCtx) {
+        ensureSpeak(ttsCtx)
+      } else {
+        ttsChecked = false
+        void ensureTtsCtx().then((ctx) => ensureSpeak(ctx))
       }
       // 重置本轮状态
       accRef.text = ''
@@ -235,6 +249,10 @@ export function ChatWindow() {
     api.app.setPetCard({
       modelId: card?.modelId ?? null,
       modelOverride: card?.modelOverride ?? null,
+      renderMode: card?.renderMode ?? null,
+      spriteId: card?.spriteId ?? null,
+      emotionMap: card?.emotionMap ?? null,
+      live2dExpressionMap: card?.live2dExpressionMap ?? null,
     })
     resetCurrentSession()
   }
@@ -323,7 +341,7 @@ export function ChatWindow() {
         </div>
 
         {/* 消息流 */}
-        <MessageList />
+        <MessageList activeChunk={activeChunk} />
 
         {/* 输入区 */}
         <InputArea />

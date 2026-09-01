@@ -5,11 +5,35 @@
 
 export type ChatRole = 'system' | 'user' | 'assistant'
 
+/** 句子级情绪段：从某一句起切换到该情绪（炉语联动用） */
+export interface EmotionSegment {
+  /** 起始消息内句子索引（0 基，来自 splitSentences） */
+  startSentence: number
+  emotion: StandardEmotion
+}
+
+/** 语音合成分段：一次回复的一个"对话段"（JSON dialogue 一项），整段一次合成，段内不再按标点切碎 */
+export interface DialogueChunk {
+  text: string
+  emotion: StandardEmotion
+}
+
 /** 单条聊天消息（落盘到 sessions/{id}.json 的 messages 数组） */
 export interface ChatMessage {
   role: ChatRole
   content: string
   timestamp?: number
+  /**
+   * AI 回复的结构化情绪标签（仅 assistant 消息；缺省 = 未解析/平静）。
+   * 由主进程从回复末尾的 {@emotion:xxx} 标签解析并归一化到标准情绪。
+   */
+  emotion?: StandardEmotion
+  /** 按标点切分的句子序列（语音/朗读句级同步与高亮共用，仅 assistant 消息） */
+  sentences?: string[]
+  /** 句子级情绪切换点（内嵌 {@emo:xxx} 解析所得，仅 assistant 消息） */
+  emotionSegments?: EmotionSegment[]
+  /** 语音合成分段（JSON dialogue 逐项，段级合成与切换立绘用，仅 assistant 消息） */
+  chunks?: DialogueChunk[]
 }
 
 /** 角色卡 schema 版本，用于未来迁移 */
@@ -130,7 +154,17 @@ export interface CharacterCard {
   /** 绑定的参考音频 id（null = 不启用 TTS） */
   voiceId: string | null
 
-  // --- 角色级配置覆盖（null = 跟随全局）---
+  // --- 形象呈现（2D 立绘 / Live2D 并行切换）---
+  /** 形象渲染模式：'live2d'（默认）| 'sprite'（2D 静态立绘） */
+  renderMode: RenderMode | null
+  /** 绑定的立绘集 id（null = 未绑定；renderMode='sprite' 时生效） */
+  spriteId: string | null
+  /** 立绘模式的情绪映射：8 情绪 → 立绘集内图片文件名。缺项回退 neutral */
+  emotionMap: Partial<Record<StandardEmotion, string>> | null
+  /** Live2D 模式的情绪映射（可选）：8 情绪 → 现有 exp3.json 表情名。缺项跟随全局/覆盖表情 */
+  live2dExpressionMap: Partial<Record<StandardEmotion, string>> | null
+
+  /** 角色级配置覆盖（null = 跟随全局）--- */
   /** TTS 配置覆盖：解决日文/中文角色共用全局 language 的问题 */
   ttsOverride: CharacterTTSOverride | null
   /** 模型设置覆盖：让同模型不同角色有不同表情/待机动作 */
@@ -140,6 +174,22 @@ export interface CharacterCard {
   avatar: string | null
   createdAt: number
   updatedAt: number
+}
+
+/** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式 + 情绪映射 */
+export interface PetCardPayload {
+  /** 绑定的 Live2D 模型 id（null = 使用全局当前模型） */
+  modelId: string | null
+  /** 模型设置覆盖（表情/待机动作），null = 跟随全局 */
+  modelOverride: CharacterModelOverride | null
+  /** 形象渲染模式：null = 跟随默认（live2d） */
+  renderMode: RenderMode | null
+  /** 绑定的立绘集 id（renderMode='sprite' 时生效） */
+  spriteId: string | null
+  /** 立绘模式情绪映射：情绪 → 立绘集内文件名 */
+  emotionMap: Partial<Record<StandardEmotion, string>> | null
+  /** Live2D 模式情绪映射：情绪 → exp3 表情名 */
+  live2dExpressionMap: Partial<Record<StandardEmotion, string>> | null
 }
 
 /** 角色卡创建/更新时的业务输入字段（不含 id/时间戳/版本，由主进程生成） */
@@ -152,6 +202,10 @@ export type CharacterCardInput = Pick<
   | 'voiceId'
   | 'ttsOverride'
   | 'modelOverride'
+  | 'renderMode'
+  | 'spriteId'
+  | 'emotionMap'
+  | 'live2dExpressionMap'
   | 'avatar'
 >
 
@@ -231,6 +285,59 @@ export interface Live2DModelMeta {
   name: string
   /** model3 json 相对 userData/models/{id}/ 的路径 */
   model3Path: string
+  createdAt: number
+}
+
+// ---------------- 情绪标签（结构化情绪输出） ----------------
+
+/**
+ * 标准情绪：AI 回复的情绪标签、角色卡情绪映射的唯一定义。
+ * 顺序即语义，全小写下划线命名，保证 prompt 与解析一致。
+ * 原「担心」「亲近」已删除，分别回退到 sad(难过) / happy(开心)。
+ * 解析失败 / 缺图一律回退 DEFAULT_EMOTION(neutral)，保证任何输入都有确定输出。
+ */
+export const STANDARD_EMOTIONS = [
+  'neutral', // 平静：默认/兜底
+  'happy', // 开心
+  'sad', // 难过
+  'angry', // 生气
+  'surprised', // 惊讶
+  'shy', // 害羞
+] as const
+
+export type StandardEmotion = (typeof STANDARD_EMOTIONS)[number]
+
+/** 兜底情绪：任何未映射/解析失败的情绪都收敛到这里 */
+export const DEFAULT_EMOTION: StandardEmotion = 'neutral'
+
+// ---------------- 2D 立绘 ----------------
+
+/** 立绘渲染模式：Live2D 动画 或 2D 静态切图（并行切换，统一形象层分发） */
+export type RenderMode = 'live2d' | 'sprite'
+
+/** 立绘集内单张图片：按情绪映射的目标文件（相对 sprites/{id}/） */
+export interface CharacterSpriteImage {
+  /** 文件名（含扩展名，相对 userData/sprites/{id}/） */
+  filePath: string
+}
+
+/**
+ * 立绘集元信息（sprites/index.json）。
+ * 一个立绘集 = 导入的一个文件夹，内含多张情绪切图（png/jpg/webp 等）。
+ * 通过角色卡的 emotionMap 或本集的 emotionMap 把 8 标准情绪映射到某张图。
+ */
+export interface CharacterSprite {
+  id: string
+  /** 展示名，默认取导入文件夹名 */
+  name: string
+  /** 该立绘集下的图片列表 */
+  images: CharacterSpriteImage[]
+  /** 立绘集自身的情绪 → 立绘图 映射（全局使用该立绘集时生效，缺项回退 neutral/首图） */
+  emotionMap: Partial<Record<StandardEmotion, string>> | null
+  /** 说话立绘图（相对文件路径，空 = 未配置）：情绪为平静且正在说话时使用 */
+  speakingImage: string | null
+  /** 思考立绘图（相对文件路径，空 = 未配置）：AI 开始准备回答到输出文本前使用 */
+  thinkingImage: string | null
   createdAt: number
 }
 
@@ -335,6 +442,8 @@ export interface ModelSettings {
   view: ModelViewSettings
   /** 当前全局选中的 Live2D 模型 id（角色卡未绑定时使用） */
   selectedModelId: string | null
+  /** 当前全局选中的 2D 立绘集 id（角色卡未绑定时、且立绘模式下使用） */
+  selectedSpriteId: string | null
 }
 
 /** 会话导出结果为 Markdown 时返回 */
@@ -429,6 +538,18 @@ export interface WindowApi {
     /** 弹原生文件选择框导入 live2dcubismcore.min.js */
     importCore: () => Promise<{ present: boolean; path: string | null }>
   }
+  sprite: {
+    /** 列出所有已导入的立绘集 */
+    list: () => Promise<CharacterSprite[]>
+    /** 弹原生文件夹选择框导入立绘集（复制到 userData/sprites/），返回导入结果 */
+    importFromFolder: () => Promise<CharacterSprite | null>
+    /** 删除指定立绘集（同时删除资源目录与索引条目） */
+    remove: (spriteId: string) => Promise<void>
+    /** 更新立绘集展示资产：情绪→立绘图映射 / 说话立绘 / 思考立绘 */
+    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'emotionMap' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
+    /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
+    onChanged: (cb: () => void) => () => void
+  }
   settings: {
     /** 返回非敏感配置 + 是否已配置 Key（不回显明文） */
     get: () => Promise<AppSettings & { hasApiKey: boolean }>
@@ -461,27 +582,44 @@ export interface WindowApi {
   app: {
     openChat: () => void
     openSettings: () => void
-    /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖） */
-    setPetCard: (payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => void
+    /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖 + 立绘/渲染模式 + 情绪映射） */
+    setPetCard: (payload: PetCardPayload) => void
     quit: () => void
-    /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
-    speak: (text: string, voiceId: string | null, languageOverride?: TTSLanguage | null) => void
+    /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步）。
+     *  payload 携带主进程切好的合成分段（dialogue 逐项），供桌宠段级合成并联动。 */
+    speak: (
+      text: string,
+      voiceId: string | null,
+      languageOverride?: TTSLanguage | null,
+      payload?: { chunks?: DialogueChunk[] },
+    ) => void
   }
   pet: {
-    /** 订阅角色卡切换事件（chat 窗口切卡后同步模型 + 覆盖配置到桌宠） */
-    onCardChanged: (cb: (payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => void) => () => void
+    /** 订阅角色卡切换事件（chat 窗口切卡后同步模型/覆盖/立绘到桌宠） */
+    onCardChanged: (cb: (payload: PetCardPayload) => void) => () => void
     /** 订阅 Live2D 模型列表变化（导入/删除后刷新） */
     onModelsChanged: (cb: () => void) => () => void
     /** 订阅 Cubism Core 运行库导入事件（导入后桌宠重新初始化） */
     onCoreChanged: (cb: () => void) => () => void
     /** 获取 Live2D 模型资源的 file:// 前缀（用于拼 model3.json 地址） */
     modelUrl: (modelId: string, model3Path: string) => string
+    /** 拼接立绘图片资源地址（pet-res://sprites/{spriteId}/{filePath}） */
+    spriteUrl: (spriteId: string, filePath: string) => string
     /** 订阅模型设置变化（设置窗口修改后广播到桌宠窗口） */
     onModelSettingsChanged: (cb: (settings: ModelSettings) => void) => () => void
     /** 订阅全局鼠标坐标变化（窗口相对坐标，由主进程轮询 screen.getCursorScreenPoint） */
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
-    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null }) => void) => () => void
+    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
+     *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放 */
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[] }) => void) => () => void
+    /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘） */
+    onEmotion: (cb: (emotion: StandardEmotion) => void) => () => void
+    /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
+    onThinking: (cb: (thinking: boolean) => void) => () => void
+    /** 上报当前朗读的合成分段索引（null 表示无朗读/清空高亮；桌宠播放时调用，经主进程转发给聊天窗高亮） */
+    reportChunkActive: (index: number | null) => void
+    /** 订阅"当前朗读合成分段"索引（null 表示清空；聊天窗高亮用），返回取消订阅函数 */
+    onChunkActive: (cb: (index: number | null) => void) => () => void
   }
   /** 语音合成（TTS）：MiMo 声音克隆 */
   tts: {

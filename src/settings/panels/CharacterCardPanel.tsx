@@ -25,13 +25,17 @@ import {
 } from 'lucide-react'
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
+import { EmotionMapEditor, emptyEmotionMap, emotionMapToEditor, editorToEmotionMap } from '../../components/EmotionMapEditor'
 import type {
   CharacterCard,
   CharacterCardInput,
   CharacterModelOverride,
   CharacterPersona,
+  CharacterSprite,
   CharacterTTSOverride,
   ExpressionMeta,
+  RenderMode,
+  StandardEmotion,
   TTSLanguage,
   VoiceReference,
 } from '../../types'
@@ -100,6 +104,15 @@ interface EditorState {
   // 模型覆盖
   expressionOverride: 'global' | string
   idleAnimationOverride: 'global' | string
+  // 形象呈现（2D 立绘 / Live2D 并行切换）
+  /** 'global' = 跟随全局当前形象（角色模型面板中选 live2d 还是立绘） */
+  renderMode: 'global' | RenderMode
+  /** 绑定的立绘集 id */
+  spriteId: string
+  /** 情绪 → 立绘文件名 映射（editor 内空串 = 不配置） */
+  emotionMap: Record<StandardEmotion, string>
+  /** 情绪 → exp3 表情名 映射（editor 内空串 = 不配置） */
+  live2dExpressionMap: Record<StandardEmotion, string>
 }
 
 /** 空编辑器状态 */
@@ -114,6 +127,10 @@ const EMPTY_EDITOR: EditorState = {
   ttsAutoPlayOverride: 'global',
   expressionOverride: 'global',
   idleAnimationOverride: 'global',
+  renderMode: 'global',
+  spriteId: '',
+  emotionMap: emptyEmotionMap(),
+  live2dExpressionMap: emptyEmotionMap(),
 }
 
 /** 行分隔字符串 → 数组（解析 array 字段的输入值） */
@@ -226,6 +243,7 @@ export function CharacterCardPanel() {
   const { cards, loading, load } = useCharacterStore()
   const [models, setModels] = useState<{ id: string; name: string }[]>([])
   const [voices, setVoices] = useState<VoiceReference[]>([])
+  const [sprites, setSprites] = useState<CharacterSprite[]>([])
   const [expressions, setExpressions] = useState<ExpressionMeta[]>([])
   const [motionGroups, setMotionGroups] = useState<string[]>([])
   const [editor, setEditor] = useState<EditorState | null>(null)
@@ -248,6 +266,15 @@ export function CharacterCardPanel() {
       setVoices(list)
     } catch {
       setVoices([])
+    }
+  }
+
+  /** 加载立绘集列表 */
+  const loadSprites = async () => {
+    try {
+      setSprites(await api.sprite.list())
+    } catch {
+      setSprites([])
     }
   }
 
@@ -275,7 +302,11 @@ export function CharacterCardPanel() {
     void load()
     void loadModels()
     void loadVoices()
+    void loadSprites()
   }, [load])
+
+  // 立绘集列表变化（导出/删除）时刷新
+  useEffect(() => api.sprite.onChanged(() => void loadSprites()), [])
 
   // 窗口聚焦时刷新参考音频列表（用户可能在语音合成面板导入新的）
   useEffect(() => {
@@ -312,6 +343,10 @@ export function CharacterCardPanel() {
       ttsAutoPlayOverride: ttsAutoPlayToEditor(card.ttsOverride),
       expressionOverride: expressionToEditor(card.modelOverride),
       idleAnimationOverride: idleAnimToEditor(card.modelOverride),
+      renderMode: card.renderMode ?? 'global',
+      spriteId: card.spriteId ?? '',
+      emotionMap: emotionMapToEditor(card.emotionMap),
+      live2dExpressionMap: emotionMapToEditor(card.live2dExpressionMap),
     })
     setActiveTab('persona')
   }
@@ -329,6 +364,10 @@ export function CharacterCardPanel() {
         voiceId: editor.voiceId || null,
         ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride, editor.ttsAutoPlayOverride),
         modelOverride: editorToModelOverride(editor.expressionOverride, editor.idleAnimationOverride),
+        renderMode: editor.renderMode === 'global' ? null : editor.renderMode,
+        spriteId: editor.spriteId || null,
+        emotionMap: editorToEmotionMap(editor.emotionMap),
+        live2dExpressionMap: editorToEmotionMap(editor.live2dExpressionMap),
         avatar: editor.card?.avatar ?? null,
       }
 
@@ -800,52 +839,114 @@ export function CharacterCardPanel() {
             {/* 外观 Tab */}
             {activeTab === 'appearance' && (
               <div className="space-y-4">
-                <Field label="绑定 Live2D 模型（可选）" hint="不绑定则使用全局当前模型">
-                  <Select
-                    value={editor.modelId}
-                    onChange={(e) => setEditor({ ...editor, modelId: e.target.value })}
-                  >
-                    <option value="">不绑定（使用全局当前模型）</option>
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name}
-                      </option>
-                    ))}
-                  </Select>
+                {/* 形象呈现模式（置顶） */}
+                <Field label="形象呈现模式（renderMode）" hint="跟随全局 = 用「角色模型」面板当前的全局形象（选 Live2D 还是立绘）。也可为本角色固定使用某一种。">
+                  <SegmentedControl<'global' | RenderMode>
+                    value={editor.renderMode}
+                    onChange={(v) => setEditor({ ...editor, renderMode: v })}
+                    options={[
+                      { value: 'global', label: '跟随全局' },
+                      { value: 'live2d', label: 'Live2D 动画' },
+                      { value: 'sprite', label: '2D 立绘' },
+                    ]}
+                  />
                 </Field>
-                <Field label="表情覆盖（modelOverride.selectedExpression）" hint="角色级表情覆盖。需先绑定模型。null = 跟随全局；空串 = 清除表情">
-                  <Select
-                    value={editor.expressionOverride}
-                    onChange={(e) => setEditor({ ...editor, expressionOverride: e.target.value as 'global' | string })}
-                    disabled={!editor.modelId}
-                  >
-                    <option value="global">跟随全局</option>
-                    <option value="">清除表情（不应用任何表情）</option>
-                    {expressions.map((ex) => (
-                      <option key={ex.name} value={ex.name}>
-                        {ex.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="待机动作覆盖（modelOverride.idleAnimation）" hint="角色级待机动作组覆盖。需先绑定模型。null = 跟随全局；空串 = 随机动作">
-                  <Select
-                    value={editor.idleAnimationOverride}
-                    onChange={(e) => setEditor({ ...editor, idleAnimationOverride: e.target.value as 'global' | string })}
-                    disabled={!editor.modelId}
-                  >
-                    <option value="global">跟随全局</option>
-                    <option value="">随机动作（不指定动作组）</option>
-                    {motionGroups.map((g) => (
-                      <option key={g} value={g}>
-                        {g}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                {!editor.modelId && (
-                  <p className="text-xs text-text-muted">
-                    绑定 Live2D 模型后可选择表情和待机动作覆盖
+
+                {editor.renderMode === 'live2d' ? (
+                  <>
+                    <Field label="绑定 Live2D 模型（可选）" hint="不绑定则使用全局当前模型">
+                      <Select
+                        value={editor.modelId}
+                        onChange={(e) => setEditor({ ...editor, modelId: e.target.value })}
+                      >
+                        <option value="">不绑定（使用全局当前模型）</option>
+                        {models.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label="表情覆盖（modelOverride.selectedExpression）" hint="角色级表情覆盖。需先绑定模型。null = 跟随全局；空串 = 清除表情">
+                      <Select
+                        value={editor.expressionOverride}
+                        onChange={(e) => setEditor({ ...editor, expressionOverride: e.target.value as 'global' | string })}
+                        disabled={!editor.modelId}
+                      >
+                        <option value="global">跟随全局</option>
+                        <option value="">清除表情（不应用任何表情）</option>
+                        {expressions.map((ex) => (
+                          <option key={ex.name} value={ex.name}>
+                            {ex.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label="待机动作覆盖（modelOverride.idleAnimation）" hint="角色级待机动作组覆盖。需先绑定模型。null = 跟随全局；空串 = 随机动作">
+                      <Select
+                        value={editor.idleAnimationOverride}
+                        onChange={(e) => setEditor({ ...editor, idleAnimationOverride: e.target.value as 'global' | string })}
+                        disabled={!editor.modelId}
+                      >
+                        <option value="global">跟随全局</option>
+                        <option value="">随机动作（不指定动作组）</option>
+                        {motionGroups.map((g) => (
+                          <option key={g} value={g}>
+                            {g}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    {!editor.modelId && (
+                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可选择表情/待机动作覆盖并配置情绪映射</p>
+                    )}
+                    {editor.modelId ? (
+                      <EmotionMapEditor
+                        title="情绪 → 表情映射（live2dExpressionMap）"
+                        hint="AI 回复的情绪会切换到对应 exp3 表情。缺项回退角色覆盖/全局表情。"
+                        options={expressions.map((e) => ({ value: e.name, label: e.name }))}
+                        map={editor.live2dExpressionMap}
+                        onChange={(m) => setEditor({ ...editor, live2dExpressionMap: m })}
+                        placeholder="不配置（跟随覆盖/全局）"
+                      />
+                    ) : (
+                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可配置情绪 → 表情映射</p>
+                    )}
+                  </>
+                ) : editor.renderMode === 'sprite' ? (
+                  <>
+                    <Field label="绑定 2D 立绘集（可选）" hint="不绑定则使用全局当前立绘集（在「角色模型」中选中）。">
+                      <Select
+                        value={editor.spriteId}
+                        onChange={(e) => setEditor({ ...editor, spriteId: e.target.value })}
+                      >
+                        <option value="">不绑定（使用全局当前立绘集）</option>
+                        {sprites.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    {editor.spriteId ? (
+                      <EmotionMapEditor
+                        title="情绪 → 立绘图映射（emotionMap）"
+                        hint="AI 回复的情绪会切换到对应立绘图。缺项回退 neutral / 立绘集首图。"
+                        options={(sprites.find((s) => s.id === editor.spriteId)?.images ?? []).map((i) => ({
+                          value: i.filePath,
+                          label: i.filePath,
+                        }))}
+                        map={editor.emotionMap}
+                        onChange={(m) => setEditor({ ...editor, emotionMap: m })}
+                        placeholder="不配置（回退 neutral/首图）"
+                      />
+                    ) : (
+                      <p className="text-xs text-text-muted">绑定立绘集后可配置情绪 → 立绘图映射；未绑定时使用全局当前立绘集</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-xs leading-relaxed text-text-muted">
+                    跟随全局当前形象：到「角色模型」面板切换当前 Live2D 模型或 2D 立绘集，桌宠会随之切换。
                   </p>
                 )}
               </div>

@@ -5,7 +5,7 @@
  * - 应用级操作（打开聊天/设置、同步桌宠模型、退出）
  */
 import { app, BrowserWindow, ipcMain } from 'electron'
-import type { CharacterModelOverride, TTSLanguage } from '../../src/types'
+import type { PetCardPayload, TTSLanguage } from '../../src/types'
 import { markPetWindowQuitting } from '../windows/petWindow'
 import { windowManager } from '../windows/windowManager'
 
@@ -92,13 +92,19 @@ export function registerWindowIpc(): void {
   ipcMain.on('app:open-chat', () => windowManager.showChat())
   ipcMain.on('app:open-settings', () => windowManager.showSettings())
 
-  ipcMain.on('app:set-pet-card', (_e, payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }) => {
+  ipcMain.on('app:set-pet-card', (_e, payload: PetCardPayload) => {
     windowManager.setPetCard(payload)
   })
 
-  /** 通知桌宠窗口播放语音（聊天窗口 AI 回复后调用，触发 TTS + 口型同步） */
-  ipcMain.on('app:speak', (_e, text: string, voiceId: string | null, languageOverride?: TTSLanguage | null) => {
-    windowManager.speak(text, voiceId, languageOverride)
+  /** 通知桌宠窗口播放语音（聊天窗口 AI 回复后调用，触发 TTS + 口型同步）。
+     *  payload 含主进程拆好的合成分段（dialogue 逐项），供桌宠段级合成播放。 */
+  ipcMain.on('app:speak', (_e, text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[] }) => {
+    windowManager.speak(text, voiceId, languageOverride, payload)
+  })
+
+  /** 桌宠上报当前朗读合成分段（null 表示清空高亮）→ 转发给聊天窗高亮 */
+  ipcMain.on('chunk-active', (_e, index: number | null) => {
+    windowManager.notifyChunkActive(index)
   })
 
   ipcMain.on('app:quit', () => {

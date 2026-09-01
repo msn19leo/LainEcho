@@ -7,7 +7,7 @@ import path from 'path'
 import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWindow'
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
-import type { ModelSettings, CharacterModelOverride, TTSLanguage } from '../../src/types'
+import type { ModelSettings, PetCardPayload, StandardEmotion, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -59,8 +59,8 @@ class WindowManager {
     }
   }
 
-  /** 角色卡切换后同步桌宠的 Live2D 模型 + 表情/待机动作覆盖 */
-  setPetCard(payload: { modelId: string | null; modelOverride: CharacterModelOverride | null }): void {
+  /** 角色卡切换后同步桌宠的 Live2D 模型 + 覆盖配置 + 立绘/渲染模式 */
+  setPetCard(payload: PetCardPayload): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:set-card', payload)
     }
@@ -70,6 +70,13 @@ class WindowManager {
   notifyModelsChanged(): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:models-changed')
+    }
+  }
+
+  /** 立绘集导入/删除后广播给桌宠刷新列表 */
+  notifySpritesChanged(): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:sprites-changed')
     }
   }
 
@@ -92,9 +99,35 @@ class WindowManager {
    * 桌宠窗口收到 pet:speak 事件后：调用 TTS 合成 → 播放音频 → 口型同步。
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null): void {
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[] }): void {
     if (this.pet && !this.pet.isDestroyed()) {
-      this.pet.webContents.send('pet:speak', { text, voiceId, languageOverride: languageOverride ?? null })
+      this.pet.webContents.send('pet:speak', {
+        text,
+        voiceId,
+        languageOverride: languageOverride ?? null,
+        chunks: payload?.chunks,
+      })
+    }
+  }
+
+  /** 桌宠播放到某合成分段时转发给聊天窗高亮（null 表示清空）（pet → chat 中转） */
+  notifyChunkActive(index: number | null): void {
+    if (this.chat && !this.chat.isDestroyed()) {
+      this.chat.webContents.send('chunk-active', index)
+    }
+  }
+
+  /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘 */
+  notifyEmotion(emotion: StandardEmotion): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:emotion', emotion)
+    }
+  }
+
+  /** 广播"思考中"状态给桌宠：true 进入思考（立绘切思考图），false 退出 */
+  notifyThinking(thinking: boolean): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:thinking', thinking)
     }
   }
 

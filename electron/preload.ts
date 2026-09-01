@@ -69,6 +69,17 @@ const api: WindowApi = {
     coreStatus: () => ipcRenderer.invoke('model:core-status'),
     importCore: () => ipcRenderer.invoke('model:import-core'),
   },
+  sprite: {
+    list: () => ipcRenderer.invoke('sprite:list'),
+    importFromFolder: () => ipcRenderer.invoke('sprite:import-from-folder'),
+    remove: (spriteId) => ipcRenderer.invoke('sprite:remove', spriteId),
+    update: (spriteId, patch) => ipcRenderer.invoke('sprite:update', spriteId, patch),
+    onChanged: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('pet:sprites-changed', listener)
+      return () => ipcRenderer.removeListener('pet:sprites-changed', listener)
+    },
+  },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
@@ -100,11 +111,11 @@ const api: WindowApi = {
     setPetCard: (payload) => ipcRenderer.send('app:set-pet-card', payload),
     quit: () => ipcRenderer.send('app:quit'),
     /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
-    speak: (text, voiceId, languageOverride) => ipcRenderer.send('app:speak', text, voiceId, languageOverride),
+    speak: (text, voiceId, languageOverride, payload) => ipcRenderer.send('app:speak', text, voiceId, languageOverride, payload),
   },
   pet: {
     onCardChanged: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { modelId: string | null; modelOverride: import('../src/types').CharacterModelOverride | null }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: import('../src/types').PetCardPayload) => cb(payload)
       ipcRenderer.on('pet:set-card', listener)
       return () => ipcRenderer.removeListener('pet:set-card', listener)
     },
@@ -131,11 +142,32 @@ const api: WindowApi = {
     },
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[] }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
+    /** 订阅 AI 回复情绪事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
+    onEmotion: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, emotion: import('../src/types').StandardEmotion) => cb(emotion)
+      ipcRenderer.on('pet:emotion', listener)
+      return () => ipcRenderer.removeListener('pet:emotion', listener)
+    },
+    /** 订阅"思考中"状态（AI 准备回答到输出前），立绘切思考立绘 */
+    onThinking: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, thinking: boolean) => cb(thinking)
+      ipcRenderer.on('pet:thinking', listener)
+      return () => ipcRenderer.removeListener('pet:thinking', listener)
+    },
+    /** 上报当前朗读的合成分段索引（null 表示清空高亮；桌宠播放时调用，经主进程转发给聊天窗高亮） */
+    reportChunkActive: (index) => ipcRenderer.send('chunk-active', index),
+    /** 订阅"当前朗读合成分段"索引（null 表示清空；聊天窗高亮用） */
+    onChunkActive: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, index: number | null) => cb(index)
+      ipcRenderer.on('chunk-active', listener)
+      return () => ipcRenderer.removeListener('chunk-active', listener)
+    },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
+    spriteUrl: (spriteId, filePath) => `pet-res://sprites/${spriteId}/${filePath}`,
   },
   /** 语音合成（TTS）：MiMo 声音克隆 */
   tts: {

@@ -65,7 +65,7 @@ export async function migrateDataDir(newDir: string): Promise<void> {
   await fs.mkdir(newDir, { recursive: true })
 
   // 需要迁移的子目录
-  const subDirs = ['data', 'models', 'live2d-core']
+  const subDirs = ['data', 'models', 'live2d-core', 'sprites']
   for (const sub of subDirs) {
     const src = path.join(srcRoot, sub)
     const dest = path.join(newDir, sub)
@@ -123,6 +123,10 @@ export const paths = {
   get coreDir() {
     return path.join(getRootDir(), 'live2d-core')
   },
+  /** 2D 立绘资源目录（每导入一个立绘集建一个子目录） */
+  get spritesDir() {
+    return path.join(getRootDir(), 'sprites')
+  },
   /** 参考音频目录（用于 TTS 声音克隆） */
   get voicesDir() {
     return path.join(this.dataDir, 'voices')
@@ -157,6 +161,10 @@ export const paths = {
   get modelsIndexFile() {
     return path.join(this.modelsDir, 'index.json')
   },
+  /** 立绘集索引文件 */
+  get spritesIndexFile() {
+    return path.join(this.spritesDir, 'index.json')
+  },
   get coreFile() {
     return path.join(this.coreDir, 'live2dcubismcore.min.js')
   },
@@ -168,6 +176,9 @@ export const paths = {
   },
   modelDir(id: string) {
     return path.join(this.modelsDir, id)
+  },
+  spriteDir(id: string) {
+    return path.join(this.spritesDir, id)
   },
 }
 
@@ -184,6 +195,7 @@ export async function ensureDataDirs() {
     ensureDir(paths.modelsDir),
     ensureDir(paths.coreDir),
     ensureDir(paths.voicesDir),
+    ensureDir(paths.spritesDir),
   ])
 }
 

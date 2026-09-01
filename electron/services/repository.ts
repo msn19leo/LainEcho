@@ -9,6 +9,7 @@ import type {
   CharacterCard,
   CharacterCardInput,
   CharacterPersona,
+  CharacterSprite,
   ChatMessage,
   Live2DModelMeta,
   MemoryItem,
@@ -27,7 +28,7 @@ export function genId(prefix: string): string {
  * 校验资源 ID 是否为系统生成的合法格式。
  * 会话/模型 ID 会拼入文件路径，必须校验，防止渲染进程构造路径穿越 ID（如 ../../secure/apiKey）。
  */
-export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'card' | 'mem'): void {
+export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'sprite' | 'card' | 'mem'): void {
   if (typeof id !== 'string' || !new RegExp(`^${kind}_[0-9a-f]{12}$`).test(id)) {
     throw new Error('非法资源 ID')
   }
@@ -112,6 +113,11 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     voiceId: raw.voiceId ?? null,
     ttsOverride: raw.ttsOverride ?? null,
     modelOverride: raw.modelOverride ?? null,
+    // 形象呈现（2D 立绘）；旧卡缺省 → Live2D 模式、未绑立绘
+    renderMode: raw.renderMode ?? null,
+    spriteId: raw.spriteId ?? null,
+    emotionMap: raw.emotionMap ?? null,
+    live2dExpressionMap: raw.live2dExpressionMap ?? null,
     avatar: raw.avatar ?? null,
     createdAt: raw.createdAt ?? now,
     updatedAt: raw.updatedAt ?? now,
@@ -140,6 +146,10 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     voiceId: input.voiceId || null,
     ttsOverride: input.ttsOverride ?? null,
     modelOverride: input.modelOverride ?? null,
+    renderMode: input.renderMode ?? null,
+    spriteId: input.spriteId || null,
+    emotionMap: input.emotionMap ?? null,
+    live2dExpressionMap: input.live2dExpressionMap ?? null,
     avatar: input.avatar ?? null,
     createdAt: now,
     updatedAt: now,
@@ -212,16 +222,92 @@ export async function removeMemory(id: string): Promise<void> {
  * @param card 角色卡（取人设字段）
  * @param memories 全局记忆体
  */
+/** 情绪演出指令段：约束 AI 输出结构化 JSON dialogue 数组（每项必带 emotion），供解析驱动桌宠形象按节拍切换立绘 */
+export const EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背）】
+你的【整条回复都必须且只能是】一个 JSON 对象，除此之外【一个字都不能多输出】——
+不要任何解释、序号、问候、开场白、后记，也不要 markdown 代码块包裹，直接输出 JSON 本体。
+
+必须返回的结构（严格照抄，键名一致）：
+{"dialogue":[
+  {"text":"台词或描写，可含（括号动作/心理）","emotion":"标准情绪"},
+  {"text":"……","emotion":"标准情绪"}
+]}
+
+硬性规定：
+- 只有一个顶层键 "dialogue"，它是数组，通常 2~6 项，每项是一个情绪/语义节奏。
+- 每一项必须同时有 "text" 与 "emotion" 两个字段，缺一不可。"emotion" 不得缺省。
+- "emotion" 只能取下列 6 个之一：
+  neutral(平静) / happy(开心) / sad(难过) / angry(生气) / surprised(惊讶) / shy(害羞)
+  匹配不到时：担心/紧张→sad，亲近/撒娇→happy。
+- 心理活动、动作、环境、第三人称旁白等"不发声"的内容，必须写进 "text" 的（）内；台词与旁白可各占一项。
+- 情绪转折就另起一项写对应 emotion；同情绪连续的多项会被系统自动合并，不会重复切换。
+- 即使你想输出问候、解释或额外旁白，也都只能放进 "text"，绝不允许出现在 JSON 之外。
+
+示例（你唯一允许的输出形态，前后无任何多余字符）：
+{"dialogue":[
+  {"text":"……你终于来了。","emotion":"shy"},
+  {"text":"（心跳漏了一拍，站在原地）","emotion":"neutral"},
+  {"text":"我等了好久，还以为你不来了……","emotion":"sad"},
+  {"text":"不过、现在看到你，就都好了。","emotion":"happy"}
+]}`
+
 export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryItem[]): string {
   const parts: string[] = []
   if (memories.length > 0) {
     const memLines = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
     parts.push(`## 用户长期记忆（必须记住并严格遵守）\n${memLines}`)
   }
+  // 输出格式约束提到最前面，确保"只输出 JSON"不被后续散文示例带偏
+  parts.push(EMOTION_PROMPT)
   parts.push(...buildPersonaSections(card?.persona))
-  if (card?.messageExample?.trim()) parts.push(`【示例对话】\n${card.messageExample.trim()}`)
+  if (card?.messageExample?.trim()) {
+    parts.push(`【示例对话】（下面示例是散文，仅用于参考角色的语气与分寸；你的回复仍必须严格按上方【输出格式】仅输出 JSON）\n${card.messageExample.trim()}`)
+  }
+  parts.push(PARAGRAPH_PROMPT)
+  parts.push(NARRATION_PROMPT)
   return parts.join('\n\n')
 }
+
+/**
+ * 段落组织规范：约束 AI 用空行把回复分成若干语义段落，避免一段到底、缺乏呼吸感。
+ * 每段落一个小节拍，段间留空行，让阅读（气泡）与语音逐句推进都更清晰。
+ */
+export const PARAGRAPH_PROMPT = `【节拍/分段规范（作用于上方 JSON 的 "text" 字段内部）】
+- 把回复拆成 "dialogue" 数组里的若干 "text" 项：每句台词、或整段心理/动作/环境描写都作为独立一项，按先后排列，让阅读与语音逐条推进更清晰。
+- 情绪有起伏就用不同项并写对应 emotion；台词与（括号旁白）可各自成为一项。
+- text 内部如需细分节奏或留呼吸感，可用换行自然成段，但主要分段以 dialogue 的每一项为界（通常 2~6 项）。
+参考节奏（下面每一项各自成为 dialogue 里的一项 text）：
+（心跳好像突然停了一拍）
+
+真、真的吗……
+
+（慢慢转过头对上他的眼睛，声音带着一点颤抖）
+
+我…我一直以为，你只是把我当成普通的青梅竹马……
+
+所以…我们现在算是在一起了吗？
+
+（问完这句话，整张脸埋进毯子里，只露出一双眼睛偷偷看他）
+
+今晚的星星，我一辈子都不会忘记。`
+
+/**
+ * 演出/旁白规范：约束 AI 把心理活动、动作、环境等"可不可说出口"的内容统一放进圆括号。
+ * 语音只朗读括号外的台词；括号内容供屏幕阅读/视觉表达，绝不朗读。
+ * 强调"未括起来的整句都算台词"，并把常见反例写进去（含用户遇到的"心理独白未括"）。
+ */
+export const NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON 的 "text" 字段内部）】
+严格区分"台词"与"不可说出口"的内容：
+- 台词：角色真正说出的话，不裹任何括号。
+- 心理活动、内心独白、动作描写、环境/氛围描写、第三人称旁白：必须用圆括号（）完整包裹。
+规则：
+- 一个描述性句子即使是"心理感受/内心活动"，只要它不发出声音，就必须整句放进圆括号，例如：
+  （心跳声大得好像整条路都能听见） 正确
+  心跳声大得好像整条路都能听见   错误（会被误读）
+  （虽然嘴上在找借口，但手指却悄悄收紧了） 正确
+  虽然嘴上在找借口，但手指却悄悄收紧了   错误（会被误读）
+- 括号内容仅供阅读与演出，绝不朗读；你的"台词"应简短、口语，是真正能用嘴唇说出来的话。
+- 每项 "text" 的 "emotion" 字段即该节拍的立绘/表情；情绪转折时另起一项并写对应 emotion。`
 
 /**
  * 将人设结构转换为按优先级排序的 system prompt 文本段。
@@ -425,6 +511,37 @@ export async function removeModel(modelId: string): Promise<void> {
   )
 }
 
+// ---------------- 2D 立绘 ----------------
+
+const DEFAULT_SPRITES: CharacterSprite[] = []
+
+export async function listSprites(): Promise<CharacterSprite[]> {
+  return readJson<CharacterSprite[]>(paths.spritesIndexFile, DEFAULT_SPRITES)
+}
+
+export async function addSprite(meta: CharacterSprite): Promise<CharacterSprite> {
+  await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) => [meta, ...list])
+  return meta
+}
+
+export async function removeSprite(spriteId: string): Promise<void> {
+  assertValidResourceId(spriteId, 'sprite')
+  await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) => list.filter((s) => s.id !== spriteId))
+  // 递归删除立绘资源目录
+  await deleteFile(paths.spriteDir(spriteId))
+}
+
+/** 更新立绘集的展示资产：情绪→立绘图映射 / 说话立绘 / 思考立绘 */
+export async function updateSprite(
+  spriteId: string,
+  patch: Partial<Pick<CharacterSprite, 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
+): Promise<void> {
+  assertValidResourceId(spriteId, 'sprite')
+  await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) =>
+    list.map((s) => (s.id === spriteId ? { ...s, ...patch } : s)),
+  )
+}
+
 // ---------------- 设置 ----------------
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -493,6 +610,7 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   },
   view: { scale: 1, x: 0, y: 0 },
   selectedModelId: null,
+  selectedSpriteId: null,
 }
 
 /** 读取模型设置，缺失字段用默认值补全 */
@@ -504,6 +622,7 @@ export async function getModelSettings(): Promise<ModelSettings> {
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
     selectedModelId: saved.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
+    selectedSpriteId: saved.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }
 }
 
@@ -516,6 +635,7 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
     if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
     if (patch.selectedModelId !== undefined) next.selectedModelId = patch.selectedModelId
+    if (patch.selectedSpriteId !== undefined) next.selectedSpriteId = patch.selectedSpriteId
     return next
   })
   return {
@@ -523,5 +643,6 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
     selectedModelId: result?.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
+    selectedSpriteId: result?.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }
 }

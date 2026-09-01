@@ -8,6 +8,7 @@ import { registerModelIpc } from './model.ipc'
 import { registerModelSettingsIpc } from './modelSettings.ipc'
 import { registerSessionIpc } from './session.ipc'
 import { registerSettingsIpc } from './settings.ipc'
+import { registerSpritesIpc } from './sprites.ipc'
 import { registerTtsIpc } from './tts.ipc'
 import { registerWindowIpc } from './window.ipc'
 import { registerUpdaterIpc } from './updater.ipc'
@@ -21,6 +22,7 @@ export function registerAllIpc(): void {
   registerModelSettingsIpc()
   registerSessionIpc()
   registerSettingsIpc()
+  registerSpritesIpc()
   registerTtsIpc()
   registerWindowIpc()
   // 更新：广播目标为所有窗口（桌宠/聊天/设置）

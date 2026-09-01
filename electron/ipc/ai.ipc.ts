@@ -7,6 +7,7 @@
 import { ipcMain } from 'electron'
 import type { ChatMessage } from '../../src/types'
 import { sendChatCompletion } from '../services/aiClient'
+import { parseDialogueJson, extractStreamingJsonText } from '../services/emotion'
 import { readApiKey } from '../services/crypto'
 import {
   appendSessionMessages,
@@ -16,6 +17,7 @@ import {
   getSettings,
   listMemories,
 } from '../services/repository'
+import { windowManager } from '../windows/windowManager'
 
 let currentAbort: AbortController | null = null
 
@@ -39,15 +41,21 @@ export function registerAiIpc(): void {
     let partial = ''
     let cancelled = false
 
-    // 合并推送：累积待发送文本，按 CHUNK_FLUSH_MS 窗口一次性 send，减少 IPC 往返
-    let pendingChunk = ''
+    // 进入"思考中"：通知桌宠切换到思考立绘
+    windowManager.notifyThinking(true)
+
+    // 合并推送：把模型原始输出实时提取成纯净台词文本，累积后按 CHUNK_FLUSH_MS 窗口一次性 send，
+    // 避免把 JSON（花括号/键名）暴露给聊天窗，也减少 IPC 往返。lastDisplayLen 用于只发新增片段。
+    let lastDisplayLen = 0
     let chunkTimer: NodeJS.Timeout | null = null
     const flushChunks = () => {
       chunkTimer = null
-      if (pendingChunk && !sender.isDestroyed()) {
-        sender.send('ai:stream-chunk', pendingChunk)
+      const display = extractStreamingJsonText(partial)
+      const delta = display.length > lastDisplayLen ? display.slice(lastDisplayLen) : ''
+      lastDisplayLen = Math.max(lastDisplayLen, display.length)
+      if (delta && !sender.isDestroyed()) {
+        sender.send('ai:stream-chunk', delta)
       }
-      pendingChunk = ''
     }
 
     const abort = new AbortController()
@@ -82,7 +90,6 @@ export function registerAiIpc(): void {
         signal: abort.signal,
         onChunk: (chunk) => {
           partial += chunk
-          pendingChunk += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
         },
       })
@@ -94,12 +101,17 @@ export function registerAiIpc(): void {
       }
       flushChunks()
 
-      // 持久化：user 消息 + assistant 完整回复
+      // 持久化：user 消息 + assistant 完整回复（解析 JSON dialogue，落盘句子/情绪段供句级同步与联动）
       const now = Date.now()
-      const asstMsg: ChatMessage = { role: 'assistant', content, timestamp: now }
+      const { text, emotion, sentences, emotionSegments, chunks } = parseDialogueJson(content)
+      // 临时调试：确认模型是否输出结构化 dialogue JSON（确认后删除）
+      console.log('[ai:parse-json] isDialogueJson=', /"dialogue"\s*:/.test(content), 'chunks=', chunks.length, 'segments=', JSON.stringify(emotionSegments))
+      const asstMsg: ChatMessage = { role: 'assistant', content: text, emotion, sentences, emotionSegments, chunks, timestamp: now }
       await appendSessionMessages(sessionId, [userMsg, asstMsg])
 
       if (!sender.isDestroyed()) sender.send('ai:stream-done', { sessionId, message: asstMsg })
+      // 广播归一化情绪到桌宠窗口，驱动形象层切表情/切立绘
+      windowManager.notifyEmotion(emotion)
       return asstMsg
     } catch (err) {
       cancelled = abort.signal.aborted
@@ -108,7 +120,7 @@ export function registerAiIpc(): void {
       // 出错/取消时也持久化 user 消息与已流出的部分回复，避免 UI 与磁盘状态分叉
       try {
         const extra: ChatMessage[] = [userMsg]
-        if (partial) extra.push({ role: 'assistant', content: partial, timestamp: Date.now() })
+        if (partial) extra.push({ role: 'assistant', content: extractStreamingJsonText(partial), timestamp: Date.now() })
         await appendSessionMessages(sessionId, extra)
       } catch {
         // 持久化失败不影响错误上报
@@ -125,6 +137,8 @@ export function registerAiIpc(): void {
       throw err
     } finally {
       if (currentAbort === abort) currentAbort = null
+      // 退出"思考中"：无论成功/出错/取消都复位（情绪事件已在成功路径驱动形象）
+      windowManager.notifyThinking(false)
     }
   })
 

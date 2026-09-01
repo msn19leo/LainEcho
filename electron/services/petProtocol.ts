@@ -24,6 +24,7 @@ const MIME_TYPES: Record<string, string> = {
   '.jpeg': 'image/jpeg',
   '.gif': 'image/gif',
   '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
   '.moc3': 'application/octet-stream',
   '.physics3.json': 'application/json',
   '.motion3.json': 'application/json',
@@ -77,6 +78,9 @@ export function registerPetProtocolHandler(): void {
         root = paths.coreDir
       } else if (host === 'models') {
         root = paths.modelsDir
+      } else if (host === 'sprites') {
+        // 2D 立绘资源：pet-res://sprites/{spriteId}/{filePath}
+        root = paths.spritesDir
       } else {
         return new Response('Unknown host', { status: 404 })
       }

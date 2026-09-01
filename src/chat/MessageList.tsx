@@ -11,24 +11,33 @@
  *   - 流式气泡抽成独立组件（StreamingBubble）单独订阅 streamingContent，流式更新时
  *     不再触发整个 MessageList 的 messages.map 重渲染。
  */
-import { useEffect, useRef, type RefObject } from 'react'
+import { Fragment, useEffect, useRef, type RefObject } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
-import { cn, formatTime } from '../lib/utils'
+import { cn, formatTime, splitSentences } from '../lib/utils'
+import type { DialogueChunk } from '../types'
 import { popSlideUp, springElastic } from '../lib/motion'
 
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
 const NEAR_BOTTOM_THRESHOLD = 80
 
-export function MessageList() {
+export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
   const messages = useSessionStore((s) => s.messages)
   const streaming = useSessionStore((s) => s.streaming)
   const streamError = useSessionStore((s) => s.streamError)
   const currentCardName = useCurrentCardName()
   const listRef = useRef<HTMLDivElement>(null)
   const nearBottomRef = useRef(true)
+
+  /** 最后一条 AI 消息（当前正在朗读/高亮的目标） */
+  const lastAssistantIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === 'assistant') return i
+    }
+    return -1
+  })()
 
   // 监听滚动：用户上翻看历史时不强制拉回底部
   const onScroll = () => {
@@ -96,7 +105,13 @@ export function MessageList() {
                       'glass rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] text-text',
                 )}
               >
-                {msg.content}
+                {isUser ? (
+                  msg.content
+                ) : i === lastAssistantIndex ? (
+                  <AssistantSentences content={normalizeParagraphs(msg.content)} chunks={msg.chunks} activeChunk={activeChunk ?? null} />
+                ) : (
+                  normalizeParagraphs(msg.content)
+                )}
               </div>
             </div>
           </motion.div>
@@ -158,6 +173,48 @@ function StreamingBubble({
         </div>
       </div>
     </motion.div>
+  )
+}
+
+/**
+ * 显示前规范化文本：把模型输出的连续换行（含多余空行）统一压成单个换行，去掉过密的空行。
+ * 气泡 pre-wrap 保留单换行即可有自然的段间换行。
+ */
+function normalizeParagraphs(text: string): string {
+  return text.replace(/\n+/g, '\n')
+}
+
+/**
+ * 段级朗读高亮 + 保留空行段落：
+ * 以合成分段（dialogue 逐项）为单位渲染，当前朗读段整段高亮；
+ * 段与段之间留空行，段内多行用 <br/> 分隔，行内 splitSentences 保证段落换行/标点自然。
+ * 无 chunks 时退化为整段文本（仍保留多行与空行）。
+ */
+function AssistantSentences({ content, chunks, activeChunk }: { content: string; chunks?: DialogueChunk[]; activeChunk: number | null }) {
+  const list = chunks && chunks.length > 0 ? chunks.map((c) => c.text) : [content]
+  const ACTIVE_CLS = 'rounded bg-[var(--primary-400)]/20 text-[var(--primary-400)]'
+  return (
+    <>
+      {list.map((chunkText, ci) => {
+        const active = ci === activeChunk
+        const lines = chunkText.split('\n')
+        return (
+          <Fragment key={ci}>
+            {ci > 0 && <br />}
+            {lines.map((line, li) => (
+              <Fragment key={li}>
+                {li > 0 && <br />}
+                {splitSentences(line).map((s, i) => (
+                  <span key={i} className={active ? ACTIVE_CLS : undefined}>
+                    {s}
+                  </span>
+                ))}
+              </Fragment>
+            ))}
+          </Fragment>
+        )
+      })}
+    </>
   )
 }
 

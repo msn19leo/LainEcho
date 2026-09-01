@@ -15,7 +15,8 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, CharacterModelOverride } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, CharacterModelOverride, RenderMode, StandardEmotion, PetCardPayload } from '../types'
+import { DEFAULT_EMOTION } from '../types'
 import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
 import { LipSyncController } from './lipSync'
 
@@ -29,6 +30,8 @@ export interface PetStageHandle {
   speak: (audio: ArrayBuffer) => Promise<void>
   /** 停止播放语音并清零口型参数 */
   stopSpeak: () => void
+  /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动） */
+  setEmotion: (emotion: StandardEmotion) => void
 }
 
 interface PetStageProps {
@@ -54,8 +57,49 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const cardModelOverrideRef = useRef<CharacterModelOverride | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  /** 当前形象渲染模式：'live2d'（动画）| 'sprite'（2D 静态立绘） */
+  const [mode, setMode] = useState<RenderMode>('live2d')
+  /** 立绘模式下当前展示的立绘（null = 不显示） */
+  const [sprite, setSprite] = useState<{ url: string; name: string } | null>(null)
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
   const currentScaleRef = useRef(1)
+  /** 当前渲染模式引用（供 effect 闭包读取最新值，避免依赖数组重跑） */
+  const modeRef = useRef<RenderMode>('live2d')
+  /** 角色卡显式设定的形象模式（null = 跟随全局当前形象），由 onCardChanged 维护 */
+  const cardModeRef = useRef<RenderMode | null>(null)
+  /** 当前生效情绪（由 AI 回复情绪联动更新，默认 neutral） */
+  const currentEmotionRef = useRef<StandardEmotion>(DEFAULT_EMOTION)
+  /** 当前角色卡绑定的立绘集 id（立绘模式渲染用） */
+  const spriteIdRef = useRef<string | null>(null)
+  /** 当前角色卡的情绪 → 立绘文件名 映射 */
+  const emotionMapRef = useRef<Partial<Record<StandardEmotion, string>> | null>(null)
+  /** 当前角色卡的情绪 → exp3 表情名 映射（Live2D 模式） */
+  const live2dExpressionMapRef = useRef<Partial<Record<StandardEmotion, string>> | null>(null)
+  /** 全局当前立绘集 id（modelSettings.selectedSpriteId，角色卡未绑定立绘时回退用） */
+  const selectedSpriteIdRef = useRef<string | null>(null)
+  /** 桌面立绘展示状态：idle(情绪态) / speaking(说话) / thinking(思考) */
+  const displayStateRef = useRef<'idle' | 'speaking' | 'thinking'>('idle')
+  /** 上一帧说话状态（检测翻转以触发说话立绘切换） */
+  const lastSpeakingRef = useRef(false)
+
+  /** 解析当前立绘模式实际使用的立绘集 id：角色卡绑定优先，否则全局当前立绘集 */
+  function getEffectiveSpriteId(): string | null {
+    return spriteIdRef.current ?? selectedSpriteIdRef.current ?? null
+  }
+
+  /** 解析当前 Live2D 模式实际使用的模型 id：角色卡绑定优先，否则全局当前模型 */
+  function getEffectiveModelId(): string | null {
+    return currentCardModelIdRef.current ?? settingsRef.current.selectedModelId ?? null
+  }
+
+  /**
+   * 计算当前有效渲染模式：
+   *   角色卡显式设定了形象模式 → 用之；否则跟随全局（全局选中立绘集则立绘，否则 Live2D）。
+   */
+  function effectiveRenderMode(): RenderMode {
+    if (cardModeRef.current) return cardModeRef.current
+    return selectedSpriteIdRef.current ? 'sprite' : 'live2d'
+  }
 
   /** 模型设置引用（每帧读取，不触发重渲染） */
   const settingsRef = useRef<ModelSettings>(DEFAULT_MODEL_SETTINGS)
@@ -92,6 +136,15 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     /** 停止播放并清零口型 */
     stopSpeak: () => {
       lipSyncRef.current.stop()
+    },
+    /** 按句更新情绪：写 emotion 并重应用立绘/表情 */
+    setEmotion: (emotion: StandardEmotion) => {
+      currentEmotionRef.current = emotion
+      if (modeRef.current === 'sprite') {
+        applySprite()
+      } else {
+        updateCurrentExpression()
+      }
     },
   }))
 
@@ -155,11 +208,71 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   }
 
   /**
-   * 获取当前生效的表情名：角色卡覆盖优先，否则跟随全局设置。
+   * 立绘模式：解析当前应显示的立绘图并设置 to sprite state。
+   * 规则：emotionMap[emotion] 优先，缺映射或缺文件时回退 neutral，再退回立绘集第一张。
+   * @param spriteId 绑定的立绘集 id
+   * @param emotionMap 角色卡的情绪 → 文件名映射（可为 null）
+   * @param emotion 当前情绪（默认 neutral）
+   */
+  async function resolveSprite(
+    spriteId: string | null,
+    emotionMap: Partial<Record<StandardEmotion, string>> | null | undefined,
+    emotion: StandardEmotion = DEFAULT_EMOTION,
+    variant: 'idle' | 'speaking' | 'thinking' = 'idle',
+  ) {
+    if (!spriteId) {
+      setSprite(null)
+      return
+    }
+    try {
+      const list = await api.sprite.list()
+      const spr = list.find((s) => s.id === spriteId)
+      if (!spr || spr.images.length === 0) {
+        setSprite(null)
+        return
+      }
+      const has = (f: string | null | undefined) => !!f && spr.images.some((i) => i.filePath === f)
+      // 变体立绘优先：思考 > 说话(仅平静情绪时) > 情绪映射图
+      let file: string | null = null
+      if (variant === 'thinking' && has(spr.thinkingImage)) {
+        file = spr.thinkingImage
+      } else if (variant === 'speaking' && emotion === DEFAULT_EMOTION && has(spr.speakingImage)) {
+        file = spr.speakingImage
+      }
+      if (!file) {
+        // 情绪映射优先级：角色卡传入的映射 > 立绘集自身的映射(spr.emotionMap) > 无映射
+        const sourceMap = emotionMap ?? spr.emotionMap ?? null
+        const want = pickEmotionAsset(sourceMap, emotion)
+        file = (want && spr.images.some((i) => i.filePath === want)) ? want : (spr.images[0]!.filePath)
+      }
+      setSprite({ url: api.pet.spriteUrl(spriteId, file), name: spr.name })
+    } catch {
+      setSprite(null)
+    }
+  }
+
+  /** 立绘模式统一重新解析当前立绘（依据当前情绪 + 说话/思考状态） */
+  function applySprite() {
+    if (modeRef.current !== 'sprite') return
+    const hasCardSprite = !!spriteIdRef.current
+    void resolveSprite(
+      getEffectiveSpriteId(),
+      hasCardSprite ? emotionMapRef.current : null,
+      currentEmotionRef.current,
+      displayStateRef.current,
+    )
+  }
+
+  /**
+   * 获取当前生效的表情名。优先级从高到低：
+   *   情绪映射(live2dExpressionMap[当前情绪]) → 角色卡覆盖 → 全局设置。
    * 返回空串表示不应用表情。
    */
   function getEffectiveExpression(): string {
     const override = cardModelOverrideRef.current
+    // 情绪联动：当前情绪配置了专属表情时优先使用
+    const emoExpr = pickEmotionAsset(live2dExpressionMapRef.current, currentEmotionRef.current)
+    if (emoExpr) return emoExpr
     if (override && override.selectedExpression !== null) return override.selectedExpression
     return settingsRef.current.animation.selectedExpression
   }
@@ -314,12 +427,28 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     let unsubModels = () => {}
     let unsubCore = () => {}
     let unsubSettings = () => {}
+    let unsubEmotion = () => {}
+    let unsubThinking = () => {}
+    let unsubSprites = () => {}
     let unsubCursor = () => {}
     let ro: ResizeObserver | null = null
     let booting = false
 
     /** 每帧参数引擎回调（注册到 PIXI ticker） */
     const tickerFn = (delta: number) => {
+      // 立绘模式：检测说话态翻转，切换说话/空闲立绘（思考态优先不被覆盖）
+      if (modeRef.current === 'sprite') {
+        const speakingNow = lipSyncRef.current.isPlaying
+        if (speakingNow !== lastSpeakingRef.current) {
+          lastSpeakingRef.current = speakingNow
+          if (speakingNow) {
+            if (displayStateRef.current !== 'thinking') displayStateRef.current = 'speaking'
+          } else if (displayStateRef.current === 'speaking') {
+            displayStateRef.current = 'idle'
+          }
+          applySprite()
+        }
+      }
       const model = modelRef.current
       if (!model) return
       const settings = settingsRef.current
@@ -482,8 +611,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
           mouseRef.current.active = true
         })
 
-        // ---- 3. 加载模型 ----
-        await loadModel()
+        // ---- 3. 渲染形象分发 ----
+        // 不再在此直接 loadModel：统一交给 applyRenderState 按当前有效模式/设置分发，
+        // 避免 init 在设置就绪前抢先加载 Live2D，导致与立绘并存。
+        applyRenderState()
 
         // 随机待机动作（角色卡覆盖优先，否则跟随全局设置）
         idleTimer = setInterval(() => {
@@ -499,20 +630,20 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     // 订阅始终注册（即使 core 缺失也会收到导入事件后重试）：
     // 角色卡切换 → 换模型 + 应用表情/待机动作覆盖；模型列表变化 / Cubism Core 导入 → 重新初始化
-    unsubModel = api.pet.onCardChanged((payload) => {
-      const { modelId, modelOverride } = payload ?? {}
+    unsubModel = api.pet.onCardChanged((payload: PetCardPayload) => {
+      const { modelId, modelOverride, renderMode, spriteId, emotionMap, live2dExpressionMap } = payload ?? {}
       // 记录角色卡的模型覆盖配置，触发表情参数刷新
       cardModelOverrideRef.current = modelOverride ?? null
+      // 记录形象呈现相关配置（立绘/情绪映射/渲染模式），供渲染分发与情绪联动使用
+      spriteIdRef.current = spriteId ?? null
+      emotionMapRef.current = emotionMap ?? null
+      live2dExpressionMapRef.current = live2dExpressionMap ?? null
+      // 角色卡显式设定的形象模式（null = 跟随全局当前形象）
+      cardModeRef.current = renderMode ?? null
+      currentCardModelIdRef.current = modelId ?? null
       updateCurrentExpression()
-      if (modelId) {
-        // 角色卡绑定了模型：记录并加载该模型
-        currentCardModelIdRef.current = modelId
-        void loadModel(modelId)
-      } else {
-        // 角色卡未绑定模型：清除绑定，按全局选中模型重新加载
-        currentCardModelIdRef.current = null
-        void loadModel()
-      }
+      // 统一按当前有效模式与资源刷新桌面形象
+      applyRenderState()
     })
     unsubModels = api.pet.onModelsChanged(() => {
       void init()
@@ -521,10 +652,37 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       void init()
     })
 
-    /** 应用模型设置（更新 ticker、拟合，并在必要时切换模型） */
-    const applySettings = (settings: ModelSettings, shouldSwitchModel: boolean) => {
+    /** 按当前角色卡/全局配置的渲染模式与资源，统一刷新桌面形象（Live2D 或立绘） */
+    const applyRenderState = () => {
+      const nextMode = effectiveRenderMode()
+      const modeChanged = nextMode !== modeRef.current
+      if (modeChanged) {
+        modeRef.current = nextMode
+        setMode(nextMode)
+      }
+      if (nextMode === 'sprite') {
+        // 立绘：作废在途的 Live2D 加载请求并销毁已加载模型，避免初始阶段二者并存
+        loadGenRef.current++
+        clearModel()
+        applySprite()
+      } else {
+        // Live2D：清空残留立绘状态，只渲染动画模型
+        setSprite(null)
+        const mid = getEffectiveModelId()
+        // 模式发生切换（例如从立绘切回 Live2D）或模型 id 变化时，重新加载模型，
+        // 避免守卫误判"模型未变"而漏加载导致形象消失
+        if (modeChanged || mid !== currentModelIdRef.current) {
+          void loadModel(mid ?? undefined)
+        }
+      }
+    }
+
+    /** 应用模型设置（更新 ticker、拟合，并按全局形象刷新桌面） */
+    const applySettings = (settings: ModelSettings) => {
       const prevIdle = settingsRef.current.animation.idleAnimation
       settingsRef.current = settings
+      // 全局当前立绘集变化时记录，供立绘回退用
+      selectedSpriteIdRef.current = settings.selectedSpriteId ?? null
       // FPS 变化时更新 ticker
       if (appRef.current) {
         appRef.current.ticker.maxFPS = settings.animation.maxFps === 0 ? 0 : settings.animation.maxFps
@@ -537,20 +695,48 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (prevIdle !== settings.animation.idleAnimation) {
         playRandomIdle(modelRef.current, settings.animation.idleAnimation || undefined)
       }
-      // 选中模型变化且当前角色卡未绑定时，切换到新选中模型
-      if (shouldSwitchModel && !currentCardModelIdRef.current && settings.selectedModelId !== currentModelIdRef.current) {
-        void loadModel(settings.selectedModelId ?? undefined)
-      }
+      // 全局当前形象变化（model/sprite 切换）时统一刷新桌面形象
+      applyRenderState()
     }
 
     // 订阅模型设置变化（设置窗口修改后实时同步）
     unsubSettings = api.pet.onModelSettingsChanged((settings) => {
-      applySettings(settings, true)
+      applySettings(settings)
+    })
+
+    // 订阅 AI 回复情绪：立绘切图 / Live2D 切表情（情绪联动核心）
+    unsubEmotion = api.pet.onEmotion((emotion: StandardEmotion) => {
+      currentEmotionRef.current = emotion
+      if (modeRef.current === 'sprite') {
+        // 回复完成：退出思考态，回到情绪/空闲态
+        displayStateRef.current = 'idle'
+        applySprite()
+      } else {
+        updateCurrentExpression()
+      }
+    })
+
+    // 订阅"思考中"状态：立绘模式切换到思考立绘（开始准备回答到输出文本前）
+    unsubThinking = api.pet.onThinking((thinking: boolean) => {
+      if (modeRef.current !== 'sprite') return
+      if (thinking) {
+        // 新一轮输入：情绪归零（natural 平静），进入思考态
+        currentEmotionRef.current = DEFAULT_EMOTION
+        displayStateRef.current = 'thinking'
+      } else if (displayStateRef.current === 'thinking') {
+        displayStateRef.current = 'idle'
+      }
+      applySprite()
+    })
+
+    // 订阅立绘集列表变化（导入/删除/切全局后重解析）
+    unsubSprites = api.sprite.onChanged(() => {
+      if (modeRef.current === 'sprite') applyRenderState()
     })
 
     // 启动时加载已保存的模型设置
     void api.modelSettings.get().then((settings) => {
-      applySettings(settings, true)
+      applySettings(settings)
     })
 
     return () => {
@@ -560,6 +746,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       unsubModels()
       unsubCore()
       unsubSettings()
+      unsubEmotion()
+      unsubThinking()
+      unsubSprites()
       unsubCursor()
       ro?.disconnect()
       // 停止口型同步并释放 AudioContext
@@ -575,14 +764,31 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
   return (
     <div ref={containerRef} className="relative h-full w-full">
-      {/* 加载中：居中品牌渐变环形加载 */}
-      {loading && !banner && (
+      {/* 加载中：居中品牌渐变环形加载（立绘模式不显示） */}
+      {loading && !banner && mode !== 'sprite' && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="brand-spinner" />
         </div>
       )}
 
-      {banner && (
+      {/* 2D 立绘展示层：仅立绘模式显示，覆盖在 Live2D 画布上方（避免切换后与 Live2D 并存） */}
+      {mode === 'sprite' && sprite && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.25 }}
+          className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-4"
+        >
+          <img
+            src={sprite.url}
+            alt={sprite.name}
+            draggable={false}
+            className="max-h-full max-w-full select-none object-contain"
+          />
+        </motion.div>
+      )}
+
+      {banner && mode !== 'sprite' && (
         <motion.div
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
@@ -669,6 +875,17 @@ function patchCubismCoreCompatibility(mod: Record<string, unknown>): void {
     const drawables = this._model?.drawables
     return drawables?.renderOrders ?? drawables?.drawOrders
   }
+}
+
+/**
+ * 从情绪映射中取某情绪对应的资源名；缺失时回退 neutral。
+ * 用于立绘模式选图与 Live2D 模式选表情。
+ */
+function pickEmotionAsset(
+  map: Partial<Record<StandardEmotion, string>> | null | undefined,
+  emotion: StandardEmotion,
+): string {
+  return map?.[emotion] ?? map?.[DEFAULT_EMOTION] ?? ''
 }
 
 function zoomModel(model: Live2DModel | null, factor: number): number {

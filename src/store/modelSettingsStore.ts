@@ -60,6 +60,7 @@ export const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   animation: { ...DEFAULT_ANIMATION },
   view: { ...DEFAULT_VIEW },
   selectedModelId: null,
+  selectedSpriteId: null,
 }
 
 interface ModelSettingsState {
@@ -92,6 +93,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
           animation: { ...DEFAULT_ANIMATION, ...data.animation },
           view: { ...DEFAULT_VIEW, ...data.view },
           selectedModelId: data.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
+          selectedSpriteId: data.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
         },
         loaded: true,
       })
@@ -107,6 +109,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
       animation: { ...get().settings.animation, ...(patch.animation ?? {}) },
       view: { ...get().settings.view, ...(patch.view ?? {}) },
       selectedModelId: patch.selectedModelId !== undefined ? patch.selectedModelId : get().settings.selectedModelId,
+      selectedSpriteId: patch.selectedSpriteId !== undefined ? patch.selectedSpriteId : get().settings.selectedSpriteId,
     }
     set({ settings: next })
     await api.modelSettings.save(patch)
@@ -120,6 +123,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         animation: { ...cur.animation, ...(patch.animation ?? {}) },
         view: { ...cur.view, ...(patch.view ?? {}) },
         selectedModelId: patch.selectedModelId !== undefined ? patch.selectedModelId : cur.selectedModelId,
+        selectedSpriteId: patch.selectedSpriteId !== undefined ? patch.selectedSpriteId : cur.selectedSpriteId,
       },
     })
   },
@@ -135,6 +139,7 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         animation: { ...DEFAULT_ANIMATION, ...settings.animation },
         view: { ...DEFAULT_VIEW, ...settings.view },
         selectedModelId: settings.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
+        selectedSpriteId: settings.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
       },
     })
   },

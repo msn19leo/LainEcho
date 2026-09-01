@@ -116,32 +116,97 @@ function paeth(a, b, c) {
 // ---------------- 缩放 ----------------
 
 /**
- * 双线性缩放到目标尺寸，输出 RGBA Buffer。
+ * Lanczos-3 核函数：锐利的经典重采样核，对缩小的边缘保持度优于双线性。
+ * @param {number} x 距采样点中心的距离（像素）
+ * @returns {number} 权重，距离≥3 时为 0
+ */
+function lanczosKernel(x) {
+  if (x === 0) return 1
+  const a = Math.PI * x
+  const b = Math.PI * (x / 3)
+  return (3 * Math.sin(a) * Math.sin(b)) / (a * b)
+}
+
+/**
+ * 沿单个轴做 Lanczos 重采样（可分离实现）。
+ * 缩小（scale>1）时用源像素做带抗锯齿的加权平均；放大（scale<1）时插值。
+ * @param {number[]} src 源轴数据（预乘后的 RGB 或直接 alpha）
+ * @param {number} dstLen 目标长度
+ * @param {number} scale 源长度 / 目标长度
+ * @returns {number[]}
+ */
+function resampleAxis(src, dstLen, scale) {
+  const out = new Array(dstLen)
+  // Lanczos 支撑半径随缩小比例放大，保证覆盖率避免摩尔纹
+  const radius = scale > 1 ? 3 * scale : 3
+  for (let x = 0; x < dstLen; x++) {
+    const center = (x + 0.5) * scale - 0.5
+    const start = Math.floor(center - radius)
+    const end = Math.ceil(center + radius)
+    let sum = 0
+    let wsum = 0
+    for (let sx = start; sx <= end; sx++) {
+      if (sx < 0 || sx >= src.length) continue
+      const w = lanczosKernel((center - sx) * Math.min(1 / scale, 1))
+      sum += src[sx] * w
+      wsum += w
+    }
+    out[x] = wsum > 0 ? sum / wsum : 0
+  }
+  return out
+}
+
+/**
+ * 双线性缩放到目标尺寸（带 alpha 预乘 + Lanczos-3，边缘更锐利、透明边缘无暗边）。
+ * 流程：先把 RGB 与 alpha 预乘，分两个轴重采样，最后除以 alpha 还原。
  * @param {{ width: number, height: number, rgba: Buffer }} src 源图
  * @param {number} size 目标边长（宽=高）
  * @returns {{ width: number, height: number, rgba: Buffer }}
  */
 function resize(src, size) {
-  const rgba = Buffer.alloc(size * size * 4)
   const scale = src.width / size
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const sx = x * scale
-      const sy = y * scale
-      const x0 = Math.min(Math.floor(sx), src.width - 1)
-      const y0 = Math.min(Math.floor(sy), src.height - 1)
-      const x1 = Math.min(x0 + 1, src.width - 1)
-      const y1 = Math.min(y0 + 1, src.height - 1)
-      const fx = sx - x0
-      const fy = sy - y0
-      const d = (y * size + x) * 4
-      for (let c = 0; c < 4; c++) {
-        const v00 = src.rgba[(y0 * src.width + x0) * 4 + c]
-        const v10 = src.rgba[(y0 * src.width + x1) * 4 + c]
-        const v01 = src.rgba[(y1 * src.width + x0) * 4 + c]
-        const v11 = src.rgba[(y1 * src.width + x1) * 4 + c]
-        rgba[d + c] = Math.round(v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) + v01 * (1 - fx) * fy + v11 * fx * fy)
-      }
+  // 拆成四通道数组，便于按轴重采样
+  const ch = [0, 1, 2, 3].map((c) => {
+    const a = new Array(src.width * src.height)
+    for (let i = 0; i < a.length; i++) a[i] = src.rgba[i * 4 + c]
+    return a
+  })
+  // 预乘：RGB × alpha/255，alpha 通道本身不动
+  for (let i = 0; i < src.width * src.height; i++) {
+    const a = ch[3][i]
+    ch[0][i] = (ch[0][i] * a) / 255
+    ch[1][i] = (ch[1][i] * a) / 255
+    ch[2][i] = (ch[2][i] * a) / 255
+  }
+
+  // 垂直重采样：逐列把 (h×w) 压到 (size×w)
+  for (let c = 0; c < 4; c++) {
+    const temp = new Array(size * src.width)
+    for (let x = 0; x < src.width; x++) {
+      const col = new Array(src.height)
+      for (let y = 0; y < src.height; y++) col[y] = ch[c][y * src.width + x]
+      const rs = resampleAxis(col, size, scale)
+      for (let y = 0; y < size; y++) temp[y * src.width + x] = rs[y]
+    }
+    ch[c] = temp
+  }
+  // 水平重采样：逐行把 (size×w) 压到 (size×size)
+  for (let c = 0; c < 4; c++) {
+    const row = new Array(src.width)
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < src.width; x++) row[x] = ch[c][y * src.width + x]
+      const rs = resampleAxis(row, size, scale)
+      for (let x = 0; x < size; x++) ch[c][y * size + x] = rs[x]
+    }
+  }
+
+  // 还原：RGB 除以 alpha，输出 RGBA Buffer
+  const rgba = Buffer.alloc(size * size * 4)
+  for (let i = 0; i < size * size; i++) {
+    const a = Math.max(0, Math.min(255, Math.round(ch[3][i])))
+    rgba[i * 4 + 3] = a
+    if (a > 0) {
+      for (let c = 0; c < 3; c++) rgba[i * 4 + c] = Math.max(0, Math.min(255, Math.round(ch[c][i] / (a / 255))))
     }
   }
   return { width: size, height: size, rgba }
@@ -247,7 +312,16 @@ const inPath = resolve(dirname(fileURLToPath(import.meta.url)), '../build/icon.p
 const outPath = resolve(dirname(fileURLToPath(import.meta.url)), '../build/icon.ico')
 
 const src = decodePng(readFileSync(inPath))
-const images = SIZES.map((size) => ({ size, png: encodePng(resize(src, size)) }))
+
+// 逐级缩放：先缩到最大目标尺寸（256），再依次以「上一级结果」缩到更小尺寸，
+// 相比每次都从原始大图直接缩，过渡更平滑、小尺寸细节更好。
+const images = []
+let current = src
+for (const size of SIZES) {
+  current = resize(current, size)
+  images.push({ size, png: encodePng(current) })
+}
+
 const ico = encodeIco(images)
 writeFileSync(outPath, ico)
 console.log(

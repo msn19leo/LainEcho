@@ -16,6 +16,8 @@ import { LogOut, MessageSquare, Settings } from 'lucide-react'
 import { api } from '../api'
 import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
 import { PetStage, type PetStageHandle } from './PetStage'
+import { DEFAULT_EMOTION, type StandardEmotion } from '../types'
+import { stripBrackets } from '../lib/utils'
 
 /** 桌宠窗口固定尺寸（与主进程 PET_WIDTH/PET_HEIGHT 保持一致）。
  *  用固定像素而非 h-full/w-full：Windows 透明窗口拖动时 CSS 布局尺寸会被报告失真，
@@ -39,18 +41,17 @@ export default function PetApp() {
   // 效果：播放第 1 句时，合成循环已在合成第 2 句 → 句间几乎无间隔。
   // 旧串行架构间隔 = 合成时间 + 播放时间；新架构间隔 ≈ max(合成时间, 播放时间)。
 
-  /** 待合成的文本队列（入队顺序 = 播放顺序） */
-  const textQueueRef = useRef<Array<{ text: string; voiceId: string; languageOverride: import('../types').TTSLanguage | null }>>([])
-  /** 已合成待播放的音频队列 */
-  const audioQueueRef = useRef<Array<ArrayBuffer>>([])
-  /** 合成锁：同时只合成一句，避免 MiMo API 并发请求 */
+  /** 待合成的文本队列（入队顺序 = 播放顺序；index 为合成分段索引，null 表示单段整条） */
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: StandardEmotion }>>([])
+  /** 已合成待播放的音频队列（附带对应分段索引与情绪） */
+  const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer; index: number | null; emotion: StandardEmotion }>>([])
+  /** 合成锁：同时只合成一段，避免 MiMo API 并发请求 */
   const isSynthesizingRef = useRef(false)
   /** 播放锁：同时只播放一段音频，避免叠加 */
   const isPlayingRef = useRef(false)
 
   /**
-   * 合成循环：从文本队列取一句合成，结果放入音频队列。
-   * 合成完成后继续合成下一句（如果队列中还有），实现预合成。
+   * 合成循环：从文本队列取一个合成分段合成音频（携带分段索引与情绪）放入音频队列，串行不并发。
    */
   const synthesizeLoop = async () => {
     if (isSynthesizingRef.current) return
@@ -59,9 +60,13 @@ export default function PetApp() {
 
     isSynthesizingRef.current = true
     try {
-      const audio = await api.tts.synthesize({ text: next.text, voiceId: next.voiceId, languageOverride: next.languageOverride })
+      // 合成前剥离心理/动作旁白（括号内容），只朗读台词
+      const speakText = stripBrackets(next.text)
+      // 整段只剩括号旁白（被剥空）：跳过该段，不合成、不产生音频，避免空文本报错
+      if (!speakText) return
+      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride })
       if (audio) {
-        audioQueueRef.current.push(audio)
+        audioQueueRef.current.push({ buffer: audio, index: next.index, emotion: next.emotion })
         // 有新音频了，尝试触发播放
         void playLoop()
       }
@@ -69,7 +74,7 @@ export default function PetApp() {
       console.error('[pet] TTS 合成失败', err)
     } finally {
       isSynthesizingRef.current = false
-      // 继续合成下一句（预合成），不等播放
+      // 继续合成下一段（预合成），不等播放
       if (textQueueRef.current.length > 0) {
         void synthesizeLoop()
       }
@@ -77,8 +82,7 @@ export default function PetApp() {
   }
 
   /**
-   * 播放循环：从音频队列取一段播放，播放完成后继续播放下一段。
-   * 与合成循环并行运行，互不阻塞。
+   * 播放循环：取出音频播放；分段索引非空时上报段级高亮，并按该段情绪切换立绘。
    */
   const playLoop = async () => {
     if (isPlayingRef.current) return
@@ -87,7 +91,11 @@ export default function PetApp() {
 
     isPlayingRef.current = true
     try {
-      await stageRef.current?.speak(next)
+      if (next.index !== null) {
+        api.pet.reportChunkActive(next.index)
+        stageRef.current?.setEmotion(next.emotion)
+      }
+      await stageRef.current?.speak(next.buffer)
     } catch (err) {
       console.error('[pet] TTS 播放失败', err)
     } finally {
@@ -95,16 +103,31 @@ export default function PetApp() {
       // 继续播放下一段（如果队列中还有）
       if (audioQueueRef.current.length > 0) {
         void playLoop()
+      } else if (!isSynthesizingRef.current && textQueueRef.current.length === 0) {
+        // 全部段落播放完毕（无待合成、无待播）：清空高亮，避免停在最后一段
+        api.pet.reportChunkActive(null)
       }
     }
   }
 
-  // 订阅"说话"事件：聊天窗口流式分句触发，入文本队列并启动合成+播放流水线
+  // 订阅"说话"事件：聊天窗口流式完成后触发，按主进程拆好的合成分段（dialogue 逐项）段级合成播放
   useEffect(() => {
     const unsub = api.pet.onSpeak((payload) => {
-      const { text, voiceId, languageOverride } = payload ?? {}
+      const { text, voiceId, languageOverride, chunks } = payload ?? {}
       if (!voiceId || !text?.trim()) return
-      textQueueRef.current.push({ text: text.trim(), voiceId, languageOverride: languageOverride ?? null })
+      const list = chunks && chunks.length > 0 ? chunks : [{ text: text.trim(), emotion: DEFAULT_EMOTION }]
+      const items = list
+        .map((c) => ({ text: (c.text ?? '').trim(), emotion: c.emotion ?? DEFAULT_EMOTION }))
+        .filter((c) => c.text.length > 0)
+        .map((c, i) => ({
+          text: c.text,
+          voiceId,
+          languageOverride: languageOverride ?? null,
+          index: chunks && chunks.length > 0 ? i : null,
+          emotion: c.emotion,
+        }))
+      if (items.length === 0) return
+      textQueueRef.current.push(...items)
       void synthesizeLoop()
       void playLoop()
     })
