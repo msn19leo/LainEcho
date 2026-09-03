@@ -807,6 +807,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
             alt={sprite.name}
             draggable={false}
             className="max-h-full max-w-full select-none object-contain"
+            style={{
+              transform: `translate(${settingsRef.current.spriteView.x}px, ${settingsRef.current.spriteView.y}px) scale(${settingsRef.current.spriteView.scale})`,
+            }}
           />
         </motion.div>
       )}

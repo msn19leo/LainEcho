@@ -259,6 +259,11 @@ export function CharacterModelPanel() {
     void save({ view: { ...settings.view, [key]: value } })
   }
 
+  /** 更新 2D 立绘集的缩放/位置 */
+  const updateSpriteView = (key: 'scale' | 'x' | 'y', value: number) => {
+    void save({ spriteView: { ...settings.spriteView, [key]: value } })
+  }
+
   return (
     <div className="space-y-4">
       {/* Cubism Core */}
@@ -355,75 +360,14 @@ export function CharacterModelPanel() {
         </div>
       )}
 
-      {/* ==================== 2D 立绘分区 ==================== */}
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-semibold text-text">2D 立绘集（{sprites.length}）</span>
-        <Button onClick={() => void handleImportSprite()} disabled={importingSprite}>
-          <Images size={14} strokeWidth={2.25} />
-          {importingSprite ? '导入中…' : '从文件夹导入'}
-        </Button>
-      </div>
-      <p className="text-xs leading-relaxed text-text-muted">
-        立绘集 = 一个含多张情绪切图的文件夹（png/jpg/webp）。导入后在「角色卡 → 外观」中把立绘集与情绪映射绑定到角色。
-      </p>
-
-      {sprites.length === 0 ? (
-        <Card>
-          <div className="flex items-center gap-3 py-2">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
-              <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
-            </div>
-            <div className="flex-1 text-sm text-text-muted">还没有立绘集。导入包含情绪切图的文件夹即可。</div>
-          </div>
-        </Card>
-      ) : (
-        <div className="space-y-2">
-          {sprites.map((s) => (
-            <Card
-              key={s.id}
-              className={cn(
-                'flex items-center gap-3 py-3',
-                settings.selectedSpriteId === s.id &&
-                  'ring-2 ring-[var(--primary-400)] ring-offset-2 ring-offset-[var(--bg-base)] shadow-[0_0_16px_var(--primary-glow)]',
-              )}
-              onClick={() => void handleSelectSprite(s.id)}
-            >
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
-                <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <div className="truncate text-sm font-medium text-text">{s.name}</div>
-                  {settings.selectedSpriteId === s.id && (
-                    <span className="inline-flex shrink-0 items-center rounded-full bg-[var(--primary-400)]/15 px-2 py-0.5 text-[10px] text-[var(--primary-400)] ring-1 ring-[var(--primary-400)]/30">
-                      当前选择
-                    </span>
-                  )}
-                </div>
-                <div className="mt-0.5 truncate text-xs text-text-muted selectable">
-                  {s.images.length} 张图 · {formatRelativeTime(s.createdAt)} 导入
-                </div>
-              </div>
-              <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openEmotionMap(s) }}>
-                <Smile size={14} strokeWidth={2} />
-                情绪映射
-              </Button>
-              <Button variant="danger" size="sm" onClick={(e) => { e.stopPropagation(); setDeletingSprite(s) }}>
-                删除
-              </Button>
-            </Card>
-          ))}
-        </div>
-      )}
-
-      {/* ==================== 模型设置分区 ==================== */}
+            {/* ==================== 模型设置分区 ==================== */}
 
       {!loaded ? (
         <Loading text="加载模型设置…" />
       ) : (
         <>
           {/* 1. 缩放与位置 */}
-          <AccordionItem title="缩放与位置" icon={<Maximize2 size={15} strokeWidth={1.75} />}>
+          <AccordionItem title="缩放与位置" icon={<Maximize2 size={15} strokeWidth={1.75} />} defaultOpen={false}>
             <Slider
               label="缩放"
               value={settings.view.scale}
@@ -457,7 +401,7 @@ export function CharacterModelPanel() {
           </AccordionItem>
 
           {/* 2. 动画 */}
-          <AccordionItem title="动画" icon={<Play size={15} strokeWidth={1.75} />}>
+          <AccordionItem title="动画" icon={<Play size={15} strokeWidth={1.75} />} defaultOpen={false}>
             {/* 鼠标跟踪 */}
             <div className="border-b border-border py-2.5">
               <div className="flex items-start justify-between gap-3">
@@ -559,7 +503,7 @@ export function CharacterModelPanel() {
           </AccordionItem>
 
           {/* 3. 表情 */}
-          <AccordionItem title="表情" icon={<Smile size={15} strokeWidth={1.75} />}>
+          <AccordionItem title="表情" icon={<Smile size={15} strokeWidth={1.75} />} defaultOpen={false}>
             <div className="border-b border-border py-2.5">
               <div className="flex items-start justify-between gap-3">
                 <div>
@@ -602,6 +546,103 @@ export function CharacterModelPanel() {
             </div>
           </AccordionItem>
         </>
+      )}
+
+      {/* ==================== 2D 立绘分区 ==================== */}
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold text-text">2D 立绘集（{sprites.length}）</span>
+        <Button onClick={() => void handleImportSprite()} disabled={importingSprite}>
+          <Images size={14} strokeWidth={2.25} />
+          {importingSprite ? '导入中…' : '从文件夹导入'}
+        </Button>
+      </div>
+      <p className="text-xs leading-relaxed text-text-muted">
+        立绘集 = 一个含多张情绪切图的文件夹（png/jpg/webp）。导入后在「角色卡 → 外观」中把立绘集与情绪映射绑定到角色。
+      </p>
+
+      {sprites.length === 0 ? (
+        <Card>
+          <div className="flex items-center gap-3 py-2">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+              <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
+            </div>
+            <div className="flex-1 text-sm text-text-muted">还没有立绘集。导入包含情绪切图的文件夹即可。</div>
+          </div>
+        </Card>
+      ) : (
+        <div className="space-y-2">
+          {sprites.map((s) => (
+            <Card
+              key={s.id}
+              className={cn(
+                'flex items-center gap-3 py-3',
+                settings.selectedSpriteId === s.id &&
+                  'ring-2 ring-[var(--primary-400)] ring-offset-2 ring-offset-[var(--bg-base)] shadow-[0_0_16px_var(--primary-glow)]',
+              )}
+              onClick={() => void handleSelectSprite(s.id)}
+            >
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
+                <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <div className="truncate text-sm font-medium text-text">{s.name}</div>
+                  {settings.selectedSpriteId === s.id && (
+                    <span className="inline-flex shrink-0 items-center rounded-full bg-[var(--primary-400)]/15 px-2 py-0.5 text-[10px] text-[var(--primary-400)] ring-1 ring-[var(--primary-400)]/30">
+                      当前选择
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 truncate text-xs text-text-muted selectable">
+                  {s.images.length} 张图 · {formatRelativeTime(s.createdAt)} 导入
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openEmotionMap(s) }}>
+                <Smile size={14} strokeWidth={2} />
+                情绪映射
+              </Button>
+              <Button variant="danger" size="sm" onClick={(e) => { e.stopPropagation(); setDeletingSprite(s) }}>
+                删除
+              </Button>
+            </Card>
+          ))}
+        </div>
+      )});
+
+      {/* ==================== 2D 立绘缩放与位置 ==================== */}
+      {loaded && (
+        <AccordionItem title="立绘缩放与位置" icon={<Maximize2 size={15} strokeWidth={1.75} />} defaultOpen={false}>
+          <Slider
+            label="缩放"
+            value={settings.spriteView.scale}
+            min={0.1}
+            max={3}
+            step={0.01}
+            defaultValue={DEFAULT_VIEW.scale}
+            onChange={(v) => updateSpriteView('scale', v)}
+            format={(v) => v.toFixed(2)}
+          />
+          <Slider
+            label="X"
+            value={settings.spriteView.x}
+            min={-500}
+            max={500}
+            step={1}
+            defaultValue={0}
+            onChange={(v) => updateSpriteView('x', v)}
+            format={(v) => v.toFixed(0)}
+          />
+          <Slider
+            label="Y"
+            value={settings.spriteView.y}
+            min={-500}
+            max={500}
+            step={1}
+            defaultValue={0}
+            onChange={(v) => updateSpriteView('y', v)}
+            format={(v) => v.toFixed(0)}
+          />
+        </AccordionItem>
       )}
 
       <ConfirmModal

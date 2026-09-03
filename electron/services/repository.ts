@@ -609,6 +609,7 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
     selectedExpression: '',
   },
   view: { scale: 1, x: 0, y: 0 },
+  spriteView: { scale: 1, x: 0, y: 0 },
   selectedModelId: null,
   selectedSpriteId: null,
 }
@@ -621,6 +622,7 @@ export async function getModelSettings(): Promise<ModelSettings> {
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(saved.parameters ?? {}) },
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
+    spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(saved.spriteView ?? {}) },
     selectedModelId: saved.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
     selectedSpriteId: saved.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }
@@ -634,6 +636,7 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     if (patch.parameters) next.parameters = { ...(base.parameters ?? {}), ...patch.parameters }
     if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
     if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
+    if (patch.spriteView) next.spriteView = { ...(base.spriteView ?? {}), ...patch.spriteView }
     if (patch.selectedModelId !== undefined) next.selectedModelId = patch.selectedModelId
     if (patch.selectedSpriteId !== undefined) next.selectedSpriteId = patch.selectedSpriteId
     return next
@@ -642,6 +645,7 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(result?.parameters ?? {}) },
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
+    spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(result?.spriteView ?? {}) },
     selectedModelId: result?.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
     selectedSpriteId: result?.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }

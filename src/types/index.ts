@@ -442,6 +442,8 @@ export interface ModelSettings {
   parameters: ModelParameters
   animation: ModelAnimationSettings
   view: ModelViewSettings
+  /** 2D 立绘集的缩放与位置（与 Live2D view 独立） */
+  spriteView: ModelViewSettings
   /** 当前全局选中的 Live2D 模型 id（角色卡未绑定时使用） */
   selectedModelId: string | null
   /** 当前全局选中的 2D 立绘集 id（角色卡未绑定时、且立绘模式下使用） */

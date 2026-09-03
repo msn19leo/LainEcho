@@ -823,7 +823,7 @@ export function CharacterCardPanel() {
                   </Field>
                 </AccordionItem>
 
-                <AccordionItem title="对话增强" icon={<MessageCircle size={14} />}>
+                <AccordionItem title="对话增强" icon={<MessageCircle size={14} />} defaultOpen={false}>
                   <Field label="示例对话（messageExample）" hint="few-shot 样本，让 LLM 学习角色说话风格。格式：{{char}}: xxx / {{user}}: yyy">
                     <Textarea
                       rows={4}
