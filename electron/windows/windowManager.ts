@@ -117,6 +117,22 @@ class WindowManager {
     }
   }
 
+  /** 把 AI 流式事件同时广播给聊天窗与宠物窗（两侧各自维护会话视图，保持同步） */
+  broadcastAI(channel: string, payload?: unknown): void {
+    for (const win of [this.chat, this.pet]) {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send(channel, payload)
+      }
+    }
+  }
+
+  /** 聊天窗切会话/新建会话后，把当前会话 id 转发给宠物窗，让内容框跟随同步 */
+  notifyCurrentSession(sessionId: string | null): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('session:current', sessionId)
+    }
+  }
+
   /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘 */
   notifyEmotion(emotion: StandardEmotion): void {
     if (this.pet && !this.pet.isDestroyed()) {
@@ -150,11 +166,16 @@ class WindowManager {
 
   // ---------------- 聊天 ----------------
 
-  showChat(): void {
+  showChat(sessionId?: string): void {
     if (!this.chat || this.chat.isDestroyed()) {
       this.chat = createChatWindow()
+      // 窗口创建后（DOM 就绪）再把目标会话 id 交给聊天窗加载
+      this.chat.webContents.once('did-finish-load', () => {
+        if (sessionId) this.chat?.webContents.send('chat:open-session', sessionId)
+      })
       return
     }
+    if (sessionId) this.chat.webContents.send('chat:open-session', sessionId)
     if (!this.chat.isVisible()) this.chat.show()
     this.chat.focus()
   }

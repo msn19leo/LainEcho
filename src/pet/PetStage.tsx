@@ -17,6 +17,7 @@ import { api } from '../api'
 import { IconTile } from '../components/IconTile'
 import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, CharacterModelOverride, RenderMode, StandardEmotion, PetCardPayload } from '../types'
 import { DEFAULT_EMOTION } from '../types'
+import { useCharacterStore } from '../store/characterStore'
 import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
 import { LipSyncController } from './lipSync'
 
@@ -32,6 +33,8 @@ export interface PetStageHandle {
   stopSpeak: () => void
   /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动） */
   setEmotion: (emotion: StandardEmotion) => void
+  /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后调用） */
+  resize: () => void
 }
 
 interface PetStageProps {
@@ -145,6 +148,22 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       } else {
         updateCurrentExpression()
       }
+    },
+    /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后由 PetApp 调用） */
+    resize: () => {
+      const container = containerRef.current
+      const app = appRef.current
+      if (!container || !app) return
+      const w = container.clientWidth || 300
+      const h = container.clientHeight || 300
+      if (app.screen.width !== w || app.screen.height !== h) {
+        try {
+          app.renderer.resize(w, h)
+        } catch {
+          // 忽略 resize 异常
+        }
+      }
+      fitModel()
     },
   }))
 
@@ -631,7 +650,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     // 订阅始终注册（即使 core 缺失也会收到导入事件后重试）：
     // 角色卡切换 → 换模型 + 应用表情/待机动作覆盖；模型列表变化 / Cubism Core 导入 → 重新初始化
     unsubModel = api.pet.onCardChanged((payload: PetCardPayload) => {
-      const { modelId, modelOverride, renderMode, spriteId, emotionMap, live2dExpressionMap } = payload ?? {}
+      const { cardId, modelId, modelOverride, renderMode, spriteId, emotionMap, live2dExpressionMap } = payload ?? {}
+      // 同步宠物窗的当前角色卡（内容框名牌/头部显示当前角色名）
+      if (cardId) {
+        useCharacterStore.setState({ currentCardId: cardId })
+      }
       // 记录角色卡的模型覆盖配置，触发表情参数刷新
       cardModelOverrideRef.current = modelOverride ?? null
       // 记录形象呈现相关配置（立绘/情绪映射/渲染模式），供渲染分发与情绪联动使用

@@ -107,11 +107,25 @@ const api: WindowApi = {
   },
   app: {
     openChat: () => ipcRenderer.send('app:open-chat'),
+    /** 打开聊天窗口，并可选指定要进入的会话 id（宠物窗点开时带当前会话） */
+    openChatWithSession: (sessionId) => ipcRenderer.send('app:open-chat', sessionId),
     openSettings: () => ipcRenderer.send('app:open-settings'),
     setPetCard: (payload) => ipcRenderer.send('app:set-pet-card', payload),
     quit: () => ipcRenderer.send('app:quit'),
     /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
     speak: (text, voiceId, languageOverride, payload) => ipcRenderer.send('app:speak', text, voiceId, languageOverride, payload),
+    /** 上报当前会话（聊天窗切会话/新建会话时调用，主进程转发给宠物窗同步内容框） */
+    notifyCurrentSession: (sessionId) => ipcRenderer.send('session:current', sessionId),
+    /** 宠物窗内容框高度联动：调整宠物窗总高度（模型区恒定，顶边固定向下生长） */
+    setPetPanelHeight: (panelH) => ipcRenderer.send('pet:set-panel-height', panelH),
+  },
+  chat: {
+    /** 订阅"打开聊天窗口并进入指定会话"（宠物窗点开聊天时触发，聊天窗据此 loadSession） */
+    onOpenSession: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, sessionId: string) => cb(sessionId)
+      ipcRenderer.on('chat:open-session', listener)
+      return () => ipcRenderer.removeListener('chat:open-session', listener)
+    },
   },
   pet: {
     onCardChanged: (cb) => {
@@ -165,6 +179,12 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, index: number | null) => cb(index)
       ipcRenderer.on('chunk-active', listener)
       return () => ipcRenderer.removeListener('chunk-active', listener)
+    },
+    /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
+    onCurrentSessionChanged: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, sessionId: string | null) => cb(sessionId)
+      ipcRenderer.on('session:current', listener)
+      return () => ipcRenderer.removeListener('session:current', listener)
     },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
     spriteUrl: (spriteId, filePath) => `pet-res://sprites/${spriteId}/${filePath}`,

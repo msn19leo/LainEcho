@@ -53,8 +53,8 @@ export function registerAiIpc(): void {
       const display = extractStreamingJsonText(partial)
       const delta = display.length > lastDisplayLen ? display.slice(lastDisplayLen) : ''
       lastDisplayLen = Math.max(lastDisplayLen, display.length)
-      if (delta && !sender.isDestroyed()) {
-        sender.send('ai:stream-chunk', delta)
+      if (delta) {
+        windowManager.broadcastAI('ai:stream-chunk', delta)
       }
     }
 
@@ -109,9 +109,14 @@ export function registerAiIpc(): void {
       const asstMsg: ChatMessage = { role: 'assistant', content: text, emotion, sentences, emotionSegments, chunks, timestamp: now }
       await appendSessionMessages(sessionId, [userMsg, asstMsg])
 
-      if (!sender.isDestroyed()) sender.send('ai:stream-done', { sessionId, message: asstMsg })
+      windowManager.broadcastAI('ai:stream-done', { sessionId, message: asstMsg })
       // 广播归一化情绪到桌宠窗口，驱动形象层切表情/切立绘
       windowManager.notifyEmotion(emotion)
+      // 直接触发桌宠语音（不依赖聊天窗）：按会话角色卡的参考音频/语言覆盖合成播放
+      if (card?.voiceId) {
+        const langOverride = card.ttsOverride?.language ?? null
+        windowManager.speak(asstMsg.content, card.voiceId, langOverride, { chunks: asstMsg.chunks })
+      }
       return asstMsg
     } catch (err) {
       cancelled = abort.signal.aborted
@@ -133,7 +138,7 @@ export function registerAiIpc(): void {
       }
       flushChunks()
 
-      if (!sender.isDestroyed()) sender.send('ai:stream-error', { sessionId, error: message, cancelled })
+      windowManager.broadcastAI('ai:stream-error', { sessionId, error: message, cancelled })
       throw err
     } finally {
       if (currentAbort === abort) currentAbort = null

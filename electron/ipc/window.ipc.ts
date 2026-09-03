@@ -6,7 +6,7 @@
  */
 import { app, BrowserWindow, ipcMain } from 'electron'
 import type { PetCardPayload, TTSLanguage } from '../../src/types'
-import { markPetWindowQuitting } from '../windows/petWindow'
+import { markPetWindowQuitting, setPetPanelHeight } from '../windows/petWindow'
 import { windowManager } from '../windows/windowManager'
 
 function windowFromEvent(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): BrowserWindow | null {
@@ -89,7 +89,7 @@ export function registerWindowIpc(): void {
 
   // ---------------- 应用级操作 ----------------
 
-  ipcMain.on('app:open-chat', () => windowManager.showChat())
+  ipcMain.on('app:open-chat', (_e, sessionId?: string) => windowManager.showChat(sessionId))
   ipcMain.on('app:open-settings', () => windowManager.showSettings())
 
   ipcMain.on('app:set-pet-card', (_e, payload: PetCardPayload) => {
@@ -105,6 +105,16 @@ export function registerWindowIpc(): void {
   /** 桌宠上报当前朗读合成分段（null 表示清空高亮）→ 转发给聊天窗高亮 */
   ipcMain.on('chunk-active', (_e, index: number | null) => {
     windowManager.notifyChunkActive(index)
+  })
+
+  /** 聊天窗上报当前会话 → 转发给宠物窗（内容框跟随同步） */
+  ipcMain.on('session:current', (_e, sessionId: string | null) => {
+    windowManager.notifyCurrentSession(sessionId)
+  })
+
+  /** 宠物窗内容框高度变化 → 调整宠物窗总高度（模型区恒定，顶边固定向下生长） */
+  ipcMain.on('pet:set-panel-height', (_e, panelH: number) => {
+    setPetPanelHeight(typeof panelH === 'number' && Number.isFinite(panelH) ? panelH : 0)
   })
 
   ipcMain.on('app:quit', () => {

@@ -17,7 +17,7 @@ import { DropdownMenu, type MenuItem } from '../components/DropdownMenu'
 import { IconTile } from '../components/IconTile'
 import { FloatingDock } from '../components/FloatingDock'
 import { useCharacterStore } from '../store/characterStore'
-import { useSessionStore } from '../store/sessionStore'
+import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
 import { MessageList } from './MessageList'
 import { InputArea } from './InputArea'
 import { SessionSidebar } from './SessionSidebar'
@@ -53,6 +53,9 @@ export function ChatWindow() {
   /** 当前朗读到的合成分段索引（pet 段级播放时上报，用于聊天窗高亮当前段） */
   const [activeChunk, setActiveChunk] = useState<number | null>(null)
 
+  // 持久订阅 AI 流式/完成事件，驱动会话消息流式上屏与完成落定（与宠物窗同步）
+  useEffect(() => bindPersistentSessionSync(), [])
+
   // 订阅"当前朗读合成分段"（桌宠段级播放时经主进程转发），用于聊天窗高亮该段
   useEffect(() => api.pet.onChunkActive(setActiveChunk), [])
   // 新一轮回复开始时清空高亮，避免上一轮（尤其无语音时）的高亮残留
@@ -71,6 +74,11 @@ export function ChatWindow() {
       const state = useSessionStore.getState()
       if (state.currentSessionId) void loadSession(state.currentSessionId)
     })()
+    // 宠物窗点开聊天并指定会话时：加载该会话并切换当前卡
+    const unsubOpen = api.chat.onOpenSession((sessionId) => {
+      void loadSession(sessionId)
+    })
+    return unsubOpen
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -201,23 +209,8 @@ export function ChatWindow() {
       }
     })
 
-    // 流式完成：整段回复按主进程切好的句子表交给桌宠逐句合成播放（不再流式中分句合成）
-    const unsubDone = api.ai.onStreamDone((payload: { message: import('../types').ChatMessage } | undefined) => {
-      const msg = payload?.message
-      const ensureSpeak = (ctx: { voiceId: string; languageOverride: import('../types').TTSLanguage | null } | null) => {
-        if (ctx && msg) {
-          api.app.speak(msg.content, ctx.voiceId, ctx.languageOverride, {
-            chunks: msg.chunks,
-          })
-        }
-      }
-      // 语音上下文优先用流式中已初始化的；未初始化（如短回复无流式块）时兜底初始化一次
-      if (ttsCtx) {
-        ensureSpeak(ttsCtx)
-      } else {
-        ttsChecked = false
-        void ensureTtsCtx().then((ctx) => ensureSpeak(ctx))
-      }
+    // 流式完成：文本由持久同步落定；语音由主进程在 stream-done 时直接触发桌宠（此处不再调 speak）
+    const unsubDone = api.ai.onStreamDone(() => {
       // 重置本轮状态
       accRef.text = ''
       consumedPos = 0
@@ -247,6 +240,7 @@ export function ChatWindow() {
     setCurrentCard(cardId)
     const card = cards.find((c) => c.id === cardId)
     api.app.setPetCard({
+      cardId,
       modelId: card?.modelId ?? null,
       modelOverride: card?.modelOverride ?? null,
       renderMode: card?.renderMode ?? null,

@@ -16,13 +16,27 @@ import { LogOut, MessageSquare, Settings } from 'lucide-react'
 import { api } from '../api'
 import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
 import { PetStage, type PetStageHandle } from './PetStage'
+import { PetMiniChat } from './PetMiniChat'
+import { PetInput } from './PetInput'
+import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
+import { useCharacterStore } from '../store/characterStore'
 import { DEFAULT_EMOTION, type StandardEmotion } from '../types'
 import { stripBrackets } from '../lib/utils'
 
-/** 桌宠窗口固定尺寸（与主进程 PET_WIDTH/PET_HEIGHT 保持一致）。
+/** 桌宠窗口宽度固定（与主进程 PET_WIDTH 保持一致）。
  *  用固定像素而非 h-full/w-full：Windows 透明窗口拖动时 CSS 布局尺寸会被报告失真，
- *  百分比尺寸会跟着变大。钉死像素则完全不受影响。 */
-const PET_SIZE = { width: 300, height: 440 }
+ *  百分比尺寸会跟着变大。钉死像素则完全不受影响。
+ *  高度不固定：由"内容框高度 + 模型区 440 + 输入框高度"联动（主进程 setSize），模型区恒定。 */
+const PET_W = 300
+/** 模型区恒定高度：内容框收放/拖高不改变模型与立绘显示大小 */
+const MODEL_H = 440
+/** 底部迷你输入框占用的固定高度 */
+const INPUT_H = 40
+/** 内容框展开时的默认高度（左上角角标可拖高） */
+const CONTENT_H = 130
+
+/** 内容框状态持久化 key（重启恢复展开/收起与高度） */
+const STORAGE_KEY = 'lainecho.petChatPanel'
 
 interface MenuPos {
   x: number
@@ -33,7 +47,73 @@ export default function PetApp() {
   const stageRef = useRef<PetStageHandle>(null)
   const [menu, setMenu] = useState<MenuPos | null>(null)
   const [scalePct, setScalePct] = useState<number | null>(null)
+  /** 迷你会话内容框：初始收起；展开高度可拖调（左上角角标）。状态持久化，重启恢复 */
+  const [contentOpen, setContentOpen] = useState<boolean>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}').open ?? false
+    } catch {
+      return false
+    }
+  })
+  const [contentH, setContentH] = useState<number>(() => {
+    try {
+      const h = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}').height
+      return typeof h === 'number' && h >= 90 && h <= 320 ? h : CONTENT_H
+    } catch {
+      return CONTENT_H
+    }
+  })
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 宠物窗侧会话同步：只持久订阅 AI 流式/完成事件；初始为空，跟随聊天窗广播的当前会话，
+  // 不主动加载"最近会话"（聊天窗为空时宠物窗也为空）
+  useEffect(() => {
+    // 宠物窗自己的 renderer 有独立的 characterStore：先加载角色卡列表，
+    // 保证内容框名牌/头部能显示当前角色名（否则恒为 AI 兜底）
+    void useCharacterStore.getState().load()
+    return bindPersistentSessionSync()
+  }, [])
+
+  // 跟随聊天窗切换/新建会话：收到当前会话 id 时加载对应消息到宠物窗内容框；null 表示清空
+  useEffect(() => api.pet.onCurrentSessionChanged((id) => {
+    if (!id) {
+      useSessionStore.setState({ currentSessionId: null, messages: [], streamingContent: '', streaming: false })
+      return
+    }
+    // 若宠物窗本地已经是该会话（含刚发送、正在流式、或已渲染消息），跳过拉取，
+    // 避免一次自广播把刚显示的用户气泡/流式覆盖成空
+    const cur = useSessionStore.getState()
+    if (cur.currentSessionId === id) return
+    void (async () => {
+      try {
+        const detail = await api.session.get(id)
+        useSessionStore.setState({ currentSessionId: id, messages: detail.messages, streaming: false, streamingContent: '' })
+        // 会话绑定的角色卡 → 设为当前卡，名牌显示其名字
+        if (detail.characterCardId) {
+          useCharacterStore.setState({ currentCardId: detail.characterCardId })
+        }
+      } catch {
+        // 加载失败不阻塞
+      }
+    })()
+  }), [])
+
+  // 用户发送了消息：若内容框处于收起状态则主动展开
+  useEffect(() => {
+    const unsub = useSessionStore.subscribe((state, prev) => {
+      if (!prev.streaming && state.streaming) setContentOpen(true)
+    })
+    return unsub
+  }, [])
+
+  // 内容框收放/拖高 → 仅持久化状态（内容框是叠加浮层，不改变窗口或模型尺寸）
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ open: contentOpen, height: contentH }))
+    } catch {
+      // 存储失败不阻塞
+    }
+  }, [contentOpen, contentH])
 
   // ============ TTS 双队列架构 ============
   // 合成和播放完全解耦：合成循环持续从文本队列取句合成，
@@ -156,21 +236,62 @@ export default function PetApp() {
 
   return (
     <div
-      style={{ width: PET_SIZE.width, height: PET_SIZE.height }}
+      style={{ width: PET_W, height: MODEL_H + INPUT_H }}
       className="app-drag relative overflow-hidden"
       onWheel={onWheel}
       onContextMenu={onContextMenu}
     >
-      <PetStage stageRef={stageRef} onStatus={() => {}} />
+      {/* 模型区：始终满高（模型/立绘大小恒定）。根容器已是 app-drag（拖动窗口），这里不再标 drag，
+          避免子级 drag 命中区覆盖交互按钮 */}
+      <div
+        style={{ position: 'absolute', left: 0, right: 0, top: 0, height: MODEL_H, zIndex: 0 }}
+      >
+        <PetStage stageRef={stageRef} onStatus={() => {}} />
+      </div>
 
-      {/* 原生拖动区域不接收鼠标事件，聊天/设置改为右上角 no-drag 小按钮 */}
-      <div className="app-no-drag absolute right-2 top-2 flex items-center gap-2">
-        <PetQuickButton title="打开聊天" onClick={() => api.app.openChat()}>
+      {/* 底部浮层：迷你会话内容框（半透明叠加在模型上，位于输入框上方） */}
+      {contentOpen && (
+        <div className="app-no-drag absolute bottom-12 left-1 z-30" style={{ height: contentH, width: 'calc(100% - 8px)' }}>
+          <PetMiniChat
+            contentH={contentH}
+            onToggle={() => setContentOpen((v) => !v)}
+            onResize={setContentH}
+          />
+        </div>
+      )}
+
+      {/* 模型取右上角 no-drag 小按钮（聊天/设置） */}
+      <div className="app-no-drag absolute right-2 top-1 flex items-center gap-2" style={{ zIndex: 40 }}>
+        <PetQuickButton title="打开聊天" onClick={() => {
+          const sid = useSessionStore.getState().currentSessionId
+          if (sid) api.app.openChatWithSession(sid)
+          else api.app.openChat()
+        }}>
           <MessageSquare size={14} strokeWidth={1.75} />
         </PetQuickButton>
         <PetQuickButton title="打开设置" onClick={() => api.app.openSettings()}>
           <Settings size={14} strokeWidth={1.75} />
         </PetQuickButton>
+      </div>
+
+      {/* 收起态：右下角胶囊唤起会话 */}
+      {!contentOpen && (
+        <div className="app-no-drag absolute bottom-10 right-2 z-50">
+          <button
+            type="button"
+            onClick={() => setContentOpen(true)}
+            className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] font-medium text-text transition-colors hover:text-[var(--primary-400)]"
+            title="展开聊天会话"
+          >
+            <MessageSquare size={12} strokeWidth={1.75} />
+            会话
+          </button>
+        </div>
+      )}
+
+      {/* 底部：迷你聊天输入框（可发送，与聊天窗同会话同步） */}
+      <div className="app-no-drag absolute bottom-0 left-0 right-0 z-30" style={{ height: INPUT_H }}>
+        <PetInput />
       </div>
 
       {/* 缩放百分比徽标（滚轮缩放后短暂浮现） */}

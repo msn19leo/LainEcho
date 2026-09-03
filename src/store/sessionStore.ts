@@ -66,6 +66,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const detail = await api.session.get(id)
       if (seq !== loadSeq) return // 已有更新的切换请求，丢弃本次响应
       set({ currentSessionId: id, messages: detail.messages })
+      // 通知宠物窗跟随切换会话（内容框同步）
+      api.app.notifyCurrentSession(id)
       // 切换会话时同步角色卡：根据会话绑定的 characterCardId 切换当前角色卡，
       // 并通知桌宠窗口同步模型 + 表情/待机动作覆盖
       const charStore = useCharacterStore.getState()
@@ -73,6 +75,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         charStore.setCurrentCard(detail.characterCardId)
         const card = charStore.cards.find((c) => c.id === detail.characterCardId)
         api.app.setPetCard({
+          cardId: detail.characterCardId,
           modelId: card?.modelId ?? null,
           modelOverride: card?.modelOverride ?? null,
           renderMode: card?.renderMode ?? null,
@@ -86,8 +89,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  resetCurrentSession: () =>
-    set({ currentSessionId: null, messages: [], streamingContent: '', streamError: null }),
+  resetCurrentSession: () => {
+    // 通知宠物窗内容框清空（新建空会话时保持两侧一致）
+    api.app.notifyCurrentSession(null)
+    return set({ currentSessionId: null, messages: [], streamingContent: '', streamError: null })
+  },
 
   deleteSession: async (id) => {
     await api.session.remove(id)
@@ -127,6 +133,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             const item = await api.session.create({ characterCardId: cardId })
             currentSessionId = item.id
             set((s) => ({ sessions: [item, ...s.sessions], currentSessionId: item.id }))
+            // 通知宠物窗跟随新建的会话（内容框同步）
+            api.app.notifyCurrentSession(item.id)
             messages = get().messages
           } catch (err) {
             console.error('创建会话失败', err)
@@ -140,87 +148,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const nextMessages = [...messages, userMsg]
         set({ messages: nextMessages, streaming: true, streamingContent: '', streamError: null })
 
-        const isStillCurrent = () => get().currentSessionId === currentSessionId
-
-        // 流式上屏合并（T2）：把多次 chunk 累积到本地缓冲，按 ~40ms 合并 flush 到
-        // streamingContent，避免每个 token 都触发一次 React 全量重渲染，显著降低渲染开销。
-        let streamBuffer = ''
-        let streamFlushTimer: ReturnType<typeof setTimeout> | null = null
-        const scheduleStreamFlush = () => {
-          if (streamFlushTimer) return
-          streamFlushTimer = setTimeout(() => {
-            streamFlushTimer = null
-            if (streamBuffer) {
-              const buffered = streamBuffer
-              streamBuffer = ''
-              if (isStillCurrent()) set((s) => ({ streamingContent: s.streamingContent + buffered }))
-            }
-          }, 40)
-        }
-        // 清空定时器并立即 flush（流结束/错误/清理时调用，避免残留定时器触发过期 set）
-        const flushStreamNow = () => {
-          if (streamFlushTimer) {
-            clearTimeout(streamFlushTimer)
-            streamFlushTimer = null
-          }
-          streamBuffer = ''
-        }
-
-      function cleanup() {
-        unsubscribeChunk()
-        unsubscribeDone()
-        unsubscribeError()
-        flushStreamNow()
-      }
-
-      const unsubscribeChunk = api.ai.onStreamChunk((chunk) => {
-        if (!isStillCurrent()) return
-        streamBuffer += chunk
-        scheduleStreamFlush()
-      })
-
-      const unsubscribeDone = api.ai.onStreamDone((payload) => {
-        if (payload.sessionId !== currentSessionId) return
-        if (isStillCurrent()) {
-          set((s) => ({
-            messages: [...s.messages, payload.message],
-            streaming: false,
-            streamingContent: '',
-            streamError: null,
-          }))
-        } else {
-          set({ streaming: false, streamingContent: '' })
-        }
-        void refreshSessionIndex()
-        cleanup()
-        resolve()
-      })
-
-      const unsubscribeError = api.ai.onStreamError((payload) => {
-        if (payload.sessionId !== currentSessionId) return
-        set((s) => {
-          const partial = s.streamingContent
-          const appended = partial
-            ? [...s.messages, { role: 'assistant' as const, content: partial, timestamp: Date.now() }]
-            : s.messages
-          return {
-            messages: appended,
-            streaming: false,
-            streamingContent: '',
-            // 主动取消（停止）不算错误，不展示红色错误条
-            streamError: payload.cancelled ? null : payload.error,
-          }
+        // 流式上屏、完成落定统一由 bindPersistentSessionSync 的持久订阅驱动（聊天窗/宠物窗两侧同步）
+        api.ai.sendMessage({ sessionId: currentSessionId, messages: nextMessages }).catch((err) => {
+          set({ streaming: false, streamError: err instanceof Error ? err.message : '消息发送失败' })
         })
-        void refreshSessionIndex()
-        cleanup()
         resolve()
-      })
-
-      void api.ai.sendMessage({ sessionId: currentSessionId, messages: nextMessages }).catch(() => {
-        set((s) => ({ streaming: false, streamError: s.streamError ?? '消息发送失败' }))
-        cleanup()
-        resolve()
-      })
       })()
     }),
 
@@ -240,3 +172,58 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 }))
+
+/**
+ * 持久订阅 AI 流式/完成/错误事件，统一驱动会话消息的流式上屏与完成落定。
+ * 聊天窗、宠物窗各注册一次，保证两侧会话视图同步（无论哪一端发起发送）：
+ * - stream-chunk：追加到 streamingContent（非发起方在本轮首块时重置，实现镜像流式）；
+ * - stream-done：从主进程拉取该会话已落定的完整消息（含本轮 user+assistant），避免增量去重；
+ * - stream-error：把已流出的部分收成一条 assistant 消息并展示错误（主动取消不报错）。
+ * 返回取消订阅函数。
+ */
+export function bindPersistentSessionSync(): () => void {
+  const unsubChunk = api.ai.onStreamChunk((delta) => {
+    const st = useSessionStore.getState()
+    if (!st.currentSessionId) return
+    // 非发起方的镜像：本轮首块时重置流式内容
+    const base = st.streaming ? st.streamingContent : ''
+    useSessionStore.setState({ streaming: true, streamError: null, streamingContent: base + (delta ?? '') })
+  })
+  const unsubDone = api.ai.onStreamDone((payload) => {
+    const st = useSessionStore.getState()
+    if (!payload?.sessionId || payload.sessionId !== st.currentSessionId) return
+    void (async () => {
+      useSessionStore.setState({ streaming: false, streamingContent: '' })
+      try {
+        const detail = await api.session.get(payload.sessionId!)
+        useSessionStore.setState({ messages: detail.messages, streamError: null })
+      } catch {
+        // 拉取失败：仍清空流式状态，不阻塞
+      }
+      void refreshSessionIndex()
+    })()
+  })
+  const unsubError = api.ai.onStreamError((payload) => {
+    const st = useSessionStore.getState()
+    if (!payload?.sessionId || payload.sessionId !== st.currentSessionId) return
+    useSessionStore.setState((s) => {
+      const partial = s.streamingContent
+      const appended = partial
+        ? [...s.messages, { role: 'assistant' as const, content: partial, timestamp: Date.now() }]
+        : s.messages
+      return {
+        messages: appended,
+        streaming: false,
+        streamingContent: '',
+        // 主动取消（停止）不算错误，不展示红色错误条
+        streamError: payload.cancelled ? null : payload.error,
+      }
+    })
+    void refreshSessionIndex()
+  })
+  return () => {
+    unsubChunk()
+    unsubDone()
+    unsubError()
+  }
+}

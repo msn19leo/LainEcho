@@ -178,6 +178,8 @@ export interface CharacterCard {
 
 /** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式 + 情绪映射 */
 export interface PetCardPayload {
+  /** 角色卡 id（宠物窗用于同步当前角色名的名牌显示） */
+  cardId?: string | null
   /** 绑定的 Live2D 模型 id（null = 使用全局当前模型） */
   modelId: string | null
   /** 模型设置覆盖（表情/待机动作），null = 跟随全局 */
@@ -581,6 +583,8 @@ export interface WindowApi {
   /** 应用级操作（桌宠唤起聊天、托盘、模型同步等） */
   app: {
     openChat: () => void
+    /** 打开聊天窗口，并可指定要进入的会话 id（宠物窗点开时带当前会话） */
+    openChatWithSession: (sessionId: string) => void
     openSettings: () => void
     /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖 + 立绘/渲染模式 + 情绪映射） */
     setPetCard: (payload: PetCardPayload) => void
@@ -593,6 +597,10 @@ export interface WindowApi {
       languageOverride?: TTSLanguage | null,
       payload?: { chunks?: DialogueChunk[] },
     ) => void
+    /** 上报当前会话（聊天窗切会话/新建会话时调用，主进程转发给宠物窗同步内容框；null 表示清空） */
+    notifyCurrentSession: (sessionId: string | null) => void
+    /** 宠物窗内容框高度联动：调整宠物窗总高度（模型区恒定，顶边固定向下生长） */
+    setPetPanelHeight: (panelH: number) => void
   }
   pet: {
     /** 订阅角色卡切换事件（chat 窗口切卡后同步模型/覆盖/立绘到桌宠） */
@@ -620,6 +628,8 @@ export interface WindowApi {
     reportChunkActive: (index: number | null) => void
     /** 订阅"当前朗读合成分段"索引（null 表示清空；聊天窗高亮用），返回取消订阅函数 */
     onChunkActive: (cb: (index: number | null) => void) => () => void
+    /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
+    onCurrentSessionChanged: (cb: (sessionId: string | null) => void) => () => void
   }
   /** 语音合成（TTS）：MiMo 声音克隆 */
   tts: {
@@ -650,6 +660,11 @@ export interface WindowApi {
     get: () => Promise<ModelSettings>
     /** 保存模型设置（部分合并），并广播到桌宠窗口 */
     save: (patch: Partial<ModelSettings>) => Promise<void>
+  }
+  /** 聊天窗口事件（宠物窗点开聊天时进入指定会话） */
+  chat: {
+    /** 订阅"打开聊天窗口并进入指定会话"，聊天窗据此 loadSession；返回取消订阅函数 */
+    onOpenSession: (cb: (sessionId: string) => void) => () => void
   }
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

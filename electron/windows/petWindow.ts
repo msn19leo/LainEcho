@@ -6,7 +6,19 @@ import path from 'path'
 import { loadWindowPage } from './base'
 
 const PET_WIDTH = 300
-const PET_HEIGHT = 440
+/** 模型区基础高度（内容框作为半透明浮层叠加在模型上，不占用布局，模型区恒定）
+ *  窗口总高 = 模型区 + 底部输入框；不随内容框变化 */
+const PET_MODEL_H = 440
+/** 底部输入框固定占高（与渲染层 INPUT_H 一致） */
+const PET_INPUT_H = 40
+/** 窗口目标高度：固定不变 */
+const currentPetHeight = PET_MODEL_H + PET_INPUT_H
+
+/** 当前宠物窗口引用（保留字段） */
+let petWin: BrowserWindow | null = null
+
+/** 历史 IPC：内容框已改为浮层，不再调整窗口高度；保留导出避免破坏调用方 */
+export function setPetPanelHeight(_panelH: number): void {}
 
 /** 应用是否正在退出：退出时允许真正关闭窗口，否则关闭=隐藏（常驻托盘） */
 let quitting = false
@@ -17,7 +29,7 @@ export function markPetWindowQuitting(): void {
 export function createPetWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: PET_WIDTH,
-    height: PET_HEIGHT,
+    height: currentPetHeight,
     x: 200,
     y: 160,
     frame: false,
@@ -45,12 +57,12 @@ export function createPetWindow(): BrowserWindow {
   win.setMenuBarVisibility(false)
 
   // 保险：Windows 上透明无边框窗口在拖动时尺寸可能被 DWM 漂移（即使 resizable:false），
-  // 一旦检测到尺寸变化立即钉回固定尺寸，保证「无论如何拖动都保持不变」。
+  // 一旦检测到尺寸偏离当前目标（宽固定 300、高随面板联动）立即钉回，保证拖动不会让窗口漂移变大。
   win.on('resize', () => {
     if (win.isDestroyed()) return
     const [w, h] = win.getSize()
-    if (w !== PET_WIDTH || h !== PET_HEIGHT) {
-      win.setSize(PET_WIDTH, PET_HEIGHT)
+    if (w !== PET_WIDTH || h !== currentPetHeight) {
+      win.setSize(PET_WIDTH, currentPetHeight)
     }
   })
 
@@ -92,10 +104,15 @@ export function createPetWindow(): BrowserWindow {
   }
   win.on('show', startCursorTracking)
   win.on('hide', stopCursorTracking)
-  win.on('closed', stopCursorTracking)
+  win.on('closed', () => {
+    stopCursorTracking()
+    if (petWin === win) petWin = null
+  })
 
+  petWin = win
   void loadWindowPage(win, 'pet.html')
   return win
 }
 
-export const PET_WINDOW_SIZE = { width: PET_WIDTH, height: PET_HEIGHT }
+/** 窗口基础尺寸（宽度固定；高度随面板联动，见 currentPetHeight） */
+export const PET_WINDOW_SIZE = { width: PET_WIDTH, height: PET_MODEL_H }
