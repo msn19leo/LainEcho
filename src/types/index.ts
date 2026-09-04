@@ -43,8 +43,6 @@ export const CHARACTER_CARD_VERSION = 2
 export interface CharacterTTSOverride {
   /** null = 跟随全局；'zh'/'ja' = 角色强制语言 */
   language: TTSLanguage | null
-  /** null = 跟随全局 */
-  autoPlay: boolean | null
 }
 
 /** 角色级模型设置覆盖：让同一 Live2D 模型在不同角色下有不同表情/待机动作。null 字段表示跟随全局 */
@@ -236,10 +234,10 @@ export type TTSLanguage = 'zh' | 'ja'
 export interface TTSConfig {
   /** 输出语言：中文 / 日文 */
   language: TTSLanguage
-  /** AI 回复完成后是否自动播放语音 */
-  autoPlay: boolean
   /** MiMo 模型名（如 mimo-v2.5-tts-voiceclone） */
   model: string
+  /** 语音是否跟读文本：开启后桌宠"说一个字出一个字"，文本随音频播放逐段 reveal */
+  followText: boolean
 }
 
 /** 记忆体：用户手动维护的全局固定记忆条目 */
@@ -475,6 +473,13 @@ export interface StreamErrorPayload {
   cancelled?: boolean
 }
 
+/** AI 流式用户消息广播（跟随窗口即时补上用户气泡） */
+export interface StreamUserPayload {
+  sessionId: string
+  content: string
+  timestamp: number
+}
+
 /** 桌宠窗口交互（拖动/缩放） */
 export interface WindowState {
   x: number
@@ -495,6 +500,10 @@ export interface WindowApi {
     onStreamChunk: (cb: (chunk: string) => void) => () => void
     onStreamDone: (cb: (payload: StreamDonePayload) => void) => () => void
     onStreamError: (cb: (payload: StreamErrorPayload) => void) => () => void
+    /** 订阅主进程广播的用户消息（跟随窗口即时补上用户气泡，无需等 stream-done 全量拉取） */
+    onStreamUser: (cb: (payload: StreamUserPayload) => void) => () => void
+    /** 订阅"进行中的流"会话 id 补发（窗口重载/就绪后，用于认领漏掉的当前会话；null 表示无流） */
+    onActiveSession: (cb: (sessionId: string | null) => void) => () => void
     /** 取消当前流式请求 */
     cancel: () => void
     testConnection: () => Promise<TestConnectionResult>
@@ -621,15 +630,19 @@ export interface WindowApi {
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
      *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放 */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[] }) => void) => () => void
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean }) => void) => () => void
     /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘） */
     onEmotion: (cb: (emotion: StandardEmotion) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
-    /** 上报当前朗读的合成分段索引（null 表示无朗读/清空高亮；桌宠播放时调用，经主进程转发给聊天窗高亮） */
-    reportChunkActive: (index: number | null) => void
-    /** 订阅"当前朗读合成分段"索引（null 表示清空；聊天窗高亮用），返回取消订阅函数 */
-    onChunkActive: (cb: (index: number | null) => void) => () => void
+    /** 订阅流式开始时的"本轮语音模式"（是否有语音 / 是否跟读），宠物窗提前决定文本展示方式 */
+    onVoiceMode: (cb: (opts: { voiceEnabled: boolean; followText: boolean }) => void) => () => void
+    /** 上报宠物窗"当前已朗读到"的段落文本（段变化时调用），经主进程转发给聊天窗随语音显示 */
+    reportReadingText: (text: string) => void
+    /** 上报语音朗读是否进行中（经主进程转发给聊天窗控制光标显隐） */
+    reportReadingActive: (active: boolean) => void
+    /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
+    reportRendererReady: () => void
     /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
     onCurrentSessionChanged: (cb: (sessionId: string | null) => void) => () => void
   }
@@ -667,6 +680,14 @@ export interface WindowApi {
   chat: {
     /** 订阅"打开聊天窗口并进入指定会话"，聊天窗据此 loadSession；返回取消订阅函数 */
     onOpenSession: (cb: (sessionId: string) => void) => () => void
+    /** 订阅"语音朗读到当前段落文本"（宠物窗朗读时经主进程转发），聊天窗随语音段段显示 */
+    onReadingText: (cb: (text: string) => void) => () => void
+    /** 订阅"语音朗读是否进行中"（控制聊天窗跳动光标显隐） */
+    onReadingActive: (cb: (active: boolean) => void) => () => void
+    /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
+    onVoiceMode: (cb: (opts: { voiceEnabled: boolean; followText: boolean }) => void) => () => void
+    /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
+    reportRendererReady: () => void
   }
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

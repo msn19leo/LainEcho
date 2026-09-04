@@ -15,10 +15,27 @@ class WindowManager {
   settings: BrowserWindow | null = null
   private tray: Tray | null = null
   private allowQuit = false
+  /** 桌宠 renderer 是否已 ready（did-finish-load）。就绪前触发的语音缓存，避免首个回答丢声 */
+  private petSpeakReady = false
+  /** 当前缓存的最新的"本轮语音模式"（未就绪时暂存，就绪后先于首批语音补发） */
+  private pendingVoiceMode: { voiceEnabled: boolean; followText: boolean } | null = null
+  /** 最近一次广播的语音模式（窗口就绪后补发用） */
+  private lastVoiceMode: { voiceEnabled: boolean; followText: boolean } | null = null
+  /** 当前正在进行 AI 流式回复的会话 id（无则 null）。用于窗口重载/新建后就绪时补发，
+   *  让重开/热更的窗口能"认领"进行中的会话，避免漏掉该轮的 stream-user/done 而看起来"生成失败" */
+  private activeStreamingSession: string | null = null
+  private pendingPetSpeaks: Array<{
+    text: string
+    voiceId: string | null
+    languageOverride: TTSLanguage | null
+    chunks?: Array<{ text: string; emotion: StandardEmotion }>
+    follow: boolean
+  }> = []
 
   /** app ready 后调用：创建桌宠窗口 + 托盘 */
   init(): void {
     this.pet = createPetWindow()
+    this.armPetSpeakReady(this.pet)
     this.setupTray()
 
     app.on('before-quit', () => {
@@ -32,6 +49,39 @@ class WindowManager {
     })
   }
 
+  /** 注册桌宠窗口的"语音可用"信号：等 webContents 加载完成后再放行 speak，之前缓存 */
+  private armPetSpeakReady(win: BrowserWindow): void {
+    this.petSpeakReady = false
+    if (!win.isDestroyed() && win.webContents.isLoading()) {
+      win.webContents.once('did-finish-load', () => {
+        this.petSpeakReady = true
+        this.flushPendingPetSpeaks()
+      })
+    } else {
+      this.petSpeakReady = true
+    }
+  }
+
+  /** 桌宠就绪后一次性补发缓存的首批语音与语音模式 */
+  private flushPendingPetSpeaks(): void {
+    if (!this.petSpeakReady) return
+    const win = this.pet
+    if (!win || win.isDestroyed()) {
+      this.pendingPetSpeaks = []
+      this.pendingVoiceMode = null
+      return
+    }
+    if (this.pendingVoiceMode) {
+      win.webContents.send('pet:voice-mode', this.pendingVoiceMode)
+      this.pendingVoiceMode = null
+    }
+    const pending = this.pendingPetSpeaks
+    this.pendingPetSpeaks = []
+    for (const body of pending) {
+      win.webContents.send('pet:speak', body)
+    }
+  }
+
   // ---------------- 桌宠 ----------------
 
   getPetWindow(): BrowserWindow | null {
@@ -41,6 +91,7 @@ class WindowManager {
   showPet(): void {
     if (!this.pet || this.pet.isDestroyed()) {
       this.pet = createPetWindow()
+      this.armPetSpeakReady(this.pet)
       return
     }
     this.pet.show()
@@ -50,6 +101,7 @@ class WindowManager {
   togglePet(): void {
     if (!this.pet || this.pet.isDestroyed()) {
       this.pet = createPetWindow()
+      this.armPetSpeakReady(this.pet)
       return
     }
     if (this.pet.isVisible()) this.pet.hide()
@@ -99,22 +151,28 @@ class WindowManager {
    * 桌宠窗口收到 pet:speak 事件后：调用 TTS 合成 → 播放音频 → 口型同步。
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[] }): void {
-    if (this.pet && !this.pet.isDestroyed()) {
-      this.pet.webContents.send('pet:speak', {
-        text,
-        voiceId,
-        languageOverride: languageOverride ?? null,
-        chunks: payload?.chunks,
-      })
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean }): void {
+    const win = this.pet
+    if (!win || win.isDestroyed()) return
+    const body: {
+      text: string
+      voiceId: string | null
+      languageOverride: TTSLanguage | null
+      chunks?: Array<{ text: string; emotion: StandardEmotion }>
+      follow: boolean
+    } = {
+      text,
+      voiceId,
+      languageOverride: languageOverride ?? null,
+      chunks: payload?.chunks,
+      follow: payload?.follow ?? true,
     }
-  }
-
-  /** 桌宠播放到某合成分段时转发给聊天窗高亮（null 表示清空）（pet → chat 中转） */
-  notifyChunkActive(index: number | null): void {
-    if (this.chat && !this.chat.isDestroyed()) {
-      this.chat.webContents.send('chunk-active', index)
+    // 桌宠 renderer 未就绪（首个回答常发生）→ 先缓存，ready 后补发，避免丢声
+    if (!this.petSpeakReady) {
+      this.pendingPetSpeaks.push(body)
+      return
     }
+    win.webContents.send('pet:speak', body)
   }
 
   /** 把 AI 流式事件同时广播给聊天窗与宠物窗（两侧各自维护会话视图，保持同步） */
@@ -126,10 +184,64 @@ class WindowManager {
     }
   }
 
+  /** 广播"本轮语音是否跟读/是否有语音"（流式开始时下发），供宠物窗与聊天窗提前决定文本展示方式 */
+  notifyVoiceMode(opts: { voiceEnabled: boolean; followText: boolean }): void {
+    // 记录最近一次语音模式：供窗口就绪后（renderer-ready）补发，保证两端都拿到
+    this.lastVoiceMode = opts
+    const win = this.pet
+    if (!win || win.isDestroyed()) return
+    // 桌宠 renderer 未就绪：先缓存最新的语音模式，就绪后随首批语音一起补发
+    if (!this.petSpeakReady) {
+      this.pendingVoiceMode = opts
+      return
+    }
+    win.webContents.send('pet:voice-mode', opts)
+    // 聊天窗同样需要知道本轮语音模式，以便与宠物窗采用一致的分段跟读显示
+    if (this.chat && !this.chat.isDestroyed()) {
+      this.chat.webContents.send('chat:voice-mode', opts)
+    }
+  }
+
+  /** 单个窗口 renderer 就绪后补发最近一次语音模式（只发给出问题的窗口，避免把旧模式广播到其它窗口导致误入待输出） */
+  resendVoiceMode(target: 'pet' | 'chat'): void {
+    if (!this.lastVoiceMode) return
+    const win = target === 'pet' ? this.pet : this.chat
+    if (!win || win.isDestroyed()) return
+    if (target === 'pet') win.webContents.send('pet:voice-mode', this.lastVoiceMode)
+    else win.webContents.send('chat:voice-mode', this.lastVoiceMode)
+  }
+
+  /** 记录当前正在进行 AI 流式回复的会话 id（流式开始置入，结束置 null） */
+  setActiveStreamingSession(sessionId: string | null): void {
+    this.activeStreamingSession = sessionId
+  }
+
+  /** 单个窗口 renderer 就绪后补发"进行中的会话 id"（null 表示当前无流式）。
+   *  重载窗口借此认领进行中的会话，避免漏掉该轮事件；故意只发给指定窗口，不广播干扰其它窗口 */
+  resendActiveSession(target: 'pet' | 'chat'): void {
+    const win = target === 'pet' ? this.pet : this.chat
+    if (!win || win.isDestroyed()) return
+    win.webContents.send('ai:active-session', this.activeStreamingSession)
+  }
+
   /** 聊天窗切会话/新建会话后，把当前会话 id 转发给宠物窗，让内容框跟随同步 */
   notifyCurrentSession(sessionId: string | null): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('session:current', sessionId)
+    }
+  }
+
+  /** 宠物窗朗读到某段文本时转发给聊天窗，让其随语音段段显示（null 表示清空） */
+  notifyReadingText(text: string): void {
+    if (this.chat && !this.chat.isDestroyed()) {
+      this.chat.webContents.send('chat:reading-text', text)
+    }
+  }
+
+  /** 宠物窗朗读是否进行中 → 转发给聊天窗控制跳动光标显隐 */
+  notifyReadingActive(active: boolean): void {
+    if (this.chat && !this.chat.isDestroyed()) {
+      this.chat.webContents.send('chat:reading-active', active)
     }
   }
 

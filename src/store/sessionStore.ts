@@ -182,6 +182,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
  * 返回取消订阅函数。
  */
 export function bindPersistentSessionSync(): () => void {
+  const unsubUser = api.ai.onStreamUser((payload) => {
+    const st = useSessionStore.getState()
+    if (!payload?.sessionId) return
+    // 若当前已持有其它会话，则忽略属于别的新会话的流式事件（避免串台）
+    if (st.currentSessionId && st.currentSessionId !== payload.sessionId) {
+      console.log('[bind] streamUser IGNORE sid=' + payload?.sessionId, 'cur=' + st.currentSessionId)
+      return
+    }
+    // 幂等追加：仅在 messages 末尾还没有这条 user 消息时补上，避免发起方收到自身广播时重复
+    const last = st.messages[st.messages.length - 1]
+    if (last?.role === 'user' && last.content === payload.content) return
+    // 跟随窗口若尚未持有该会话（新会话首条会先广播 stream-user），从事件中即席采纳会话 id，
+    // 让新会话的第一个用户气泡立即同步出现，无需等主进程 session:current 或 stream-done
+    useSessionStore.setState((s) => ({
+      currentSessionId: payload.sessionId,
+      messages: [...s.messages, { role: 'user', content: payload.content, timestamp: payload.timestamp }],
+    }))
+    console.log('[bind] streamUser ADD usr=' + payload.content.slice(0, 12))
+  })
+  const unsubActive = api.ai.onActiveSession((sessionId) => {
+    // 仅认领：本地尚未持有会话、且主进程确实有进行中的流时，才拉取该会话补上漏掉的轮次。
+    // 本地已有会话（无论是否等于该 id）一律忽略，绝不顶掉用户正看的会话。
+    if (!sessionId) return
+    const st = useSessionStore.getState()
+    if (st.currentSessionId) return
+    void useSessionStore.getState().loadSession(sessionId)
+  })
   const unsubChunk = api.ai.onStreamChunk((delta) => {
     const st = useSessionStore.getState()
     if (!st.currentSessionId) return
@@ -197,6 +224,7 @@ export function bindPersistentSessionSync(): () => void {
       try {
         const detail = await api.session.get(payload.sessionId!)
         useSessionStore.setState({ messages: detail.messages, streamError: null })
+        console.log('[bind] DONE setMsg=' + detail.messages.length, 'usr=' + detail.messages.filter((m) => m.role === 'user').length)
       } catch {
         // 拉取失败：仍清空流式状态，不阻塞
       }
@@ -222,6 +250,8 @@ export function bindPersistentSessionSync(): () => void {
     void refreshSessionIndex()
   })
   return () => {
+    unsubUser()
+    unsubActive()
     unsubChunk()
     unsubDone()
     unsubError()

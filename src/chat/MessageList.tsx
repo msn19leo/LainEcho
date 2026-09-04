@@ -16,22 +16,33 @@ import { motion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
+import { useChatReadingStore } from './readingStore'
+import { Typewriter } from '../components/Typewriter'
 import { cn, formatTime, splitSentences } from '../lib/utils'
+import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
 import type { DialogueChunk } from '../types'
 import { popSlideUp, springElastic } from '../lib/motion'
 
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
 const NEAR_BOTTOM_THRESHOLD = 80
+/** 流式逐字速度：固定每字间隔（毫秒） */
+const TYPEWRITER_SPEED = 500
 
-export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
+export function MessageList() {
   const messages = useSessionStore((s) => s.messages)
   const streaming = useSessionStore((s) => s.streaming)
   const streamError = useSessionStore((s) => s.streamError)
   const currentCardName = useCurrentCardName()
+  const followReading = useChatReadingStore((s) => s.followReading)
+  const readingActive = useChatReadingStore((s) => s.readingActive)
+  // 语音朗读中的文本：仅当确有朗读内容（本轮真正在朗读）时才隐藏定型 message，避免新一轮准备期误藏上一轮回答
+  const readingText = useChatReadingStore((s) => s.text)
   const listRef = useRef<HTMLDivElement>(null)
+  /** 内容区外层（观测其实际高度以在打字机/流式增长时自动滚到底） */
+  const contentRef = useRef<HTMLDivElement>(null)
   const nearBottomRef = useRef(true)
 
-  /** 最后一条 AI 消息（当前正在朗读/高亮的目标） */
+  /** 最后一条 AI 消息（用于按需分段展示合成分段，便于阅读） */
   const lastAssistantIndex = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i]?.role === 'assistant') return i
@@ -46,13 +57,22 @@ export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD
   }
 
-  // 新消息 / 流式更新：仅在接近底部时瞬时滚到底（替代每 token 的 smooth，降低渲染开销）
+  // 内容高度增长（含打字机逐字 reveal、流式、跟读追加段）时自动滚到底；
+  // 仅在用户接近底部时跟随，尊重其上翻历史
+  useAutoScrollBottom(listRef, contentRef, nearBottomRef, [messages, streaming, streamError])
+
+  // [diag] 跟踪气泡驱动状态组合，便于定位"用户气泡消失 / 先完整后消失"的时序
   useEffect(() => {
-    const el = listRef.current
-    if (el && nearBottomRef.current) {
-      el.scrollTop = el.scrollHeight
-    }
-  }, [messages, streaming, streamError])
+    const userCount = messages.filter((m) => m.role === 'user').length
+    console.log(
+      '[chatSync] msg=' + messages.length,
+      'usr=' + userCount,
+      'st=' + streaming,
+      'fup=' + followReading,
+      'act=' + readingActive,
+      'rdL=' + readingText.length,
+    )
+  }, [messages, streaming, followReading, readingActive, readingText])
 
   if (messages.length === 0 && !streaming) {
     return (
@@ -80,8 +100,14 @@ export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
   }
 
   return (
-    <div ref={listRef} onScroll={onScroll} className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+    <div ref={listRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-4">
+      {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}
+      <div ref={contentRef} className="space-y-4">
       {messages.map((msg, i) => {
+        // 语音跟读进行中（readingActive，仅在语音真正开始朗读时为真）即隐藏该条定型 AI，
+        // 由跟读气泡接管。无需再要求 readingText>0，否则语音音频尚未备好时定型全文会先露出再"消失"。
+        if (!streaming && readingActive && msg.role === 'assistant' && i === lastAssistantIndex)
+          return null
         const isUser = msg.role === 'user'
         return (
           <motion.div
@@ -108,7 +134,7 @@ export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
                 {isUser ? (
                   msg.content
                 ) : i === lastAssistantIndex ? (
-                  <AssistantSentences content={normalizeParagraphs(msg.content)} chunks={msg.chunks} activeChunk={activeChunk ?? null} />
+                  <AssistantSentences content={normalizeParagraphs(msg.content)} chunks={msg.chunks} />
                 ) : (
                   normalizeParagraphs(msg.content)
                 )}
@@ -118,13 +144,13 @@ export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
         )
       })}
 
-      {streaming && (
+      {streaming || (followReading && readingActive) ? (
         <StreamingBubble
           name={currentCardName || 'AI'}
           listRef={listRef}
           nearBottomRef={nearBottomRef}
         />
-      )}
+      ) : null}
 
       {streamError && !streaming && (
         <div className="flex justify-center">
@@ -134,6 +160,7 @@ export function MessageList({ activeChunk }: { activeChunk?: number | null }) {
           </div>
         </div>
       )}
+      </div>
     </div>
   )
 }
@@ -153,6 +180,11 @@ function StreamingBubble({
   nearBottomRef: RefObject<boolean>
 }) {
   const streamingContent = useSessionStore((s) => s.streamingContent)
+  const streaming = useSessionStore((s) => s.streaming)
+  // 语音跟读文本与模式：跟读时与宠物窗完全一致地显示段落文本
+  const followReading = useChatReadingStore((s) => s.followReading)
+  const readingText = useChatReadingStore((s) => s.text)
+  const readingActive = useChatReadingStore((s) => s.readingActive)
 
   // 流式内容更新时跟随滚动（复用父级列表，仅在接近底部时瞬时滚动）
   useEffect(() => {
@@ -160,16 +192,23 @@ function StreamingBubble({
     if (el && nearBottomRef.current) {
       el.scrollTop = el.scrollHeight
     }
-  }, [streamingContent, listRef, nearBottomRef])
+  }, [streamingContent, readingText, listRef, nearBottomRef])
 
   return (
     <motion.div {...popSlideUp} className="flex justify-start">
       <div className="max-w-[80%] text-left">
         <div className="mb-1 px-1 text-xs text-text-muted">{name}</div>
         <div className="glass selectable rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] px-4 py-2.5 text-sm leading-relaxed text-text">
-          <span className="streaming-cursor whitespace-pre-wrap break-words">
-            {streamingContent}
-          </span>
+          {/* 语音跟读：与宠物窗一致地追加式打字机流式；否则走流式打字机 */}
+          {followReading ? (
+            <span className="whitespace-pre-wrap break-words">
+              {/* 语音跟读轮：仅朗读进行中用朗读文本打字；待输出期显示空+光标，绝不透出上一轮残留文本 */}
+              {readingActive && <Typewriter text={readingText} speed={TYPEWRITER_SPEED} />}
+              {(streaming || readingActive) && <span className="streaming-cursor" />}
+            </span>
+          ) : (
+            <Typewriter text={streamingContent} speed={TYPEWRITER_SPEED} className="whitespace-pre-wrap break-words" />
+          )}
         </div>
       </div>
     </motion.div>
@@ -185,30 +224,29 @@ function normalizeParagraphs(text: string): string {
 }
 
 /**
- * 段级朗读高亮 + 保留空行段落：
- * 以合成分段（dialogue 逐项）为单位渲染，当前朗读段整段高亮；
- * 段与段之间留空行，段内多行用 <br/> 分隔，行内 splitSentences 保证段落换行/标点自然。
+ * 保留段落结构展示：以合成分段（dialogue 逐项）为单位渲染，
+ * 段与段之间留空行，段内多行用 <br/> 分隔（去掉朗读高亮）。
  * 无 chunks 时退化为整段文本（仍保留多行与空行）。
  */
-function AssistantSentences({ content, chunks, activeChunk }: { content: string; chunks?: DialogueChunk[]; activeChunk: number | null }) {
-  const list = chunks && chunks.length > 0 ? chunks.map((c) => c.text) : [content]
-  const ACTIVE_CLS = 'rounded bg-[var(--primary-400)]/20 text-[var(--primary-400)]'
+function AssistantSentences({ content, chunks }: { content: string; chunks?: DialogueChunk[] }) {
+  const list = chunks && chunks.length > 0 ? chunks.map((c) => normalizeParagraphs(c.text)) : [normalizeParagraphs(content)]
   return (
     <>
       {list.map((chunkText, ci) => {
-        const active = ci === activeChunk
         const lines = chunkText.split('\n')
         return (
           <Fragment key={ci}>
             {ci > 0 && <br />}
             {lines.map((line, li) => (
               <Fragment key={li}>
-                {li > 0 && <br />}
-                {splitSentences(line).map((s, i) => (
-                  <span key={i} className={active ? ACTIVE_CLS : undefined}>
-                    {s}
-                  </span>
-                ))}
+                {line.trim() === '' ? null : (
+                  <>
+                    {li > 0 && <br />}
+                    {splitSentences(line).map((s, i) => (
+                      <span key={i}>{s}</span>
+                    ))}
+                  </>
+                )}
               </Fragment>
             ))}
           </Fragment>

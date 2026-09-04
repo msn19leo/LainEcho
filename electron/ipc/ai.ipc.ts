@@ -5,9 +5,10 @@
  * - 流式 token 通过 webContents 事件推送到发起请求的窗口
  */
 import { ipcMain } from 'electron'
-import type { ChatMessage } from '../../src/types'
+import type { ChatMessage, StandardEmotion } from '../../src/types'
 import { sendChatCompletion } from '../services/aiClient'
-import { parseDialogueJson, extractStreamingJsonText } from '../services/emotion'
+import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta } from '../services/emotion'
+import { getTTSConfig } from './tts.ipc'
 import { readApiKey } from '../services/crypto'
 import {
   appendSessionMessages,
@@ -30,6 +31,8 @@ const MAX_CONTEXT_MESSAGES = 16
 const MAX_MEMORIES = 8
 /** 主进程合并 chunk 的 flush 间隔（毫秒）：多个 delta 合并为一次 IPC 推送，减少消息数 */
 const CHUNK_FLUSH_MS = 16
+/** 单个"情绪块"最多合并的 dialogue 项数：超过即提前结算，保持在"边生成边读"的实时性，避免单块越长越延迟出声 */
+const BLOCK_MAX_ITEMS = 3
 
 export function registerAiIpc(): void {
   ipcMain.handle('ai:send-message', async (event, params: { sessionId: string; messages: ChatMessage[] }) => {
@@ -40,6 +43,12 @@ export function registerAiIpc(): void {
     const userMsg: ChatMessage = { role: 'user', content: last?.content ?? '', timestamp: Date.now() }
     let partial = ''
     let cancelled = false
+
+    // 广播本轮的 user 消息，让跟随窗口（非发起方）也能立刻补上用户气泡，
+    // 无需等 stream-done 全量拉取才出现（否则跟随窗口会缺用户消息、且中途消息闪变）
+    windowManager.broadcastAI('ai:stream-user', { sessionId, content: userMsg.content, timestamp: userMsg.timestamp })
+    // 记录"进行中的流"所属会话：窗口重载/新建后就绪时补发用于认领，避免漏该轮事件
+    windowManager.setActiveStreamingSession(sessionId)
 
     // 进入"思考中"：通知桌宠切换到思考立绘
     windowManager.notifyThinking(true)
@@ -80,6 +89,42 @@ export function registerAiIpc(): void {
       const recentMessages = messages.slice(-MAX_CONTEXT_MESSAGES)
       const fullMessages: ChatMessage[] = [systemMessage, ...recentMessages]
 
+      // ---- 语音生成策略（由"是否跟读文本"决定） ----
+      // - 跟读开启（followText=true）：情绪块"边生成边读"，桌宠按音频段随语音逐段显示。
+      // - 跟读关闭（followText=false）：不边生成边读；整段文本流式输出完毕后，统一触发一次语音。
+      const ttsCfg = await getTTSConfig()
+      const followText = ttsCfg.followText
+      // 流式一开始即广播本轮语音模式与技术策略，让宠物窗提前用正确的展示方式（跟读=段级输出，否则流式打字机）
+      windowManager.notifyVoiceMode({ voiceEnabled: !!card?.voiceId, followText })
+      let speechCursor = 0
+      let pendingBlock: { texts: string[]; emotion: StandardEmotion } | null = null
+      /** 是否已通过流式触发过至少一次语音（用于非流式/分块失败的兜底判定） */
+      let speechEmitted = false
+      // 结算当前情绪块并触发桌宠语音（仅当该会话角色卡配置了 voiceId，沿用现有"语音启用"判定）
+      const flushPendingBlock = () => {
+        const b = pendingBlock
+        pendingBlock = null
+        if (!b || b.texts.length === 0 || !card?.voiceId) return
+        speechEmitted = true
+        const text = b.texts.join('\n')
+        const langOverride = card.ttsOverride?.language ?? null
+        windowManager.speak(text, card.voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: followText })
+      }
+      // 流式 onChunk 中实时结算：新 dialogue 项并入当前块，情绪变化或块足够大即结算旧块，保持"边生成边读"
+      const pumpSpeech = () => {
+        const { items, cursor } = extractDialogueChunkDelta(partial, speechCursor)
+        speechCursor = cursor
+        for (const it of items) {
+          if (!pendingBlock) { pendingBlock = { texts: [it.text], emotion: it.emotion }; continue }
+          if (it.emotion !== pendingBlock.emotion || pendingBlock.texts.length >= BLOCK_MAX_ITEMS) {
+            flushPendingBlock()
+            pendingBlock = { texts: [it.text], emotion: it.emotion }
+          } else {
+            pendingBlock.texts.push(it.text)
+          }
+        }
+      }
+
       const content = await sendChatCompletion(fullMessages, {
         model: settings.model,
         baseURL: settings.baseURL,
@@ -91,6 +136,8 @@ export function registerAiIpc(): void {
         onChunk: (chunk) => {
           partial += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
+          // 仅跟读开启时才边生成边读；关闭跟读时不做逐段语音（留到整段生成完统一播）
+          if (followText) pumpSpeech()
         },
       })
 
@@ -100,6 +147,17 @@ export function registerAiIpc(): void {
         chunkTimer = null
       }
       flushChunks()
+      // 结算最后一个未闭合的情绪块（仅跟读时"边生成边读"才有未闭块；关闭跟读时无块）
+      if (followText) flushPendingBlock()
+      // 未触发"边生成边读"时（跟读关闭 / 非流式 / 分块一直未触发）：
+      // 兜底在整段文本生成完毕后，一次性按 dialogue 块触发语音（满足"等语音生成完再输出语音"）。
+      if (!speechEmitted && card?.voiceId) {
+        const parsedChunks = parseDialogueJson(content).chunks
+        const langOverride = card.ttsOverride?.language ?? null
+        for (const c of parsedChunks) {
+          windowManager.speak(c.text, card.voiceId, langOverride, { chunks: [c], follow: followText })
+        }
+      }
 
       // 持久化：user 消息 + assistant 完整回复（解析 JSON dialogue，落盘句子/情绪段供句级同步与联动）
       const now = Date.now()
@@ -110,13 +168,11 @@ export function registerAiIpc(): void {
       await appendSessionMessages(sessionId, [userMsg, asstMsg])
 
       windowManager.broadcastAI('ai:stream-done', { sessionId, message: asstMsg })
-      // 广播归一化情绪到桌宠窗口，驱动形象层切表情/切立绘
-      windowManager.notifyEmotion(emotion)
-      // 直接触发桌宠语音（不依赖聊天窗）：按会话角色卡的参考音频/语言覆盖合成播放
-      if (card?.voiceId) {
-        const langOverride = card.ttsOverride?.language ?? null
-        windowManager.speak(asstMsg.content, card.voiceId, langOverride, { chunks: asstMsg.chunks })
-      }
+      // 立绘/表情驱动策略：
+      // - 有语音（voiceId）：立绘由语音块驱动（宠物窗 playLoop 逐块 setEmotion），此处不广播情绪，
+      //   避免"文本输出时切一次、语音输出时又切一次"的重叠切换。
+      // - 无语音：立绘由文本输出驱动，此处广播归一化情绪。
+      if (!card?.voiceId) windowManager.notifyEmotion(emotion)
       return asstMsg
     } catch (err) {
       cancelled = abort.signal.aborted
@@ -142,6 +198,8 @@ export function registerAiIpc(): void {
       throw err
     } finally {
       if (currentAbort === abort) currentAbort = null
+      // 流式结束/出错/取消：清除"进行中的流"标记，避免窗口在之后才就绪时误认领已结束的会话
+      windowManager.setActiveStreamingSession(null)
       // 退出"思考中"：无论成功/出错/取消都复位（情绪事件已在成功路径驱动形象）
       windowManager.notifyThinking(false)
     }

@@ -206,7 +206,7 @@ function decodeJsonString(raw: string): string {
 }
 
 /**
- * 解析结构化 JSON dialogue 输出（Shinsekai 式，prompt 强制契约）。
+ * 解析结构化 JSON dialogue 输出（prompt 强制契约）。
  * 每个元素是一个台词节拍 { text, emotion }，按元素顺序拼接成段落文本，
  * 并把每项的 emotion 落到其首句的句子索引上生成 emotionSegments（相邻相同合并）。
  *
@@ -240,7 +240,19 @@ export function parseDialogueJson(content: string): {
   const items = dialogue.filter((it) => typeof it?.text === 'string' && it.text.trim() !== '')
 
   if (items.length === 0) {
-    // 结构化解析失败：回退旧式标签解析（历史消息兼容），否则整段 neutral
+    // 结构化解析失败（如 dialogue JSON 未完整闭合 / 被截断 / 降级输出）。
+    // 先尽力从原始输出中提取各 "text" 台词值，避免把整段原始 JSON 外露成文本、或拿去朗读。
+    const prose = extractStreamingJsonText(content)
+    if (prose && prose !== content) {
+      return {
+        text: prose,
+        emotion: DEFAULT_EMOTION,
+        sentences: splitSentences(prose),
+        emotionSegments: [{ startSentence: 0, emotion: DEFAULT_EMOTION }],
+        chunks: [{ text: prose, emotion: DEFAULT_EMOTION }],
+      }
+    }
+    // 回退旧式标签解析（历史消息兼容），否则整段 neutral
     try {
       const fallback = extractEmotion(content)
       return { ...fallback, chunks: [{ text: fallback.text, emotion: fallback.emotion }] }
@@ -273,6 +285,75 @@ export function parseDialogueJson(content: string): {
   const emotion = normalizeEmotion(items[items.length - 1]?.emotion ?? '')
 
   return { text, emotion, sentences, emotionSegments, chunks }
+}
+
+/**
+ * 流式"情绪块"已闭合项增量提取：从 fromCursor 之后提取所有**已完整闭合**的 dialogue 项
+ * （`{ "text":..., "emotion":... }`，text 非空），供主进程在流式 onChunk 中逐块实时触发语音。
+ *
+ * - 只处理以 `"text"` 或 `"emotion"` 开头的扁平对象（对话项），自动跳过根对象 `{"dialogue":...}`
+ *   及其它非对话对象，使 cursor 落在 dialogue 数组内部逐个推进。
+ * - 遇未闭合/非法对象时立即停止（等更多 token），cursor 停在原地以便下一次用更长文本重试。
+ * - cursor 语义：已消费的 partial 字符索引（与分析用的 partial 字符串保持一致）。
+ */
+export function extractDialogueChunkDelta(partial: string, fromCursor: number): { items: Array<{ text: string; emotion: StandardEmotion }>; cursor: number } {
+  const items: Array<{ text: string; emotion: StandardEmotion }> = []
+  let cursor = fromCursor
+  while (true) {
+    const open = partial.indexOf('{', cursor)
+    if (open === -1) break
+    const afterBrace = partial.slice(open + 1).replace(/^\s*/, '')
+    const isDialogueItem = afterBrace.startsWith('"text"') || afterBrace.startsWith('"emotion"')
+    if (!isDialogueItem) {
+      // 根对象 {"dialogue":[...]}：跳进其数组内部（定位 '[' 之后），而非跳过整根——
+      // 否则会把整段都跳过，永远扫不到内层对话项，导致流式语音块不触发。
+      if (afterBrace.startsWith('"dialogue"')) {
+        const arr = partial.indexOf('[', open)
+        if (arr === -1) break
+        cursor = arr + 1
+        continue
+      }
+      // 其它非对话对象（可能的额外包裹层）：跳过其闭合
+      const cl = findObjectEnd(partial, open)
+      if (cl === -1) break
+      cursor = cl + 1
+      continue
+    }
+    const close = findObjectEnd(partial, open)
+    if (close === -1) break // 该项未闭合，等待更多
+    const raw = partial.slice(open, close + 1)
+    try {
+      const obj = JSON.parse(raw) as { text?: string; emotion?: string }
+      const text = obj?.text?.trim()
+      if (text) items.push({ text, emotion: normalizeEmotion(obj?.emotion ?? '') })
+      cursor = close + 1
+    } catch {
+      break // 非法/不完整：停在 open，待更长文本重试
+    }
+  }
+  return { items, cursor }
+}
+
+/**
+ * 从 open（'"{' 索引）起找出与之配对的 '}' 索引。
+ * 跳过字符串值（含转义引号）内的 {} 与引号，避免被台词文本中的花括号干扰。
+ * 找不到则返回 -1（表示未闭合，等待更多 token）。
+ */
+function findObjectEnd(s: string, open: number): number {
+  let inStr = false
+  let depth = 0
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i]
+    if (inStr) {
+      if (ch === '\\') { i++; continue }
+      if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') { inStr = true; continue }
+    if (ch === '{') depth++
+    else if (ch === '}') { depth--; if (depth === 0) return i }
+  }
+  return -1
 }
 
 /**

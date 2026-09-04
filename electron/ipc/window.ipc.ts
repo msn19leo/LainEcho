@@ -102,14 +102,34 @@ export function registerWindowIpc(): void {
     windowManager.speak(text, voiceId, languageOverride, payload)
   })
 
-  /** 桌宠上报当前朗读合成分段（null 表示清空高亮）→ 转发给聊天窗高亮 */
-  ipcMain.on('chunk-active', (_e, index: number | null) => {
-    windowManager.notifyChunkActive(index)
-  })
-
   /** 聊天窗上报当前会话 → 转发给宠物窗（内容框跟随同步） */
   ipcMain.on('session:current', (_e, sessionId: string | null) => {
     windowManager.notifyCurrentSession(sessionId)
+  })
+
+  /** 宠物窗朗读到某段文本 → 转发给聊天窗随语音显示 */
+  ipcMain.on('pet:reading-text', (_e, text: string) => {
+    const t = typeof text === 'string' ? text : ''
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[diag] pet->chat reading-text len=', t.length, t.length ? JSON.stringify(t.slice(0, 24)) : '')
+    }
+    windowManager.notifyReadingText(t)
+  })
+
+  /** 宠物窗朗读是否进行中 → 转发给聊天窗控制光标 */
+  ipcMain.on('pet:reading-active', (_e, active: boolean) => {
+    if (process.env.NODE_ENV !== 'production') console.log('[diag] pet->chat reading-active=', active)
+    windowManager.notifyReadingActive(active === true)
+  })
+
+  /** 宠物窗/聊天窗 renderer 就绪 → 补发最近一次语音模式 + 进行中的会话 id（避免广播早于订阅而丢失） */
+  ipcMain.on('pet:renderer-ready', () => {
+    windowManager.resendVoiceMode('pet')
+    windowManager.resendActiveSession('pet')
+  })
+  ipcMain.on('chat:renderer-ready', () => {
+    windowManager.resendVoiceMode('chat')
+    windowManager.resendActiveSession('chat')
   })
 
   /** 宠物窗内容框高度变化 → 调整宠物窗总高度（模型区恒定，顶边固定向下生长） */

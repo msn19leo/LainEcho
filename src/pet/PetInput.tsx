@@ -6,7 +6,12 @@ import { useEffect, useRef, useState } from 'react'
 import { Send, Square } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
 
-export function PetInput() {
+interface PetInputProps {
+  /** 本窗口用户发送消息时回调（用于展开内容框；仅本窗口发送才展开，聊天窗发送不展开） */
+  onUserSend?: () => void
+}
+
+export function PetInput({ onUserSend }: PetInputProps) {
   const streaming = useSessionStore((s) => s.streaming)
   const send = useSessionStore((s) => s.send)
   const stop = useSessionStore((s) => s.stop)
@@ -22,6 +27,7 @@ export function PetInput() {
     if (!text || streaming) return
     setValue('')
     if (taRef.current) taRef.current.style.height = 'auto'
+    onUserSend?.()
     void send(text)
   }
 

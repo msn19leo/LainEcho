@@ -6,7 +6,7 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { StreamDonePayload, StreamErrorPayload, ModelSettings, WindowApi } from '../src/types'
+import type { StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
@@ -25,6 +25,16 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, payload: StreamErrorPayload) => cb(payload)
       ipcRenderer.on('ai:stream-error', listener)
       return () => ipcRenderer.removeListener('ai:stream-error', listener)
+    },
+    onStreamUser: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: StreamUserPayload) => cb(payload)
+      ipcRenderer.on('ai:stream-user', listener)
+      return () => ipcRenderer.removeListener('ai:stream-user', listener)
+    },
+    onActiveSession: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, sessionId: string | null) => cb(sessionId)
+      ipcRenderer.on('ai:active-session', listener)
+      return () => ipcRenderer.removeListener('ai:active-session', listener)
     },
     cancel: () => ipcRenderer.send('ai:cancel'),
     testConnection: () => ipcRenderer.invoke('ai:test-connection'),
@@ -126,6 +136,26 @@ const api: WindowApi = {
       ipcRenderer.on('chat:open-session', listener)
       return () => ipcRenderer.removeListener('chat:open-session', listener)
     },
+    /** renderer 就绪通知（用于向主进程补发最近语音模式） */
+    reportRendererReady: () => ipcRenderer.send('chat:renderer-ready'),
+    /** 订阅"语音朗读到当前段落文本"（宠物窗朗读时经主进程转发），聊天窗随语音段段显示 */
+    onReadingText: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, text: string) => cb(text)
+      ipcRenderer.on('chat:reading-text', listener)
+      return () => ipcRenderer.removeListener('chat:reading-text', listener)
+    },
+    /** 订阅"语音朗读是否进行中"（控制聊天窗跳动光标的显隐） */
+    onReadingActive: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, active: boolean) => cb(active)
+      ipcRenderer.on('chat:reading-active', listener)
+      return () => ipcRenderer.removeListener('chat:reading-active', listener)
+    },
+    /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
+    onVoiceMode: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean; followText: boolean }) => cb(opts)
+      ipcRenderer.on('chat:voice-mode', listener)
+      return () => ipcRenderer.removeListener('chat:voice-mode', listener)
+    },
   },
   pet: {
     onCardChanged: (cb) => {
@@ -156,10 +186,16 @@ const api: WindowApi = {
     },
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[] }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
+    /** renderer 就绪通知（用于向主进程补发最近语音模式） */
+    reportRendererReady: () => ipcRenderer.send('pet:renderer-ready'),
+    /** 上报宠物窗"当前已朗读到"的段落文本（段变化时调用），经主进程转发给聊天窗随语音显示 */
+    reportReadingText: (text: string) => ipcRenderer.send('pet:reading-text', text),
+    /** 上报语音朗读是否进行中（经主进程转发给聊天窗控制跳动光标显隐） */
+    reportReadingActive: (active: boolean) => ipcRenderer.send('pet:reading-active', active),
     /** 订阅 AI 回复情绪事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
     onEmotion: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, emotion: import('../src/types').StandardEmotion) => cb(emotion)
@@ -172,13 +208,11 @@ const api: WindowApi = {
       ipcRenderer.on('pet:thinking', listener)
       return () => ipcRenderer.removeListener('pet:thinking', listener)
     },
-    /** 上报当前朗读的合成分段索引（null 表示清空高亮；桌宠播放时调用，经主进程转发给聊天窗高亮） */
-    reportChunkActive: (index) => ipcRenderer.send('chunk-active', index),
-    /** 订阅"当前朗读合成分段"索引（null 表示清空；聊天窗高亮用） */
-    onChunkActive: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, index: number | null) => cb(index)
-      ipcRenderer.on('chunk-active', listener)
-      return () => ipcRenderer.removeListener('chunk-active', listener)
+    /** 订阅流式开始时的"本轮语音模式"（是否有语音 / 是否跟读），提前决定文本展示 */
+    onVoiceMode: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean; followText: boolean }) => cb(opts)
+      ipcRenderer.on('pet:voice-mode', listener)
+      return () => ipcRenderer.removeListener('pet:voice-mode', listener)
     },
     /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
     onCurrentSessionChanged: (cb) => {

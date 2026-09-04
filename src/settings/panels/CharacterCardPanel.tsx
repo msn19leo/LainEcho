@@ -100,7 +100,6 @@ interface EditorState {
   voiceId: string
   // TTS 覆盖
   ttsLanguageOverride: 'global' | TTSLanguage
-  ttsAutoPlayOverride: 'global' | boolean
   // 模型覆盖
   expressionOverride: 'global' | string
   idleAnimationOverride: 'global' | string
@@ -124,7 +123,6 @@ const EMPTY_EDITOR: EditorState = {
   modelId: '',
   voiceId: '',
   ttsLanguageOverride: 'global',
-  ttsAutoPlayOverride: 'global',
   expressionOverride: 'global',
   idleAnimationOverride: 'global',
   renderMode: 'global',
@@ -207,17 +205,11 @@ function ttsLanguageToEditor(v: CharacterTTSOverride | null): 'global' | TTSLang
   return v?.language ?? 'global'
 }
 
-function ttsAutoPlayToEditor(v: CharacterTTSOverride | null): 'global' | boolean {
-  if (v?.autoPlay === null) return 'global'
-  return v?.autoPlay ?? 'global'
-}
-
 /** 将编辑器选择值转为 CharacterTTSOverride */
-function editorToTtsOverride(language: 'global' | TTSLanguage, autoPlay: 'global' | boolean): CharacterTTSOverride | null {
+function editorToTtsOverride(language: 'global' | TTSLanguage): CharacterTTSOverride | null {
   const lang = language === 'global' ? null : language
-  const play = autoPlay === 'global' ? null : autoPlay
-  if (lang === null && play === null) return null
-  return { language: lang, autoPlay: play }
+  if (lang === null) return null
+  return { language: lang }
 }
 
 /** 将 CharacterModelOverride 转为编辑器选择值 */
@@ -340,7 +332,6 @@ export function CharacterCardPanel() {
       modelId: card.modelId ?? '',
       voiceId: card.voiceId ?? '',
       ttsLanguageOverride: ttsLanguageToEditor(card.ttsOverride),
-      ttsAutoPlayOverride: ttsAutoPlayToEditor(card.ttsOverride),
       expressionOverride: expressionToEditor(card.modelOverride),
       idleAnimationOverride: idleAnimToEditor(card.modelOverride),
       renderMode: card.renderMode ?? 'global',
@@ -362,7 +353,7 @@ export function CharacterCardPanel() {
         messageExample: editor.messageExample,
         modelId: editor.modelId || null,
         voiceId: editor.voiceId || null,
-        ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride, editor.ttsAutoPlayOverride),
+        ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride),
         modelOverride: editorToModelOverride(editor.expressionOverride, editor.idleAnimationOverride),
         renderMode: editor.renderMode === 'global' ? null : editor.renderMode,
         spriteId: editor.spriteId || null,
@@ -978,25 +969,6 @@ export function CharacterCardPanel() {
                     <option value="zh">强制中文</option>
                     <option value="ja">强制日文</option>
                   </Select>
-                </Field>
-                <Field label="自动播放覆盖（ttsOverride.autoPlay）" hint="角色级自动播放覆盖。跟随全局 = 用全局设置">
-                  <div className="flex items-center gap-3">
-                    <Select
-                      value={editor.ttsAutoPlayOverride === 'global' ? 'global' : String(editor.ttsAutoPlayOverride)}
-                      onChange={(e) => {
-                        const v = e.target.value
-                        setEditor({
-                          ...editor,
-                          ttsAutoPlayOverride: v === 'global' ? 'global' : v === 'true',
-                        })
-                      }}
-                      disabled={!editor.voiceId}
-                    >
-                      <option value="global">跟随全局</option>
-                      <option value="true">强制开启</option>
-                      <option value="false">强制关闭</option>
-                    </Select>
-                  </div>
                 </Field>
                 {!editor.voiceId && (
                   <p className="text-xs text-text-muted">

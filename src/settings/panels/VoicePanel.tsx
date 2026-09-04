@@ -33,7 +33,7 @@ export function VoicePanel() {
         api.tts.getConfig(),
         api.tts.listReferences(),
       ])
-      setConfig({ language: cfg.language, autoPlay: cfg.autoPlay, model: cfg.model })
+      setConfig({ language: cfg.language, model: cfg.model, followText: cfg.followText })
       setHasApiKey(cfg.hasApiKey)
       setVoices(voiceList)
     } catch (err) {
@@ -235,12 +235,12 @@ export function VoicePanel() {
 
           <div className="flex items-center justify-between">
             <div>
-              <span className="text-[13px] font-medium text-text-2">自动播放</span>
-              <p className="mt-0.5 text-xs text-text-muted">AI 回复完成后自动合成并播放语音</p>
+              <span className="text-[13px] font-medium text-text-2">跟读文本</span>
+              <p className="mt-0.5 text-xs text-text-muted">开启后"说一段出一段"，文本随语音播放逐段显示</p>
             </div>
             <Switch
-              checked={config.autoPlay}
-              onChange={(checked) => void handleSaveConfig({ autoPlay: checked })}
+              checked={config.followText}
+              onChange={(checked) => void handleSaveConfig({ followText: checked })}
             />
           </div>
         </div>

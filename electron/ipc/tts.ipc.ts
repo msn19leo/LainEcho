@@ -19,8 +19,8 @@ import { synthesizeWithMiMo, bufferToBase64 } from '../services/ttsClient'
 /** 默认 TTS 配置 */
 const DEFAULT_TTS_CONFIG: TTSConfig = {
   language: 'zh',
-  autoPlay: true,
   model: '',
+  followText: true,
 }
 
 /** 默认参考音频列表（空数组） */
@@ -68,8 +68,8 @@ function parseWavDuration(buf: Buffer): number | null {
   }
 }
 
-/** 读取 TTS 配置 */
-async function getTTSConfig(): Promise<TTSConfig> {
+/** 读取 TTS 配置（供 ai.ipc 读取跟读等状态） */
+export async function getTTSConfig(): Promise<TTSConfig> {
   return readJson<TTSConfig>(paths.voiceSettingsFile, DEFAULT_TTS_CONFIG)
 }
 
