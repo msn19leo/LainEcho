@@ -5,9 +5,11 @@
  * - 流式 token 通过 webContents 事件推送到发起请求的窗口
  */
 import { ipcMain } from 'electron'
-import type { ChatMessage, StandardEmotion } from '../../src/types'
+import type { AppSettings, ChatMessage, StandardEmotion } from '../../src/types'
 import { sendChatCompletion } from '../services/aiClient'
 import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta } from '../services/emotion'
+import { buildModelContext, forceCompact, SUMMARY_MAX_TOKENS, toModelMessage } from '../services/context'
+import { estimateMessagesTokens } from '../services/token'
 import { getTTSConfig } from './tts.ipc'
 import { readApiKey } from '../services/crypto'
 import {
@@ -17,6 +19,7 @@ import {
   getSession,
   getSettings,
   listMemories,
+  updateSessionSummary,
 } from '../services/repository'
 import { windowManager } from '../windows/windowManager'
 
@@ -24,11 +27,43 @@ let currentAbort: AbortController | null = null
 
 /**
  * 上下文收窄（降低首 token / 逐 token 延迟）：
- * - MAX_CONTEXT_MESSAGES：只发送最近 N 条历史消息，更早的截断，避免请求体随对话无限膨胀。
+ * - 上下文管理改由 services/context.ts 统一负责（A1 Token 预算装填 + A2 自动摘要压缩），
+ *   此处不再按固定条数截断。
  * - MAX_MEMORIES：只注入最近 N 条记忆体，防止 system prompt 过长拖慢生成。
  */
-const MAX_CONTEXT_MESSAGES = 16
 const MAX_MEMORIES = 8
+/** 摘要压缩专用 system prompt：独立上下文，绝不混入主对话的 EMOTION_PROMPT JSON 约束 */
+const SUMMARY_SYSTEM_PROMPT =
+  '你是一个专业的对话总结助手。将用户与角色之间的对话历史压缩成简洁准确的总结，' +
+  '保留关键信息、人物关系进展、重要约定与当前话题，忽略无关细节。' +
+  '直接输出总结文本本身，不要输出 JSON、不要加任何解释或格式标记。'
+
+/**
+ * 构造摘要回调：把旧历史文本交给模型（独立 prompt、非流式）压成摘要文本。
+ * 与主对话隔离：绝不混入 EMOTION_PROMPT 的 JSON 输出约束。失败时 throw。
+ */
+function createSummarizer(settings: AppSettings, apiKey: string, signal?: AbortSignal) {
+  return async (olderText: string): Promise<string> => {
+    const summary = await sendChatCompletion(
+      [
+        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+        { role: 'user', content: `以下是对话历史：\n${olderText}\n\n请输出总结：` },
+      ],
+      {
+        model: settings.model,
+        baseURL: settings.baseURL,
+        apiKey,
+        temperature: 0.3,
+        stream: false,
+        maxTokensOverride: SUMMARY_MAX_TOKENS,
+        signal,
+      },
+    )
+    const trimmed = (summary ?? '').trim()
+    if (!trimmed) throw new Error('摘要为空')
+    return trimmed
+  }
+}
 /** 主进程合并 chunk 的 flush 间隔（毫秒）：多个 delta 合并为一次 IPC 推送，减少消息数 */
 const CHUNK_FLUSH_MS = 16
 /** 单个"情绪块"最多合并的 dialogue 项数：超过即提前结算，保持在"边生成边读"的实时性，避免单块越长越延迟出声 */
@@ -85,9 +120,41 @@ export function registerAiIpc(): void {
         role: 'system',
         content: buildSystemPrompt(card, memories),
       }
-      // 截断历史：仅保留最近 MAX_CONTEXT_MESSAGES 条（含当前用户消息），降低 TTFT
-      const recentMessages = messages.slice(-MAX_CONTEXT_MESSAGES)
-      const fullMessages: ChatMessage[] = [systemMessage, ...recentMessages]
+
+      // A1+A2 上下文组装：净化消息 → 按 Token 预算装填（A1）；总 token 超阈值时，
+      // 旧历史交给独立请求生成摘要并落盘复用（A2）。摘要走独立 prompt，不污染主对话的 JSON 输出约束。
+      const summarize = createSummarizer(settings, apiKey, abort.signal)
+      const modelMessages = messages.map(toModelMessage)
+      const ctx = await buildModelContext({
+        systemMessage,
+        messages: modelMessages,
+        contextWindowTokens: settings.contextWindowTokens,
+        enableAutoCompact: settings.enableAutoCompact,
+        summarize,
+      })
+      const fullMessages = ctx.messages
+      // 摘要落盘复用（失败静默，不影响本轮请求）
+      if (ctx.newSummary) {
+        await updateSessionSummary(sessionId, ctx.newSummary).catch(() => {})
+      }
+      // 上下文 token 用量日志（后续可上 UI 展示）
+      console.log(
+        '[context] system=%d history=%d total=%d (msgs %d->%d, compact=%s)',
+        estimateMessagesTokens([systemMessage]),
+        estimateMessagesTokens(modelMessages),
+        estimateMessagesTokens(fullMessages),
+        modelMessages.length,
+        fullMessages.length - 1,
+        ctx.newSummary ? 'yes' : 'no',
+      )
+      // 广播上下文 token 用量给桌宠窗显示（会话收放按钮旁）
+      windowManager.broadcastAI('ai:context-stats', {
+        sessionId,
+        system: estimateMessagesTokens([systemMessage]),
+        history: estimateMessagesTokens(modelMessages),
+        total: estimateMessagesTokens(fullMessages),
+        window: settings.contextWindowTokens,
+      })
 
       // ---- 语音生成策略（由"是否跟读文本"决定） ----
       // - 跟读开启（followText=true）：情绪块"边生成边读"，桌宠按音频段随语音逐段显示。
@@ -207,6 +274,92 @@ export function registerAiIpc(): void {
 
   ipcMain.on('ai:cancel', () => {
     currentAbort?.abort()
+  })
+
+  /**
+   * 只读查询会话上下文 token 用量（不触发摘要、不发消息）。
+   * 供桌宠窗切换到已有内容的会话时展示用量并激活手动压缩按钮；
+   * 采用 A1 预算装填口径估算「实际会发送的上下文」，enableAutoCompact=false 保证无副作用。
+   */
+  ipcMain.handle('ai:get-context-stats', async (_event, params: { sessionId: string }) => {
+    try {
+      const { sessionId } = params ?? {}
+      if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
+      const settings = await getSettings()
+      const session = await getSession(sessionId)
+      const card = await getCharacterCard(session.characterCardId)
+      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
+      const systemMessage: ChatMessage = { role: 'system', content: buildSystemPrompt(card, memories) }
+      const modelMessages = session.messages.map(toModelMessage)
+      // 只读预览：关闭自动摘要，仅按 Token 预算装填估算实际发送的上下文（summarize 不会被调用）
+      const ctx = await buildModelContext({
+        systemMessage,
+        messages: modelMessages,
+        contextWindowTokens: settings.contextWindowTokens,
+        enableAutoCompact: false,
+        summarize: async () => {
+          throw new Error('预览模式不应触发摘要')
+        },
+      })
+      const stats = {
+        sessionId,
+        system: estimateMessagesTokens([systemMessage]),
+        history: estimateMessagesTokens(modelMessages),
+        total: estimateMessagesTokens(ctx.messages),
+        window: settings.contextWindowTokens,
+      }
+      return { ok: true, stats }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false, error: message }
+    }
+  })
+
+  /**
+   * 手动压缩当前会话历史：把「最近 20 条之外」的旧历史交给模型生成摘要并落盘复用，
+   * 返回最新上下文用量。失败返回 { ok:false, error } 由桌宠窗提示，不抛异常。
+   */
+  ipcMain.handle('ai:compact-now', async (_event, params: { sessionId: string }) => {
+    try {
+      const { sessionId } = params ?? {}
+      if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
+      const settings = await getSettings()
+      const apiKey = await readApiKey()
+      if (!apiKey) throw new Error('未配置 API Key')
+      if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
+      if (!settings.model.trim()) throw new Error('未配置模型名（model）')
+
+      const session = await getSession(sessionId)
+      const card = await getCharacterCard(session.characterCardId)
+      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
+      const systemMessage: ChatMessage = { role: 'system', content: buildSystemPrompt(card, memories) }
+      const modelMessages = session.messages.map(toModelMessage)
+
+      const result = await forceCompact({
+        systemMessage,
+        messages: modelMessages,
+        summarize: createSummarizer(settings, apiKey),
+      })
+      if (result.newSummary) {
+        await updateSessionSummary(sessionId, result.newSummary)
+      }
+
+      const stats = {
+        sessionId,
+        system: estimateMessagesTokens([systemMessage]),
+        history: estimateMessagesTokens(modelMessages),
+        total: estimateMessagesTokens(result.messages),
+        window: settings.contextWindowTokens,
+      }
+      // 广播最新用量给桌宠窗（与自动组装后的广播一致，手动压缩后立即刷新显示）
+      windowManager.broadcastAI('ai:context-stats', stats)
+      console.log('[context] 手动压缩完成 compact=%s', result.newSummary ? 'yes' : 'no')
+      return { ok: true, compacted: !!result.newSummary, stats }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.warn('[context] 手动压缩失败：', message)
+      return { ok: false, error: message }
+    }
   })
 
   ipcMain.handle('ai:test-connection', async () => {

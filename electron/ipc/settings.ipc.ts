@@ -6,6 +6,7 @@ import type { AppSettings } from '../../src/types'
 import { hasApiKey, saveApiKey } from '../services/crypto'
 import { getSettings, saveSettings } from '../services/repository'
 import { getDataDirInfo, migrateDataDir, resetDataDir } from '../services/storage'
+import { windowManager } from '../windows/windowManager'
 
 export function registerSettingsIpc(): void {
   ipcMain.handle('settings:get', async () => {
@@ -14,7 +15,12 @@ export function registerSettingsIpc(): void {
     return { ...settings, hasApiKey: keyPresent }
   })
 
-  ipcMain.handle('settings:save', (_e, patch: Partial<AppSettings>) => saveSettings(patch))
+  ipcMain.handle('settings:save', async (_e, patch: Partial<AppSettings>) => {
+    const result = await saveSettings(patch)
+    // 设置变更广播给桌宠窗：同步「模型上下文窗口」等展示字段（如 token 用量显示里的窗口值）
+    windowManager.broadcastAI('settings:changed', result)
+    return result
+  })
 
   ipcMain.handle('settings:save-api-key', (_e, key: string) => saveApiKey(key))
 

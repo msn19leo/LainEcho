@@ -10,6 +10,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxTokens: 1024,
   stream: true,
   theme: 'dark',
+  contextWindowTokens: 32768,
+  enableAutoCompact: true,
 }
 
 interface SettingsState {
@@ -39,6 +41,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           maxTokens: data.maxTokens,
           stream: data.stream,
           theme: data.theme,
+          contextWindowTokens: data.contextWindowTokens,
+          enableAutoCompact: data.enableAutoCompact,
         },
         hasApiKey: data.hasApiKey,
         loaded: true,

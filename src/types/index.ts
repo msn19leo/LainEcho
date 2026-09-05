@@ -276,6 +276,10 @@ export interface AppSettings {
   maxTokens: number
   stream: boolean
   theme: ThemeMode
+  /** 模型上下文窗口 token 数（A1 预算装填 / A2 摘要触发的基准；0 = 不限制、保持旧行为） */
+  contextWindowTokens: number
+  /** 是否启用自动摘要压缩（A2：旧历史超阈值时交给 LLM 生成摘要） */
+  enableAutoCompact: boolean
 }
 
 /** Live2D 模型元信息（models/index.json） */
@@ -459,6 +463,19 @@ export interface TestConnectionResult {
   data?: string
 }
 
+/** 上下文 token 用量（主进程每次 AI 组装 / 手动压缩后广播，供桌宠窗显示） */
+export interface ContextStats {
+  sessionId: string
+  /** system prompt 占用 token */
+  system: number
+  /** 会话历史 token（净化后原始消息总量，压缩前） */
+  history: number
+  /** 最终发给模型的上下文总 token（system + 摘要 + 近段历史） */
+  total: number
+  /** 模型上下文窗口 token 数（0 = 不限制） */
+  window: number
+}
+
 /** AI 流式输出事件负载 */
 export interface StreamDonePayload {
   sessionId: string
@@ -507,6 +524,10 @@ export interface WindowApi {
     /** 取消当前流式请求 */
     cancel: () => void
     testConnection: () => Promise<TestConnectionResult>
+    /** 手动压缩指定会话历史：较早对话（最近 20 条之外）生成摘要并落盘复用，返回最新上下文用量 */
+    compactNow: (sessionId: string) => Promise<{ ok: boolean; error?: string; compacted?: boolean; stats?: ContextStats }>
+    /** 只读查询指定会话的上下文 token 用量（不触发摘要/发送），供桌宠窗切换会话时展示 */
+    getContextStats: (sessionId: string) => Promise<{ ok: boolean; error?: string; stats?: ContextStats }>
   }
   characterCard: {
     list: () => Promise<CharacterCard[]>
@@ -645,6 +666,10 @@ export interface WindowApi {
     reportRendererReady: () => void
     /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
     onCurrentSessionChanged: (cb: (sessionId: string | null) => void) => () => void
+    /** 订阅主进程广播的上下文 token 用量（每次 AI 组装 / 手动压缩后更新），返回取消订阅函数 */
+    onContextStats: (cb: (stats: ContextStats) => void) => () => void
+    /** 订阅设置变更（保存后主进程广播，桌宠窗据此同步「模型上下文窗口」等展示字段），返回取消订阅函数 */
+    onSettingsChanged: (cb: (settings: AppSettings) => void) => () => void
   }
   /** 语音合成（TTS）：MiMo 声音克隆 */
   tts: {

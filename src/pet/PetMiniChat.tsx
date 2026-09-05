@@ -8,6 +8,8 @@ import { useEffect, useRef } from 'react'
 import { ChevronUp } from 'lucide-react'
 import { useCharacterStore } from '../store/characterStore'
 import { PetContentList } from './PetContentList'
+import { PetContextToolbar } from './PetContextToolbar'
+import type { ContextStats } from '../types'
 
 const MIN_H = 90
 const MAX_H = 320
@@ -16,9 +18,19 @@ interface PetMiniChatProps {
   contentH: number
   onToggle: () => void
   onResize: (h: number) => void
+  /** 上下文 token 用量（显示在收起按钮左侧） */
+  ctxStats: ContextStats | null
+  /** 模型上下文窗口 token 数（实时设置值，token 用量显示的「窗口」分母） */
+  windowTokens: number
+  /** 手动压缩进行中 */
+  compacting: boolean
+  /** 手动压缩结果提示（短暂显示） */
+  compactNote: string | null
+  /** 点击手动压缩 */
+  onCompact: () => void
 }
 
-export function PetMiniChat({ contentH, onToggle, onResize }: PetMiniChatProps) {
+export function PetMiniChat({ contentH, onToggle, onResize, ctxStats, windowTokens, compacting, compactNote, onCompact }: PetMiniChatProps) {
   const dragRef = useRef<{ startY: number; startH: number } | null>(null)
   // 当前角色名（头部提示文字用）
   const cards = useCharacterStore((s) => s.cards)
@@ -68,15 +80,19 @@ export function PetMiniChat({ contentH, onToggle, onResize }: PetMiniChatProps) 
             {`聊天会话（${charName}）`}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={onToggle}
-          className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface)]/80 px-2 py-0.5 text-[11px] font-medium text-text-muted transition-colors hover:text-text"
-          title="收起会话"
-        >
-          <ChevronUp size={12} strokeWidth={1.75} />
-          收起
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* 上下文工具栏（token 用量 + 手动压缩）：始终位于收放按钮左侧 */}
+          <PetContextToolbar stats={ctxStats} windowTokens={windowTokens} compacting={compacting} note={compactNote} onCompact={onCompact} />
+          <button
+            type="button"
+            onClick={onToggle}
+            className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface)]/80 px-2 py-0.5 text-[11px] font-medium text-text-muted transition-colors hover:text-text"
+            title="收起会话"
+          >
+            <ChevronUp size={12} strokeWidth={1.75} />
+            收起
+          </button>
+        </div>
       </div>
 
       {/* 会话记录（用户 + AI，含流式逐字） */}

@@ -37,6 +37,8 @@ export function ApiConfigPanel() {
         temperature: Number.isFinite(Number(settings.temperature)) ? Number(settings.temperature) : 0.8,
         maxTokens: Math.max(1, Math.round(Number(settings.maxTokens) || 1024)),
         stream: settings.stream,
+        contextWindowTokens: Math.max(0, Math.round(Number(settings.contextWindowTokens) || 0)),
+        enableAutoCompact: settings.enableAutoCompact,
       })
       setApiKey('')
       toast('设置已保存')
@@ -125,6 +127,38 @@ export function ApiConfigPanel() {
             <div className="text-xs text-text-muted">启用后聊天消息逐字显示（打字机效果）</div>
           </div>
           <Switch checked={settings.stream} onChange={(v) => save({ stream: v })} />
+        </div>
+
+        {/* 上下文管理（A1/A2）：按 Token 预算装填历史 + 自动摘要压缩 */}
+        <div className="space-y-4 border-t border-border pt-4">
+          <div className="flex flex-col gap-2 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
+            <div className="text-sm text-text">模型上下文窗口（tokens）</div>
+            <Input
+              className="w-full"
+              type="number"
+              min={0}
+              step={1024}
+              value={settings.contextWindowTokens}
+              onChange={(e) => {
+                const v = Number(e.target.value)
+                // 清空/非法输入时忽略，避免误存
+                if (e.target.value.trim() !== '' && Number.isFinite(v)) save({ contextWindowTokens: Math.max(0, v) })
+              }}
+            />
+            <div className="text-xs text-text-muted">
+              历史按此预算从近到远装填；0 = 不限制（关闭自动收窄）。常见：32768 / 131072 / 1M
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
+            <div>
+              <div className="text-sm text-text">自动压缩历史</div>
+              <div className="text-xs text-text-muted">
+                上下文超阈值时，把较早对话交给模型生成摘要（落盘复用），保留最近 20 条原文；会额外消耗一次模型调用
+              </div>
+            </div>
+            <Switch checked={settings.enableAutoCompact} onChange={(v) => save({ enableAutoCompact: v })} />
+          </div>
         </div>
       </Card>
 

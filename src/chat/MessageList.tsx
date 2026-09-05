@@ -26,7 +26,7 @@ import { popSlideUp, springElastic } from '../lib/motion'
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
 const NEAR_BOTTOM_THRESHOLD = 80
 /** 流式逐字速度：固定每字间隔（毫秒） */
-const TYPEWRITER_SPEED = 500
+const TYPEWRITER_SPEED = 25
 
 export function MessageList() {
   const messages = useSessionStore((s) => s.messages)

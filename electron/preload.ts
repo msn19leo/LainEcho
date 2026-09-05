@@ -6,7 +6,7 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
+import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
@@ -38,6 +38,8 @@ const api: WindowApi = {
     },
     cancel: () => ipcRenderer.send('ai:cancel'),
     testConnection: () => ipcRenderer.invoke('ai:test-connection'),
+    compactNow: (sessionId) => ipcRenderer.invoke('ai:compact-now', { sessionId }),
+    getContextStats: (sessionId) => ipcRenderer.invoke('ai:get-context-stats', { sessionId }),
   },
   characterCard: {
     list: () => ipcRenderer.invoke('character-card:list'),
@@ -219,6 +221,18 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, sessionId: string | null) => cb(sessionId)
       ipcRenderer.on('session:current', listener)
       return () => ipcRenderer.removeListener('session:current', listener)
+    },
+    /** 订阅主进程广播的上下文 token 用量（每次 AI 组装 / 手动压缩后更新） */
+    onContextStats: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, stats: ContextStats) => cb(stats)
+      ipcRenderer.on('ai:context-stats', listener)
+      return () => ipcRenderer.removeListener('ai:context-stats', listener)
+    },
+    /** 订阅设置变更（保存后主进程广播，桌宠窗同步「模型上下文窗口」等展示字段） */
+    onSettingsChanged: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, settings: AppSettings) => cb(settings)
+      ipcRenderer.on('settings:changed', listener)
+      return () => ipcRenderer.removeListener('settings:changed', listener)
     },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
     spriteUrl: (spriteId, filePath) => `pet-res://sprites/${spriteId}/${filePath}`,

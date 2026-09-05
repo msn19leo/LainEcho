@@ -464,6 +464,20 @@ export async function appendSessionMessages(id: string, extra: ChatMessage[]): P
   return detail
 }
 
+/**
+ * 写入会话的历史摘要（A2 自动压缩产物，落盘复用）。
+ * 会话文件不存在（已被删除）时静默忽略；摘要不参与消息数组，UI 不展示。
+ */
+export async function updateSessionSummary(id: string, summary: string): Promise<void> {
+  assertValidResourceId(id, 'session')
+  const text = summary?.trim()
+  if (!text) return
+  await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) return cur
+    return { ...cur, summary: text }
+  })
+}
+
 export async function removeSession(id: string): Promise<void> {
   assertValidResourceId(id, 'session')
   await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => index.filter((s) => s.id !== id))
@@ -551,6 +565,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   maxTokens: 1024,
   stream: true,
   theme: 'dark',
+  // 上下文管理（A1/A2）：默认 32k 窗口 + 开启自动摘要
+  contextWindowTokens: 32768,
+  enableAutoCompact: true,
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -569,6 +586,8 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.maxTokens !== undefined) next.maxTokens = patch.maxTokens
     if (patch.stream !== undefined) next.stream = patch.stream
     if (patch.theme !== undefined) next.theme = patch.theme
+    if (patch.contextWindowTokens !== undefined) next.contextWindowTokens = patch.contextWindowTokens
+    if (patch.enableAutoCompact !== undefined) next.enableAutoCompact = patch.enableAutoCompact
     return next
   })
   return { ...DEFAULT_SETTINGS, ...result }

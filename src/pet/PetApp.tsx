@@ -18,10 +18,11 @@ import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
 import { PetStage, type PetStageHandle } from './PetStage'
 import { PetMiniChat } from './PetMiniChat'
 import { PetInput } from './PetInput'
+import { PetContextToolbar } from './PetContextToolbar'
 import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
 import { usePetReadingStore } from './petReadingStore'
-import { DEFAULT_EMOTION, type StandardEmotion } from '../types'
+import { DEFAULT_EMOTION, type ContextStats, type StandardEmotion } from '../types'
 import { stripBrackets } from '../lib/utils'
 
 /** 桌宠窗口宽度固定（与主进程 PET_WIDTH 保持一致）。
@@ -59,6 +60,15 @@ export default function PetApp() {
     }
   })
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** 当前会话上下文 token 用量（主进程 ai:context-stats 广播；切换会话时清空） */
+  const [ctxStats, setCtxStats] = useState<ContextStats | null>(null)
+  /** 模型上下文窗口 token 数（实时，跟随设置窗「模型上下文窗口」变更同步；0 = 不限制） */
+  const [windowTokens, setWindowTokens] = useState(0)
+  /** 手动压缩进行中 */
+  const [compacting, setCompacting] = useState(false)
+  /** 手动压缩结果提示（短暂显示后恢复 token 用量） */
+  const [compactNote, setCompactNote] = useState<string | null>(null)
+  const compactNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 宠物窗侧会话同步：只持久订阅 AI 流式/完成事件；初始为空，跟随聊天窗广播的当前会话，
   // 不主动加载"最近会话"（聊天窗为空时宠物窗也为空）
@@ -73,6 +83,8 @@ export default function PetApp() {
 
   // 跟随聊天窗切换/新建会话：收到当前会话 id 时加载对应消息到宠物窗内容框；null 表示清空
   useEffect(() => api.pet.onCurrentSessionChanged((id) => {
+    // 会话变化：清空上一会话的上下文用量，避免串显示
+    setCtxStats((prev) => (prev && prev.sessionId !== id ? null : prev))
     if (!id) {
       useSessionStore.setState({ currentSessionId: null, messages: [], streamingContent: '', streaming: false })
       return
@@ -93,6 +105,15 @@ export default function PetApp() {
         if (detail.characterCardId) {
           useCharacterStore.setState({ currentCardId: detail.characterCardId })
         }
+        // 切换到已有内容的会话：只读查询上下文用量，激活 token 展示与手动压缩按钮
+        // （发送/压缩时的广播仍会实时覆盖此查询结果）
+        if (detail.messages.length > 0) {
+          void api.ai.getContextStats(id).then((res) => {
+            if (res.ok && res.stats && useSessionStore.getState().currentSessionId === id) {
+              setCtxStats(res.stats)
+            }
+          }).catch(() => {})
+        }
       } catch {
         // 加载失败不阻塞
       }
@@ -101,6 +122,46 @@ export default function PetApp() {
 
   // 仅"本窗口"发送消息时展开内容框（聊天窗发来的消息不展开，避免被动拉起内容框）
   const handlePetUserSend = useCallback(() => setContentOpen(true), [])
+
+  // 订阅主进程广播的上下文 token 用量（每次 AI 组装 / 手动压缩后更新）。
+  // 仅当属于宠物窗当前会话时显示，避免串到其它会话；宠物窗尚无会话时也接受（新会话首条）
+  useEffect(() => api.pet.onContextStats((stats) => {
+    const cur = useSessionStore.getState().currentSessionId
+    if (cur && cur !== stats.sessionId) return
+    setCtxStats(stats)
+  }), [])
+
+  // 模型上下文窗口值：启动时读取 + 订阅设置变更即时同步（token 用量显示里的「窗口」分母）
+  useEffect(() => {
+    void api.settings.get().then((s) => setWindowTokens(s.contextWindowTokens)).catch(() => {})
+    return api.pet.onSettingsChanged((s) => setWindowTokens(s.contextWindowTokens))
+  }, [])
+
+  /** 手动压缩当前会话历史：调用主进程 ai:compact-now，成功后用量由广播自动刷新 */
+  const handleCompact = async () => {
+    const sid = useSessionStore.getState().currentSessionId
+    if (!sid || compacting) return
+    setCompacting(true)
+    setCompactNote(null)
+    try {
+      const res = await api.ai.compactNow(sid)
+      if (res.ok) {
+        if (res.stats) setCtxStats(res.stats)
+        setCompactNote(res.compacted ? '已压缩' : '无需压缩')
+      } else {
+        console.error('[pet] 手动压缩失败', res.error)
+        setCompactNote(res.error ? `失败：${res.error}` : '压缩失败')
+      }
+    } catch (err) {
+      console.error('[pet] 手动压缩异常', err)
+      setCompactNote('压缩失败')
+    } finally {
+      setCompacting(false)
+      // 短暂显示结果后恢复 token 用量
+      if (compactNoteTimer.current) clearTimeout(compactNoteTimer.current)
+      compactNoteTimer.current = setTimeout(() => setCompactNote(null), 1800)
+    }
+  }
 
   // 新一轮流式开始：重置朗续状态（避免上一轮的逐字/跟读进度串到本轮）
   useEffect(() => {
@@ -329,6 +390,11 @@ export default function PetApp() {
             contentH={contentH}
             onToggle={() => setContentOpen((v) => !v)}
             onResize={setContentH}
+            ctxStats={ctxStats}
+            windowTokens={windowTokens}
+            compacting={compacting}
+            compactNote={compactNote}
+            onCompact={() => void handleCompact()}
           />
         </div>
       )}
@@ -347,9 +413,16 @@ export default function PetApp() {
         </PetQuickButton>
       </div>
 
-      {/* 收起态：右下角胶囊唤起会话 */}
+      {/* 收起态：右下角胶囊唤起会话（左侧为上下文工具栏：token 用量 + 手动压缩） */}
       {!contentOpen && (
-        <div className="app-no-drag absolute bottom-10 right-2 z-50">
+        <div className="app-no-drag absolute bottom-10 right-2 z-50 flex items-center gap-1.5">
+          <PetContextToolbar
+            stats={ctxStats}
+            windowTokens={windowTokens}
+            compacting={compacting}
+            note={compactNote}
+            onCompact={() => void handleCompact()}
+          />
           <button
             type="button"
             onClick={() => setContentOpen(true)}
