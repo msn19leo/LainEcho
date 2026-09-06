@@ -12,6 +12,7 @@ import type {
   CharacterSprite,
   ChatMessage,
   Live2DModelMeta,
+  MemoryCategory,
   MemoryItem,
   ModelSettings,
   SessionDetail,
@@ -179,27 +180,113 @@ export async function removeCharacterCard(id: string): Promise<void> {
 
 const DEFAULT_MEMORIES: MemoryItem[] = []
 
-export async function listMemories(): Promise<MemoryItem[]> {
-  return readJson<MemoryItem[]>(paths.memoryFile, DEFAULT_MEMORIES)
+/** 归一化记忆条目：补齐 category/characterCardId/confirmed/sourceSessionId 缺省值（兼容旧数据） */
+function normalizeMemory(raw?: Partial<MemoryItem> | null): MemoryItem {
+  return {
+    id: raw?.id ?? genId('mem'),
+    content: raw?.content ?? '',
+    createdAt: raw?.createdAt ?? Date.now(),
+    category: raw?.category ?? 'long_term',
+    characterCardId: raw?.characterCardId ?? null,
+    confirmed: raw?.confirmed ?? true,
+    sourceSessionId: raw?.sourceSessionId ?? null,
+  }
 }
 
-export async function addMemory(content: string): Promise<MemoryItem> {
-  const text = content.trim()
+export async function listMemories(): Promise<MemoryItem[]> {
+  const items = await readJson<Partial<MemoryItem>[]>(paths.memoryFile, DEFAULT_MEMORIES)
+  return items.map(normalizeMemory)
+}
+
+/**
+ * 列出指定角色的已确认记忆（含全局背景 characterCardId=null，兼容旧数据），
+ * 用于 system prompt 注入；按创建时间倒序后截取前 limit 条。
+ */
+export async function listConfirmedMemories(cardId: string, limit?: number): Promise<MemoryItem[]> {
+  const items = await listMemories()
+  const owned = items.filter((m) => m.confirmed && (m.characterCardId === cardId || m.characterCardId === null))
+  return limit && limit > 0 ? owned.slice(0, limit) : owned
+}
+
+/** 列出待确认候选（自动沉淀产物，未入 system prompt） */
+export async function listPendingMemories(): Promise<MemoryItem[]> {
+  const items = await listMemories()
+  return items.filter((m) => !m.confirmed)
+}
+
+/** 手动新增一条已确认记忆（category 缺省 long_term；characterCardId 缺省 = 全局背景） */
+export async function addMemory(input: {
+  content: string
+  category?: MemoryCategory
+  characterCardId?: string | null
+}): Promise<MemoryItem> {
+  const text = input.content.trim()
   if (!text) throw new Error('记忆内容不能为空')
-  const item: MemoryItem = { id: genId('mem'), content: text, createdAt: Date.now() }
+  const item: MemoryItem = {
+    id: genId('mem'),
+    content: text,
+    createdAt: Date.now(),
+    category: input.category ?? 'long_term',
+    characterCardId: input.characterCardId ?? null,
+    confirmed: true,
+  }
   await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => [item, ...items])
   return item
 }
 
-export async function updateMemory(id: string, content: string): Promise<void> {
-  const text = content.trim()
+/** 追加待确认候选（自动沉淀写入，入列后由用户在设置窗确认/删除） */
+export async function addPendingMemory(input: {
+  content: string
+  category: MemoryCategory
+  characterCardId: string | null
+  sourceSessionId?: string | null
+}): Promise<MemoryItem> {
+  const text = input.content.trim()
   if (!text) throw new Error('记忆内容不能为空')
+  const item: MemoryItem = {
+    id: genId('mem'),
+    content: text,
+    createdAt: Date.now(),
+    category: input.category,
+    characterCardId: input.characterCardId,
+    confirmed: false,
+    sourceSessionId: input.sourceSessionId ?? null,
+  }
+  await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => [item, ...items])
+  return item
+}
+
+/** 更新记忆内容或分类（部分更新） */
+export async function updateMemory(id: string, patch: { content?: string; category?: MemoryCategory }): Promise<void> {
+  const nextPatch = { ...patch }
+  if (nextPatch.content !== undefined) {
+    const text = nextPatch.content.trim()
+    if (!text) throw new Error('记忆内容不能为空')
+    nextPatch.content = text
+  }
   await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => {
     let found = false
     const next = items.map((m) => {
       if (m.id !== id) return m
       found = true
-      return { ...m, content: text }
+      const update: Partial<MemoryItem> = {}
+      if (nextPatch.content !== undefined) update.content = nextPatch.content
+      if (nextPatch.category !== undefined) update.category = nextPatch.category
+      return { ...m, ...update }
+    })
+    if (!found) throw new Error('记忆条目不存在')
+    return next
+  })
+}
+
+/** 确认待确认候选：confirmed=false → true，此后注入 system prompt */
+export async function confirmMemory(id: string): Promise<void> {
+  await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => {
+    let found = false
+    const next = items.map((m) => {
+      if (m.id !== id) return m
+      found = true
+      return { ...m, confirmed: true }
     })
     if (!found) throw new Error('记忆条目不存在')
     return next
@@ -251,12 +338,19 @@ export const EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违�
   {"text":"不过、现在看到你，就都好了。","emotion":"happy"}
 ]}`
 
-export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryItem[]): string {
+export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryItem[], userName = '用户'): string {
   const parts: string[] = []
-  if (memories.length > 0) {
-    const memLines = memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
-    parts.push(`## 用户长期记忆（必须记住并严格遵守）\n${memLines}`)
+
+  // 记忆分主题注入（用户信息 / 长期经历 / 约定与承诺），只注入非空主题段
+  const byCategory = (cat: MemoryCategory) => memories.filter((m) => m.category === cat)
+  const pushMemories = (title: string, cat: MemoryCategory) => {
+    const lines = byCategory(cat).map((m, i) => `${i + 1}. ${m.content}`)
+    if (lines.length > 0) parts.push(`## ${title}（必须记住并严格遵守）\n${lines.join('\n')}`)
   }
+  pushMemories('用户信息', 'user_info')
+  pushMemories('长期经历', 'long_term')
+  pushMemories('约定与承诺', 'promises')
+
   // 输出格式约束提到最前面，确保"只输出 JSON"不被后续散文示例带偏
   parts.push(EMOTION_PROMPT)
   parts.push(...buildPersonaSections(card?.persona))
@@ -265,7 +359,9 @@ export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryIt
   }
   parts.push(PARAGRAPH_PROMPT)
   parts.push(NARRATION_PROMPT)
-  return parts.join('\n\n')
+  // %player% 占位符替换：人设/示例对话中写的 %player% 会替换为你的称呼
+  const joined = parts.join('\n\n')
+  return userName ? joined.split('%player%').join(userName) : joined
 }
 
 /**
@@ -568,6 +664,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 上下文管理（A1/A2）：默认 32k 窗口 + 开启自动摘要
   contextWindowTokens: 32768,
   enableAutoCompact: true,
+  // 记忆自动沉淀：默认开启（会话结束后台抽取候选记忆，需用户确认后生效）
+  enableMemoryExtraction: true,
+  // 你的称呼：%player% 占位符的替换值
+  userName: '用户',
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -588,6 +688,8 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.theme !== undefined) next.theme = patch.theme
     if (patch.contextWindowTokens !== undefined) next.contextWindowTokens = patch.contextWindowTokens
     if (patch.enableAutoCompact !== undefined) next.enableAutoCompact = patch.enableAutoCompact
+    if (patch.enableMemoryExtraction !== undefined) next.enableMemoryExtraction = patch.enableMemoryExtraction
+    if (patch.userName !== undefined) next.userName = patch.userName
     return next
   })
   return { ...DEFAULT_SETTINGS, ...result }

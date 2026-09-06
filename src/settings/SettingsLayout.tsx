@@ -22,6 +22,7 @@ import {
 import { WindowTitlebar } from '../components/WindowTitlebar'
 import { IconTile } from '../components/IconTile'
 import { ThemeSwitcher } from '../components/ThemeSwitcher'
+import { api } from '../api'
 import { cn } from '../lib/utils'
 import { fadeSlideUp, springSoft } from '../lib/motion'
 import { useSettingsStore } from '../store/settingsStore'
@@ -54,10 +55,31 @@ const MODULES: ModuleDef[] = [
 
 export function SettingsLayout() {
   const [view, setView] = useState<ModuleId | 'home'>('home')
+  /** 待确认记忆数量：有自动沉淀候选时在左侧「记忆体」导航项显示角标 */
+  const [pendingCount, setPendingCount] = useState(0)
 
   // 打开设置窗口即加载设置（主题切换器需要反映已保存的主题）
   useEffect(() => {
     void useSettingsStore.getState().load()
+  }, [])
+
+  // 待确认记忆数量：初始化查询 + 订阅变更（自动沉淀/确认/删除后刷新）
+  useEffect(() => {
+    let alive = true
+    const refresh = async () => {
+      try {
+        const items = await api.memory.listPending()
+        if (alive) setPendingCount(items.length)
+      } catch {
+        // 查询失败忽略
+      }
+    }
+    void refresh()
+    const unsub = api.memory.onChanged(() => void refresh())
+    return () => {
+      alive = false
+      unsub()
+    }
   }, [])
 
   return (
@@ -71,7 +93,14 @@ export function SettingsLayout() {
             <NavButton active={view === 'home'} onClick={() => setView('home')} icon={House} label="主页" />
             <div className="my-2 border-t border-border" />
             {MODULES.map((m) => (
-              <NavButton key={m.id} active={view === m.id} onClick={() => setView(m.id)} icon={m.icon} label={m.title} />
+              <NavButton
+                key={m.id}
+                active={view === m.id}
+                onClick={() => setView(m.id)}
+                icon={m.icon}
+                label={m.title}
+                badge={m.id === 'memory' ? pendingCount : undefined}
+              />
             ))}
           </div>
         </nav>
@@ -114,11 +143,14 @@ function NavButton({
   onClick,
   icon: Icon,
   label,
+  badge,
 }: {
   active: boolean
   onClick: () => void
   icon: LucideIcon
   label: string
+  /** 右侧角标数字（>0 时显示） */
+  badge?: number
 }) {
   return (
     <button
@@ -139,6 +171,11 @@ function NavButton({
       )}
       <Icon size={16} strokeWidth={active ? 2 : 1.75} color={active ? 'var(--primary-400)' : 'currentColor'} className="relative" />
       <span className={cn('relative truncate', active && 'font-medium')}>{label}</span>
+      {badge !== undefined && badge > 0 && (
+        <span className="ml-auto flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[var(--accent-500)] px-1 text-[9px] font-bold leading-none text-white">
+          {badge > 99 ? '99+' : badge}
+        </span>
+      )}
     </button>
   )
 }

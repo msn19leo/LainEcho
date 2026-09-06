@@ -15,6 +15,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { LogOut, MessageSquare, Settings } from 'lucide-react'
 import { api } from '../api'
 import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
+import { PendingMemoryBadge } from '../components/PendingMemoryBadge'
 import { PetStage, type PetStageHandle } from './PetStage'
 import { PetMiniChat } from './PetMiniChat'
 import { PetInput } from './PetInput'
@@ -410,6 +411,7 @@ export default function PetApp() {
         </PetQuickButton>
         <PetQuickButton title="打开设置" onClick={() => api.app.openSettings()}>
           <Settings size={14} strokeWidth={1.75} />
+          <PendingMemoryBadge />
         </PetQuickButton>
       </div>
 
@@ -466,7 +468,7 @@ function PetQuickButton({ title, onClick, children }: { title: string; onClick: 
     <button
       title={title}
       onClick={onClick}
-      className="glass-strong flex h-8 w-8 items-center justify-center rounded-full text-text-2 transition-colors hover:text-text hover:shadow-[0_0_10px_var(--primary-glow)]"
+      className="glass-strong relative flex h-8 w-8 items-center justify-center rounded-full text-text-2 transition-colors hover:text-text hover:shadow-[0_0_10px_var(--primary-glow)]"
     >
       {children}
     </button>

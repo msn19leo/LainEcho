@@ -16,6 +16,7 @@ import { api } from '../api'
 import { DropdownMenu, type MenuItem } from '../components/DropdownMenu'
 import { IconTile } from '../components/IconTile'
 import { FloatingDock } from '../components/FloatingDock'
+import { PendingMemoryBadge } from '../components/PendingMemoryBadge'
 import { useCharacterStore } from '../store/characterStore'
 import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
 import { MessageList } from './MessageList'
@@ -47,17 +48,14 @@ export function ChatWindow() {
   useEffect(() => {
     const unsubText = api.chat.onReadingText((text) => {
       useChatReadingStore.getState().setText(text)
-      console.log('[diag] chat onReadingText len=', text.length, text.slice(0, 20))
     })
     const unsubMode = api.chat.onVoiceMode(({ voiceEnabled, followText }) => {
       useChatReadingStore.getState().setFollowReading(!!voiceEnabled && !!followText)
-      console.log('[diag] chat onVoiceMode voiceEnabled=', voiceEnabled)
       // 新一轮语音模式到达：清空上一轮朗读文本，避免先冒出上轮内容
       useChatReadingStore.getState().clear()
     })
     const unsubActive = api.chat.onReadingActive((active) => {
       useChatReadingStore.getState().setReadingActive(active)
-      console.log('[diag] chat onReadingActive=', active)
     })
     return () => {
       unsubText()
@@ -212,9 +210,10 @@ export function ChatWindow() {
             <button
               onClick={() => api.app.openSettings()}
               title="设置"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border text-text-2 transition-colors hover:border-border-strong hover:text-text"
+              className="relative inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border text-text-2 transition-colors hover:border-border-strong hover:text-text"
             >
               <SettingsIcon size={15} strokeWidth={1.75} />
+              <PendingMemoryBadge />
             </button>
             <button
               onClick={() => api.win.close()}

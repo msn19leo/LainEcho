@@ -12,13 +12,14 @@ import { buildModelContext, forceCompact, SUMMARY_MAX_TOKENS, toModelMessage } f
 import { estimateMessagesTokens } from '../services/token'
 import { getTTSConfig } from './tts.ipc'
 import { readApiKey } from '../services/crypto'
+import { extractMemoriesFromSession } from '../services/memoryExtraction'
 import {
   appendSessionMessages,
   buildSystemPrompt,
   getCharacterCard,
   getSession,
   getSettings,
-  listMemories,
+  listConfirmedMemories,
   updateSessionSummary,
 } from '../services/repository'
 import { windowManager } from '../windows/windowManager'
@@ -63,6 +64,12 @@ function createSummarizer(settings: AppSettings, apiKey: string, signal?: AbortS
     if (!trimmed) throw new Error('摘要为空')
     return trimmed
   }
+}
+
+/** 格式化本地时间为 YYYY-MM-DD HH:MM:SS（用户消息本地时间注入用） */
+function formatLocalTime(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 /** 主进程合并 chunk 的 flush 间隔（毫秒）：多个 delta 合并为一次 IPC 推送，减少消息数 */
 const CHUNK_FLUSH_MS = 16
@@ -115,16 +122,23 @@ export function registerAiIpc(): void {
       // （每次请求前实时读取，保证记忆更新即时生效）
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
-      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
+      const memories = await listConfirmedMemories(session.characterCardId, MAX_MEMORIES)
       const systemMessage: ChatMessage = {
         role: 'system',
-        content: buildSystemPrompt(card, memories),
+        content: buildSystemPrompt(card, memories, settings.userName),
       }
 
       // A1+A2 上下文组装：净化消息 → 按 Token 预算装填（A1）；总 token 超阈值时，
       // 旧历史交给独立请求生成摘要并落盘复用（A2）。摘要走独立 prompt，不污染主对话的 JSON 输出约束。
       const summarize = createSummarizer(settings, apiKey, abort.signal)
       const modelMessages = messages.map(toModelMessage)
+      // 本地时间注入：仅给发送给模型的当前用户消息加前缀（不污染落盘历史），让角色感知发送时刻
+      if (modelMessages.length > 0) {
+        const lastMsg = modelMessages[modelMessages.length - 1]!
+        if (lastMsg.role === 'user') {
+          lastMsg.content = `[本地时间 ${formatLocalTime(new Date())}]\n${lastMsg.content}`
+        }
+      }
       const ctx = await buildModelContext({
         systemMessage,
         messages: modelMessages,
@@ -229,10 +243,19 @@ export function registerAiIpc(): void {
       // 持久化：user 消息 + assistant 完整回复（解析 JSON dialogue，落盘句子/情绪段供句级同步与联动）
       const now = Date.now()
       const { text, emotion, sentences, emotionSegments, chunks } = parseDialogueJson(content)
-      // 临时调试：确认模型是否输出结构化 dialogue JSON（确认后删除）
-      console.log('[ai:parse-json] isDialogueJson=', /"dialogue"\s*:/.test(content), 'chunks=', chunks.length, 'segments=', JSON.stringify(emotionSegments))
       const asstMsg: ChatMessage = { role: 'assistant', content: text, emotion, sentences, emotionSegments, chunks, timestamp: now }
       await appendSessionMessages(sessionId, [userMsg, asstMsg])
+
+      // 记忆自动沉淀（后台，不阻塞）：从本轮对话抽取待确认候选，供用户在设置窗确认/删除
+      // 受「自动沉淀记忆」开关控制（关闭时不再发起抽取请求）
+      if (settings.enableMemoryExtraction) {
+        void extractMemoriesFromSession({
+          sessionId,
+          cardId: session.characterCardId,
+          messages: [...messages, asstMsg],
+          settings: { model: settings.model, baseURL: settings.baseURL, apiKey },
+        })
+      }
 
       windowManager.broadcastAI('ai:stream-done', { sessionId, message: asstMsg })
       // 立绘/表情驱动策略：
@@ -288,7 +311,7 @@ export function registerAiIpc(): void {
       const settings = await getSettings()
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
-      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
+      const memories = await listConfirmedMemories(session.characterCardId, MAX_MEMORIES)
       const systemMessage: ChatMessage = { role: 'system', content: buildSystemPrompt(card, memories) }
       const modelMessages = session.messages.map(toModelMessage)
       // 只读预览：关闭自动摘要，仅按 Token 预算装填估算实际发送的上下文（summarize 不会被调用）
@@ -331,7 +354,7 @@ export function registerAiIpc(): void {
 
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
-      const memories = (await listMemories()).slice(0, MAX_MEMORIES)
+      const memories = await listConfirmedMemories(session.characterCardId, MAX_MEMORIES)
       const systemMessage: ChatMessage = { role: 'system', content: buildSystemPrompt(card, memories) }
       const modelMessages = session.messages.map(toModelMessage)
 

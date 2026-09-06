@@ -240,11 +240,22 @@ export interface TTSConfig {
   followText: boolean
 }
 
-/** 记忆体：用户手动维护的全局固定记忆条目 */
+/** 记忆主题分类：用户信息 / 长期经历 / 约定与承诺 */
+export type MemoryCategory = 'user_info' | 'long_term' | 'promises'
+
+/** 记忆体：按角色隔离 + 分主题 + 待确认候选 */
 export interface MemoryItem {
   id: string
   content: string
   createdAt: number
+  /** 主题分类；旧数据缺省归一为 long_term */
+  category: MemoryCategory
+  /** 归属角色卡 id；null = 全局共享背景（兼容旧数据，注入时对所有角色生效） */
+  characterCardId: string | null
+  /** 是否已确认（false = 待确认候选，不注入 system prompt） */
+  confirmed: boolean
+  /** 自动沉淀来源会话 id（追溯用，手动添加无） */
+  sourceSessionId?: string | null
 }
 
 /** 会话索引条目（sessions/index.json，不含消息正文，用于列表/搜索/筛选） */
@@ -280,6 +291,10 @@ export interface AppSettings {
   contextWindowTokens: number
   /** 是否启用自动摘要压缩（A2：旧历史超阈值时交给 LLM 生成摘要） */
   enableAutoCompact: boolean
+  /** 是否启用记忆自动沉淀（会话结束后后台从对话抽取候选记忆，需用户确认后生效） */
+  enableMemoryExtraction: boolean
+  /** 你的称呼（%player% 占位符在人设/示例对话中的替换值，默认「用户」） */
+  userName: string
 }
 
 /** Live2D 模型元信息（models/index.json） */
@@ -542,10 +557,19 @@ export interface WindowApi {
     onChanged: (cb: () => void) => () => void
   }
   memory: {
+    /** 列出全部记忆（含已确认与待确认候选，按创建时间倒序） */
     list: () => Promise<MemoryItem[]>
-    add: (content: string) => Promise<MemoryItem>
-    update: (id: string, content: string) => Promise<void>
+    /** 仅列待确认候选（自动沉淀产物） */
+    listPending: () => Promise<MemoryItem[]>
+    /** 手动新增一条记忆（category 缺省 long_term；characterCardId null = 全局背景），返回新条目 */
+    add: (input: { content: string; category: MemoryCategory; characterCardId: string | null }) => Promise<MemoryItem>
+    /** 更新记忆内容或分类 */
+    update: (id: string, patch: { content?: string; category?: MemoryCategory }) => Promise<void>
+    /** 确认待确认候选（确认后注入 system prompt） */
+    confirm: (id: string) => Promise<void>
     remove: (id: string) => Promise<void>
+    /** 订阅记忆变更（自动沉淀 / 其它窗口修改后刷新），返回取消订阅函数 */
+    onChanged: (cb: () => void) => () => void
   }
   session: {
     list: () => Promise<SessionIndexItem[]>

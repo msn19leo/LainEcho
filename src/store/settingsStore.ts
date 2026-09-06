@@ -12,6 +12,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   theme: 'dark',
   contextWindowTokens: 32768,
   enableAutoCompact: true,
+  enableMemoryExtraction: true,
+  userName: '用户',
 }
 
 interface SettingsState {
@@ -43,6 +45,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           theme: data.theme,
           contextWindowTokens: data.contextWindowTokens,
           enableAutoCompact: data.enableAutoCompact,
+          enableMemoryExtraction: data.enableMemoryExtraction,
+          userName: data.userName,
         },
         hasApiKey: data.hasApiKey,
         loaded: true,

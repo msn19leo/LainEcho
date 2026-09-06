@@ -61,19 +61,6 @@ export function MessageList() {
   // 仅在用户接近底部时跟随，尊重其上翻历史
   useAutoScrollBottom(listRef, contentRef, nearBottomRef, [messages, streaming, streamError])
 
-  // [diag] 跟踪气泡驱动状态组合，便于定位"用户气泡消失 / 先完整后消失"的时序
-  useEffect(() => {
-    const userCount = messages.filter((m) => m.role === 'user').length
-    console.log(
-      '[chatSync] msg=' + messages.length,
-      'usr=' + userCount,
-      'st=' + streaming,
-      'fup=' + followReading,
-      'act=' + readingActive,
-      'rdL=' + readingText.length,
-    )
-  }, [messages, streaming, followReading, readingActive, readingText])
-
   if (messages.length === 0 && !streaming) {
     return (
       <div className="flex flex-1 items-center justify-center px-6 py-8">

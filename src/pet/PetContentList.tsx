@@ -52,20 +52,6 @@ export function PetContentList() {
   // 内容高度增长（打字机逐字 reveal、流式、跟读追加段）时自动滚到底
   useAutoScrollBottom(scrollRef, contentRef, followRef, [messages, streaming, streamingContent, displayedText])
 
-  // [diag] 跟踪气泡驱动状态组合，便于定位"用户气泡消失 / 先完整后消失"的时序
-  useEffect(() => {
-    const userCount = messages.filter((m) => m.role === 'user').length
-    console.log(
-      '[petSync] msg=' + messages.length,
-      'usr=' + userCount,
-      'st=' + streaming,
-      'mode=' + revealMode,
-      'act=' + readingActive,
-      'play=' + playing,
-      'disp=' + displayedText.length,
-    )
-  }, [messages, streaming, revealMode, following, readingActive, playing, displayedText])
-
   return (
     <div ref={scrollRef} className="h-full overflow-y-auto px-2 py-1 text-[13px] leading-[16px] text-text" onWheel={(e) => e.stopPropagation()}>
       {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}

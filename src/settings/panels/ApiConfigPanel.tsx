@@ -39,6 +39,7 @@ export function ApiConfigPanel() {
         stream: settings.stream,
         contextWindowTokens: Math.max(0, Math.round(Number(settings.contextWindowTokens) || 0)),
         enableAutoCompact: settings.enableAutoCompact,
+        userName: settings.userName.trim() || '用户',
       })
       setApiKey('')
       toast('设置已保存')

@@ -55,9 +55,16 @@ const api: WindowApi = {
   },
   memory: {
     list: () => ipcRenderer.invoke('memory:list'),
-    add: (content) => ipcRenderer.invoke('memory:add', content),
-    update: (id, content) => ipcRenderer.invoke('memory:update', id, content),
+    listPending: () => ipcRenderer.invoke('memory:list-pending'),
+    add: (input) => ipcRenderer.invoke('memory:add', input),
+    update: (id, patch) => ipcRenderer.invoke('memory:update', id, patch),
+    confirm: (id) => ipcRenderer.invoke('memory:confirm', id),
     remove: (id) => ipcRenderer.invoke('memory:remove', id),
+    onChanged: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('memory:changed', listener)
+      return () => ipcRenderer.removeListener('memory:changed', listener)
+    },
   },
   session: {
     list: () => ipcRenderer.invoke('session:list'),

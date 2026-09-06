@@ -110,15 +110,11 @@ export function registerWindowIpc(): void {
   /** 宠物窗朗读到某段文本 → 转发给聊天窗随语音显示 */
   ipcMain.on('pet:reading-text', (_e, text: string) => {
     const t = typeof text === 'string' ? text : ''
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('[diag] pet->chat reading-text len=', t.length, t.length ? JSON.stringify(t.slice(0, 24)) : '')
-    }
     windowManager.notifyReadingText(t)
   })
 
   /** 宠物窗朗读是否进行中 → 转发给聊天窗控制光标 */
   ipcMain.on('pet:reading-active', (_e, active: boolean) => {
-    if (process.env.NODE_ENV !== 'production') console.log('[diag] pet->chat reading-active=', active)
     windowManager.notifyReadingActive(active === true)
   })
 

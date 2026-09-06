@@ -607,7 +607,7 @@ export function CharacterModelPanel() {
             </Card>
           ))}
         </div>
-      )});
+      )}
 
       {/* ==================== 2D 立绘缩放与位置 ==================== */}
       {loaded && (
