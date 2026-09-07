@@ -22,6 +22,7 @@ import { PetInput } from './PetInput'
 import { PetContextToolbar } from './PetContextToolbar'
 import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
+import { initSettingsSync } from '../store/settingsStore'
 import { usePetReadingStore } from './petReadingStore'
 import { DEFAULT_EMOTION, type ContextStats, type StandardEmotion } from '../types'
 import { stripBrackets } from '../lib/utils'
@@ -81,6 +82,9 @@ export default function PetApp() {
     api.pet.reportRendererReady()
     return bindPersistentSessionSync()
   }, [])
+
+  // 全局设置实时同步：加载持久化设置并订阅主进程广播（文字速度等设置窗改动后立即对宠物窗生效）
+  useEffect(() => initSettingsSync(), [])
 
   // 跟随聊天窗切换/新建会话：收到当前会话 id 时加载对应消息到宠物窗内容框；null 表示清空
   useEffect(() => api.pet.onCurrentSessionChanged((id) => {

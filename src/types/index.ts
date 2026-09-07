@@ -295,6 +295,8 @@ export interface AppSettings {
   enableMemoryExtraction: boolean
   /** 你的称呼（%player% 占位符在人设/示例对话中的替换值，默认「用户」） */
   userName: string
+  /** 文字显示速度（0-100 速度档，越大越快；参考 LingChat，默认 80；0 = 即时显示，不逐字） */
+  textSpeed: number
 }
 
 /** Live2D 模型元信息（models/index.json） */

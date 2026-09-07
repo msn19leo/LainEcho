@@ -19,6 +19,7 @@ import { FloatingDock } from '../components/FloatingDock'
 import { PendingMemoryBadge } from '../components/PendingMemoryBadge'
 import { useCharacterStore } from '../store/characterStore'
 import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
+import { initSettingsSync } from '../store/settingsStore'
 import { MessageList } from './MessageList'
 import { InputArea } from './InputArea'
 import { SessionSidebar } from './SessionSidebar'
@@ -43,6 +44,9 @@ export function ChatWindow() {
     api.chat.reportRendererReady()
     return bindPersistentSessionSync()
   }, [])
+
+  // 全局设置实时同步：加载持久化设置并订阅主进程广播（文字速度等设置窗改动后立即对聊天窗生效）
+  useEffect(() => initSettingsSync(), [])
 
   // 订阅宠物窗朗读文本与之语音模式：聊天窗与宠物窗采用一致的分段跟读展示
   useEffect(() => {

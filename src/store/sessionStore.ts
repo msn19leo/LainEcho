@@ -220,7 +220,7 @@ export function bindPersistentSessionSync(): () => void {
     const st = useSessionStore.getState()
     if (!payload?.sessionId || payload.sessionId !== st.currentSessionId) return
     void (async () => {
-      useSessionStore.setState({ streaming: false, streamingContent: '' })
+      useSessionStore.setState({ streaming: false })
       try {
         const detail = await api.session.get(payload.sessionId!)
         useSessionStore.setState({ messages: detail.messages, streamError: null })
@@ -242,7 +242,8 @@ export function bindPersistentSessionSync(): () => void {
       return {
         messages: appended,
         streaming: false,
-        streamingContent: '',
+        // 保留已流出的部分用于"揭示完再落定"：错误/停止后文字仍按设置速度揭示完再切定型
+        streamingContent: partial,
         // 主动取消（停止）不算错误，不展示红色错误条
         streamError: payload.cancelled ? null : payload.error,
       }

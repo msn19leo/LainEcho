@@ -338,18 +338,29 @@ export const EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违�
   {"text":"不过、现在看到你，就都好了。","emotion":"happy"}
 ]}`
 
+/**
+ * 记忆注入时的主客体归一化：把记忆里的「用户」→「对方」、「角色」→「你」。
+ * 角色扮演模型以「我」（角色）为主视角输出，若记忆以「用户」作主语且表达情感需求，
+ * 模型易把用户诉求/信息错当成自己的（如把用户生日当成角色生日）。
+ * 归一化后在注入段配合归属声明，让模型明确「这些信息属于对方」。
+ */
+export function normalizeMemoryPerspective(text: string): string {
+  return text.split('用户').join('对方').split('角色').join('你')
+}
+
 export function buildSystemPrompt(card: CharacterCard | null, memories: MemoryItem[], userName = '用户'): string {
   const parts: string[] = []
 
-  // 记忆分主题注入（用户信息 / 长期经历 / 约定与承诺），只注入非空主题段
+  // 记忆分主题注入（对方的信息 / 对方的长期经历 / 你与对方的约定），只注入非空主题段。
+  // 注入前做主客体归一化（用户→对方、角色→你），并在标题声明归属，避免模型把用户信息错当成自己的设定。
   const byCategory = (cat: MemoryCategory) => memories.filter((m) => m.category === cat)
-  const pushMemories = (title: string, cat: MemoryCategory) => {
-    const lines = byCategory(cat).map((m, i) => `${i + 1}. ${m.content}`)
-    if (lines.length > 0) parts.push(`## ${title}（必须记住并严格遵守）\n${lines.join('\n')}`)
+  const pushMemories = (title: string, note: string, cat: MemoryCategory) => {
+    const lines = byCategory(cat).map((m, i) => `${i + 1}. ${normalizeMemoryPerspective(m.content)}`)
+    if (lines.length > 0) parts.push(`## ${title}：${note}\n${lines.join('\n')}`)
   }
-  pushMemories('用户信息', 'user_info')
-  pushMemories('长期经历', 'long_term')
-  pushMemories('约定与承诺', 'promises')
+  pushMemories('对方的信息', '以下信息均属于对话对象（对方），不属于你', 'user_info')
+  pushMemories('对方的长期经历', '以下信息均属于对话对象（对方），不属于你', 'long_term')
+  pushMemories('你与对方的约定', '以下约定需要你记住并遵守', 'promises')
 
   // 输出格式约束提到最前面，确保"只输出 JSON"不被后续散文示例带偏
   parts.push(EMOTION_PROMPT)
@@ -668,6 +679,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableMemoryExtraction: true,
   // 你的称呼：%player% 占位符的替换值
   userName: '用户',
+  // 文字显示速度：0-100 速度档（越大越快；0=即时显示）
+  textSpeed: 80,
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -690,6 +703,7 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.enableAutoCompact !== undefined) next.enableAutoCompact = patch.enableAutoCompact
     if (patch.enableMemoryExtraction !== undefined) next.enableMemoryExtraction = patch.enableMemoryExtraction
     if (patch.userName !== undefined) next.userName = patch.userName
+    if (patch.textSpeed !== undefined) next.textSpeed = patch.textSpeed
     return next
   })
   return { ...DEFAULT_SETTINGS, ...result }

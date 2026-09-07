@@ -7,13 +7,14 @@
 import { useEffect, useRef } from 'react'
 import { useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
+import { typingSpeedToMs, useSettingsStore } from '../store/settingsStore'
 import { usePetReadingStore } from './petReadingStore'
 import { Typewriter } from '../components/Typewriter'
 import { cn } from '../lib/utils'
 import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
 
-/** 无语音逐字速度：固定每字间隔（毫秒） */
-const TYPEWRITER_SPEED = 25
+/** 语音跟读文字逐字速度：跟随音频节奏，不随「文字显示速度」设置（打字速度仅作用于无语音流式） */
+const FOLLOW_SPEED = 25
 
 /** 当前使用中的角色名（AI 名牌用） */
 function useCurrentCardName(): string {
@@ -24,6 +25,9 @@ function useCurrentCardName(): string {
 }
 
 export function PetContentList() {
+  // 逐字速度：从全局设置读文字显示速度档（0-100）并换算为每字间隔毫秒
+  const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? 80)
+  const typeSpeed = typingSpeedToMs(textSpeed)
   const messages = useSessionStore((s) => s.messages)
   const streaming = useSessionStore((s) => s.streaming)
   const streamingContent = useSessionStore((s) => s.streamingContent)
@@ -60,7 +64,7 @@ export function PetContentList() {
         // 本轮语音跟读流程进行中（active）即隐藏最后一条已定型的 AI 消息，由跟读气泡接管。
         // active 仅在语音真正开始朗读（onSpeak）为真，故此处无需再要求 displayedText>0——
         // 否则 LLM 已跟读完成但语音音频尚未备好（displayedText 仍为空）时，会先露出整段再"消失"。
-        if (!streaming && voiceFollowing && msg.role === 'assistant' && i === lastAssistantIndex)
+        if (!streaming && (voiceFollowing || streamingContent.length > 0) && msg.role === 'assistant' && i === lastAssistantIndex)
           return null
         const isUser = msg.role === 'user'
         return (
@@ -88,7 +92,7 @@ export function PetContentList() {
         )
       })}
 
-      {(streaming || voiceFollowing) && (
+      {(streaming || streamingContent.length > 0 || voiceFollowing) && (
         <div className="my-1 flex flex-col items-start">
           <span className="mb-0.5 select-none px-1 text-[10px] font-medium text-[var(--primary-400)]">{aiName}</span>
           <span className="max-w-[90%] whitespace-pre-wrap break-words rounded-[5px] border border-[var(--border-strong)] bg-[var(--bg-surface)]/70 px-2 py-1 text-text">
@@ -96,12 +100,18 @@ export function PetContentList() {
                 避免无语音轮因 mode 残留而显示空白 */}
             {following ? (
               <span className="whitespace-pre-wrap break-words">
-                {/* 追加式打字机：整段回复随语音段追加写入 displayedText，打字机流式打出，无替换/无闪烁 */}
-                <Typewriter text={displayedText} speed={TYPEWRITER_SPEED} />
+                {/* 追加式打字机：整段回复随语音段追加写入 displayedText，打字机流式打出，无替换/无闪烁；速度跟随音频节奏 */}
+                <Typewriter text={displayedText} speed={FOLLOW_SPEED} />
                 {(streaming || playing || readingActive) && <span className="streaming-cursor" />}
               </span>
             ) : (
-              <Typewriter text={streamingContent} speed={TYPEWRITER_SPEED} />
+              /* 无语音流式：textSpeed 逐字；流式结束后 complete 时 reveal 追平才 onDone 清空落定 */
+              <Typewriter
+                text={streamingContent}
+                speed={typeSpeed}
+                complete={!streaming}
+                onDone={() => useSessionStore.setState({ streamingContent: '' })}
+              />
             )}
           </span>
         </div>

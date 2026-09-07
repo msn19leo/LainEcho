@@ -17,6 +17,7 @@ import {
   Sparkles,
   AudioLines,
   Info,
+  SlidersHorizontal,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -33,8 +34,9 @@ import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { VoicePanel } from './panels/VoicePanel'
 import { AboutPanel } from './panels/AboutPanel'
+import { GeneralPanel } from './panels/GeneralPanel'
 
-export type ModuleId = 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice' | 'about'
+export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice' | 'about'
 
 interface ModuleDef {
   id: ModuleId
@@ -44,6 +46,7 @@ interface ModuleDef {
 }
 
 const MODULES: ModuleDef[] = [
+  { id: 'general', title: '通用设置', desc: '一些不便归入其它模块的通用设置。', icon: SlidersHorizontal },
   { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Bot },
   { id: 'model', title: '角色模型', desc: 'Live2D 模型导入与管理。', icon: PersonStanding },
   { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
@@ -249,6 +252,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
           {mod?.desc && <p className="mt-0.5 text-xs text-text-muted">{mod.desc}</p>}
         </div>
       </div>
+      {id === 'general' && <GeneralPanel />}
       {id === 'character-card' && <CharacterCardPanel />}
       {id === 'model' && <CharacterModelPanel />}
       {id === 'api' && <ApiConfigPanel />}

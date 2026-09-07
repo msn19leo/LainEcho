@@ -17,6 +17,7 @@ import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
 import { useCharacterStore } from '../store/characterStore'
 import { useChatReadingStore } from './readingStore'
+import { typingSpeedToMs, useSettingsStore } from '../store/settingsStore'
 import { Typewriter } from '../components/Typewriter'
 import { cn, formatTime, splitSentences } from '../lib/utils'
 import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
@@ -25,11 +26,12 @@ import { popSlideUp, springElastic } from '../lib/motion'
 
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
 const NEAR_BOTTOM_THRESHOLD = 80
-/** 流式逐字速度：固定每字间隔（毫秒） */
-const TYPEWRITER_SPEED = 25
 
 export function MessageList() {
+  // 逐字速度由独立的 StreamingBubble 组件内部读取（见函数 StreamingBubble）
   const messages = useSessionStore((s) => s.messages)
+  // 顶层订阅 streamingContent：用于"流式结束但文字仍在逐字揭示"时隐藏定型 AI、保留揭示气泡
+  const streamingContent = useSessionStore((s) => s.streamingContent)
   const streaming = useSessionStore((s) => s.streaming)
   const streamError = useSessionStore((s) => s.streamError)
   const currentCardName = useCurrentCardName()
@@ -93,7 +95,7 @@ export function MessageList() {
       {messages.map((msg, i) => {
         // 语音跟读进行中（readingActive，仅在语音真正开始朗读时为真）即隐藏该条定型 AI，
         // 由跟读气泡接管。无需再要求 readingText>0，否则语音音频尚未备好时定型全文会先露出再"消失"。
-        if (!streaming && readingActive && msg.role === 'assistant' && i === lastAssistantIndex)
+        if (!streaming && (readingActive || streamingContent.length > 0) && msg.role === 'assistant' && i === lastAssistantIndex)
           return null
         const isUser = msg.role === 'user'
         return (
@@ -131,7 +133,7 @@ export function MessageList() {
         )
       })}
 
-      {streaming || (followReading && readingActive) ? (
+      {streaming || streamingContent.length > 0 || (followReading && readingActive) ? (
         <StreamingBubble
           name={currentCardName || 'AI'}
           listRef={listRef}
@@ -172,6 +174,9 @@ function StreamingBubble({
   const followReading = useChatReadingStore((s) => s.followReading)
   const readingText = useChatReadingStore((s) => s.text)
   const readingActive = useChatReadingStore((s) => s.readingActive)
+  // 逐字速度：从全局设置读文字显示速度档（0-100）并换算为每字间隔毫秒
+  const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? 80)
+  const typeSpeed = typingSpeedToMs(textSpeed)
 
   // 流式内容更新时跟随滚动（复用父级列表，仅在接近底部时瞬时滚动）
   useEffect(() => {
@@ -190,11 +195,17 @@ function StreamingBubble({
           {followReading ? (
             <span className="whitespace-pre-wrap break-words">
               {/* 语音跟读轮：仅朗读进行中用朗读文本打字；待输出期显示空+光标，绝不透出上一轮残留文本 */}
-              {readingActive && <Typewriter text={readingText} speed={TYPEWRITER_SPEED} />}
+              {readingActive && <Typewriter text={readingText} speed={typeSpeed} />}
               {(streaming || readingActive) && <span className="streaming-cursor" />}
             </span>
           ) : (
-            <Typewriter text={streamingContent} speed={TYPEWRITER_SPEED} className="whitespace-pre-wrap break-words" />
+            <Typewriter
+                text={streamingContent}
+                speed={typeSpeed}
+                className="whitespace-pre-wrap break-words"
+                complete={!streaming}
+                onDone={() => useSessionStore.setState({ streamingContent: '' })}
+              />
           )}
         </div>
       </div>

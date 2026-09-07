@@ -210,27 +210,34 @@ export function MemoryPanel() {
                       <span className="text-[11px] text-text-muted">· {ownerLabel(cards, item.characterCardId)}</span>
                     </div>
                     {editingId === item.id ? (
-                      <div className="flex items-center gap-2">
+                      <div className="mt-2 space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">
+                        {/* 编辑输入框：回填原文本，占满卡片内容区宽度 */}
                         <Input
                           value={editContent}
                           onChange={(e) => setEditContent(e.target.value)}
                           autoFocus
+                          placeholder="编辑记忆内容…"
                           onKeyDown={(e) => {
                             if (e.key === 'Enter') void handleEdit()
                             if (e.key === 'Escape') setEditingId(null)
                           }}
                         />
-                        <Select
-                          value={editCategory}
-                          onChange={(e) => setEditCategory(e.target.value as MemoryCategory)}
-                          className="w-32 shrink-0"
-                        >
-                          {CATEGORY_OPTIONS.map((o) => (
-                            <option key={o.value} value={o.value}>{o.label}（{o.hint}）</option>
-                          ))}
-                        </Select>
-                        <Button size="sm" onClick={() => void handleEdit()}>保存</Button>
-                        <Button variant="ghost" size="sm" onClick={() => setEditingId(null)}>取消</Button>
+                        {/* 分类下拉 + 保存/取消：全部约束在卡片内，不溢出 */}
+                        <div className="flex items-center gap-2">
+                          <Select
+                            value={editCategory}
+                            onChange={(e) => setEditCategory(e.target.value as MemoryCategory)}
+                            className="min-w-0 flex-1"
+                          >
+                            {CATEGORY_OPTIONS.map((o) => (
+                              <option key={o.value} value={o.value}>{o.label}</option>
+                            ))}
+                          </Select>
+                          <div className="flex shrink-0 gap-1">
+                            <Button size="sm" onClick={() => void handleEdit()}>保存</Button>
+                            <Button variant="ghost" size="sm" onClick={() => setEditingId(null)}>取消</Button>
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div className="text-sm text-text selectable">{item.content}</div>
