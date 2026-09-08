@@ -53,13 +53,21 @@ export function ChatWindow() {
     const unsubText = api.chat.onReadingText((text) => {
       useChatReadingStore.getState().setText(text)
     })
-    const unsubMode = api.chat.onVoiceMode(({ voiceEnabled, followText }) => {
-      useChatReadingStore.getState().setFollowReading(!!voiceEnabled && !!followText)
+    const unsubMode = api.chat.onVoiceMode(({ voiceEnabled }) => {
+      useChatReadingStore.getState().setFollowReading(!!voiceEnabled)
       // 新一轮语音模式到达：清空上一轮朗读文本，避免先冒出上轮内容
       useChatReadingStore.getState().clear()
     })
+    // 记录上一帧朗读态：仅"真正的朗读结束（active 下降沿）"才清 streamingContent，
+    // 避免非跟读模式（active 恒 false）下语音播放状态变化反复误清，导致打字机中途跳定型
+    let prevActive = false
     const unsubActive = api.chat.onReadingActive((active) => {
       useChatReadingStore.getState().setReadingActive(active)
+      if (prevActive && !active) {
+        const st = useSessionStore.getState()
+        if (!st.streaming) useSessionStore.setState({ streamingContent: '' })
+      }
+      prevActive = active
     })
     return () => {
       unsubText()

@@ -18,6 +18,10 @@ const EXTRACT_RECENT_MESSAGES = 20
 const EXTRACT_MIN_MESSAGES = 6
 /** 同会话重复沉淀的最小间隔（毫秒） */
 const EXTRACT_COOLDOWN_MS = 5 * 60 * 1000
+/** 单次最多转入的候选记忆条数（宁缺毋滥） */
+const MAX_PER_BATCH = 6
+/** 记忆候选最小有效长度（过滤过于琐碎/纯语气词） */
+const MIN_CONTENT_LEN = 6
 /**
  * 抽取请求输出 token 上限：需比主对话更大，给思考型模型（如 mimo-v2.5-pro）
  * 的 reasoning 留出空间，否则 content 可能为空字符串
@@ -29,17 +33,19 @@ const lastExtractAt = new Map<string, number>()
 
 /** 抽取 prompt：独立上下文，绝不混入 EMOTION_PROMPT 的 JSON dialogue 约束 */
 const EXTRACT_SYSTEM_PROMPT =
-  '你是一个对话记忆提取助手。从用户与角色之间的对话中，提取值得长期记住的新信息，' +
+  '你是一个严格的对话记忆提取助手。从「对方(用户)」与「你(角色)」的对话中，' +
+  '只提取「真正长期重要」的新信息，忽略寒暄、日常随口一说、能从上下文自然获得的临时信息、以及明显重复的内容。' +
   '只输出 JSON 本体（不要 markdown 代码块、不要任何解释）：{"memories":[{"category":"user_info","content":"..."}]}\n' +
   '- category 只能是：\n' +
-  '  user_info = 用户信息（用户明确表达或透露的个人信息：姓名/年龄/职业/喜好/雷点/习惯/身份等）\n' +
+  '  user_info = 对方个人信息（姓名/年龄/职业/喜好/雷点/习惯/身份等）\n' +
   '  long_term = 长期经历（重要事件、剧情进展、值得记住的时刻）\n' +
-  '  promises = 约定与承诺（明确达成的约定、约好的时间地点、答应做的事，如"明天下午两点提醒我"）\n' +
-  '- 提取标准放宽：即使出现在角色扮演对话中，只要信息来自用户一侧且具有长期价值就应提取；' +
-  '用户的喜好/称呼归为 user_info，明确的约定（含具体时间）归为 promises。\n' +
-  '- 表述视角：描述用户信息时用「对方」称呼用户，描述角色承诺时用「你」称呼角色，' +
-  '不使用「用户/角色」作主语（例如写「对方的生日是9月11号」而非「用户的生日是9月11号」）。\n' +
-  '- 仅当整段对话确实没有任何值得长期记住的新信息时，才返回 {"memories":[]}。'
+  '  promises = 约定与承诺（明确达成的约定、时间地点、答应做的事）\n' +
+  '- 重要性门槛（满足任一才提取）：明确给出的个人信息；具体且有长期价值的约定；会影响后续互动的重要事件。\n' +
+  '  不提取：客套话、单纯的情绪宣泄、正在被当前对话解决的一次性事项、过于琐碎的日常。\n' +
+  '- 表述视角必须统一：用户一律称「对方」，角色一律称「你」；严禁出现「用户/角色」等标签词作主语。\n' +
+  '  例：写「对方喜欢喝椰奶」而非「用户喜欢喝椰奶」；写「你答应明天陪对方去书店」而非「角色答应...」。\n' +
+  '  每条尽量只包含一个主语视角、一句话讲清，不超过 40 字。\n' +
+  '- 最多返回 6 条；优先保留最具体、最重要者。仅当确实无任何价值时返回 {"memories":[]}。'
 
 /** 抽取结果中的单条记忆 */
 interface ExtractedMemory {
@@ -54,6 +60,20 @@ function isDuplicate(content: string, existing: string[]): boolean {
     const et = e.trim()
     return et === c || (et.length > 8 && (et.includes(c) || c.includes(et)))
   })
+}
+
+/**
+ * 人称视角归一化：统一为「对方=用户、你=角色」，清除混入的「用户/角色/AI」标签。
+ * 避免沉淀出的记忆一会"你"一会"对方"一会"角色"，读感混乱。
+ */
+function normalizePerspective(content: string): string {
+  let c = content.replace(/\s+/g, ' ').trim()
+  // 句中的孤立"角色/AI"→"你"（角色主语）；孤立"用户"→"对方"（用户主语）
+  c = c.replace(/(角色|AI)(?=[，。！？；：、）\s]|$)/g, '你')
+  c = c.replace(/(用户)(?=[，。！？；：、）\s]|$)/g, '对方')
+  // 压缩多余空格与连续标点
+  c = c.replace(/\s+([，。！？；：、])/g, '$1').replace(/,+/g, '，')
+  return c.trim()
 }
 
 /**
@@ -80,11 +100,11 @@ export async function extractMemoriesFromSession(params: {
   if (now - last < EXTRACT_COOLDOWN_MS) return
   lastExtractAt.set(sessionId, now)
 
-  // 取最近一段对话的纯净文本（跳过 UI 元数据）
+  // 取最近一段对话的纯净文本（跳过 UI 元数据）；用「对方/你」标注，与 prompt 视角一致
   const recent = messages.slice(-EXTRACT_RECENT_MESSAGES)
   const dialogueText = recent
     .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => `${m.role === 'user' ? '用户' : '角色'}: ${m.content}`)
+    .map((m) => `${m.role === 'user' ? '对方' : '你'}: ${m.content}`)
     .join('\n')
     .trim()
   if (!dialogueText) return
@@ -116,9 +136,20 @@ export async function extractMemoriesFromSession(params: {
       return
     }
 
-    // 去重：与该角色（含全局背景）现有全部记忆比对
+    // 去重 + 过滤 + 人称归一：与本角色（含全局背景）全部记忆、以及本次批次内都去重；
+    // 太短/纯语气词的直接丢弃；限定每批最多 MAX_PER_BATCH 条
     const existing = (await listMemories()).map((m) => m.content)
-    const fresh = parsed.filter((m) => !isDuplicate(m.content, existing))
+    const seenInBatch: string[] = []
+    const fresh: Array<{ category: MemoryCategory; content: string }> = []
+    for (const m of parsed) {
+      if (fresh.length >= MAX_PER_BATCH) break
+      const content = normalizePerspective(m.content)
+      if (content.length < MIN_CONTENT_LEN) continue
+      if (isDuplicate(content, existing)) continue
+      if (isDuplicate(content, seenInBatch)) continue
+      seenInBatch.push(content)
+      fresh.push({ category: m.category, content })
+    }
     if (fresh.length === 0) return
 
     for (const m of fresh) {

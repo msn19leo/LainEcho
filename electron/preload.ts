@@ -161,7 +161,7 @@ const api: WindowApi = {
     },
     /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
     onVoiceMode: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean; followText: boolean }) => cb(opts)
+      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean }) => cb(opts)
       ipcRenderer.on('chat:voice-mode', listener)
       return () => ipcRenderer.removeListener('chat:voice-mode', listener)
     },
@@ -195,7 +195,7 @@ const api: WindowApi = {
     },
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
@@ -217,9 +217,9 @@ const api: WindowApi = {
       ipcRenderer.on('pet:thinking', listener)
       return () => ipcRenderer.removeListener('pet:thinking', listener)
     },
-    /** 订阅流式开始时的"本轮语音模式"（是否有语音 / 是否跟读），提前决定文本展示 */
+    /** 订阅流式开始时的"本轮语音模式"（是否有语音），提前决定文本展示 */
     onVoiceMode: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean; followText: boolean }) => cb(opts)
+      const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean }) => cb(opts)
       ipcRenderer.on('pet:voice-mode', listener)
       return () => ipcRenderer.removeListener('pet:voice-mode', listener)
     },
@@ -255,6 +255,19 @@ const api: WindowApi = {
     removeReference: (id) => ipcRenderer.invoke('tts:remove-reference', id),
     renameReference: (id, name) => ipcRenderer.invoke('tts:rename-reference', id, name),
     synthesize: (params) => ipcRenderer.invoke('tts:synthesize', params),
+    genieConfig: () => ipcRenderer.invoke('tts:genie-config'),
+    genieSaveConfig: (patch) => ipcRenderer.invoke('tts:genie-save-config', patch),
+    genieCheck: (baseUrl) => ipcRenderer.invoke('tts:genie-check', baseUrl),
+    genieStart: (workPath, dataDir) => ipcRenderer.invoke('tts:genie-start', workPath, dataDir),
+    chooseFolder: () => ipcRenderer.invoke('tts:choose-folder'),
+    chooseAudioFile: () => ipcRenderer.invoke('tts:choose-audio-file'),
+  },
+  /** 角色 TTS 模型卡管理 */
+  ttsModel: {
+    list: () => ipcRenderer.invoke('tts-model:list'),
+    create: (input) => ipcRenderer.invoke('tts-model:create', input),
+    update: (id, input) => ipcRenderer.invoke('tts-model:update', id, input),
+    delete: (id) => ipcRenderer.invoke('tts-model:delete', id),
   },
   modelSettings: {
     get: () => ipcRenderer.invoke('model-settings:get'),

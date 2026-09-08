@@ -10,17 +10,25 @@
 import { ipcMain, dialog } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
-import type { TTSConfig, TTSLanguage, VoiceReference } from '../../src/types'
+import type { TTSConfig, TTSLanguage, VoiceReference, StandardEmotion, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../src/types'
 import { paths, readJson, writeJson, mutateJson, deleteFile } from '../services/storage'
 import { saveSecret, readSecret, hasSecret } from '../services/crypto'
-import { genId, assertValidResourceId } from '../services/repository'
+import { genId, assertValidResourceId, listTTSModels, getTTSModel, createTTSModel, updateTTSModel, deleteTTSModel } from '../services/repository'
 import { synthesizeWithMiMo, bufferToBase64 } from '../services/ttsClient'
+import {
+  getGenieConfig,
+  saveGenieConfig,
+  checkGenie,
+  startGenieServer,
+  downloadGenieData,
+  synthesizeGenie,
+} from '../services/genieTts'
 
-/** 默认 TTS 配置 */
+/** 默认 TTS 配置（默认走本地声库语音服务 GenieTTS） */
 const DEFAULT_TTS_CONFIG: TTSConfig = {
   language: 'zh',
   model: '',
-  followText: true,
+  engine: 'genie',
 }
 
 /** 默认参考音频列表（空数组） */
@@ -68,9 +76,10 @@ function parseWavDuration(buf: Buffer): number | null {
   }
 }
 
-/** 读取 TTS 配置（供 ai.ipc 读取跟读等状态） */
+/** 读取 TTS 配置（供 ai.ipc 读取跟读等状态）。合并默认值，兼容缺少 engine/mirror 的旧配置 */
 export async function getTTSConfig(): Promise<TTSConfig> {
-  return readJson<TTSConfig>(paths.voiceSettingsFile, DEFAULT_TTS_CONFIG)
+  const current = await readJson<TTSConfig>(paths.voiceSettingsFile, DEFAULT_TTS_CONFIG)
+  return { ...DEFAULT_TTS_CONFIG, ...current }
 }
 
 /** 读取 MiMo API Key（明文，仅主进程内存中使用） */
@@ -116,6 +125,51 @@ export function registerTtsIpc(): void {
     const next: TTSConfig = { ...current, ...patch }
     await writeJson(paths.voiceSettingsFile, next)
     return next
+  })
+
+  // ==================== 本地声库语音服务(GenieTTS) ====================
+
+  /** 读取 GenieTTS 配置 */
+  ipcMain.handle('tts:genie-config', () => getGenieConfig())
+
+  /** 保存 GenieTTS 配置（部分合并） */
+  ipcMain.handle('tts:genie-save-config', async (_e, patch: Partial<TTSGenieConfig>) => {
+    return saveGenieConfig(patch ?? {})
+  })
+
+  /** 检测 GenieTTS 服务是否在线 */
+  ipcMain.handle('tts:genie-check', async (_e, baseUrl: string) => {
+    return checkGenie(baseUrl)
+  })
+
+  /** 用 GenieTTS 环境 + GenieData 目录自动拉起服务 */
+  ipcMain.handle('tts:genie-start', async (_e, workPath: string, dataDir?: string) => {
+    const cfg = await getGenieConfig()
+    return startGenieServer(workPath ?? cfg.workPath, cfg.baseUrl, dataDir ?? cfg.dataDir)
+  })
+
+  /** 用系统 python 下载 GenieData 资源 */
+  ipcMain.handle('tts:genie-download-data', async (_e, dataDir: string) => {
+    return downloadGenieData(dataDir)
+  })
+
+  /** 弹目录选择框 */
+  ipcMain.handle('tts:choose-folder', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+      title: '选择目录',
+    })
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
+  })
+
+  /** 弹文件选择框（wav/mp3） */
+  ipcMain.handle('tts:choose-audio-file', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      title: '选择参考音频',
+      filters: [{ name: '音频', extensions: ['wav', 'mp3'] }],
+    })
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
   })
 
   // ==================== 参考音频管理 ====================
@@ -221,33 +275,68 @@ export function registerTtsIpc(): void {
   // ==================== 合成 ====================
 
   /**
-   * 合成语音：传入文本 + 参考音频 id，调用 MiMo API 返回 wav ArrayBuffer
+   * 合成语音：按 engine 路由到本地声库服务(GenieTTS) 或 MiMo 声音克隆。
    * @param params.text 要合成的文本
-   * @param params.voiceId 参考音频 id（对应 voices/index.json 中的条目）
+   * @param params.voiceId 参考音频 id（仅 mimo 引擎需要；genie 可空）
    * @param params.languageOverride 角色级语言覆盖（null/undefined = 跟随全局）
+   * @param params.emotion 保留字段（Genie 由声库自带性格，忽略逐句情绪）
+   * @param params.engine 显式引擎覆盖（角色卡决定；缺省用全局配置）
+   * @param params.genieOverride 角色级 Genie 覆盖（绑定的 TTS 模型卡 id）
    * @returns wav 格式的 ArrayBuffer，调用失败抛出错误
    */
-  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string; languageOverride?: TTSLanguage | null }) => {
-    const { text, voiceId, languageOverride } = params ?? {}
+  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: StandardEmotion | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }) => {
+    const { text, voiceId, languageOverride, engine: engineOverride, genieOverride } = params ?? {}
     if (typeof text !== 'string' || !text.trim()) {
       throw new Error('合成文本不能为空')
     }
-    assertValidVoiceId(voiceId)
 
+    // 角色级语言覆盖：languageOverride 非空时覆盖全局 language
+    const config = await getTTSConfig()
+    const effectiveConfig: TTSConfig = languageOverride
+      ? { ...config, language: languageOverride }
+      : config
+    const engine = engineOverride ?? config.engine ?? 'genie'
+
+    // 本地声库引擎：无需参考音频，直接合成（声库自带性格）
+    if (engine === 'genie') {
+      const base = await getGenieConfig()
+      // 从 TTS 模型卡获取角色参数
+      let characterName = ''
+      let onnxModelDir = ''
+      let refAudioPath = ''
+      let refAudioText = ''
+      if (genieOverride?.ttsModelId) {
+        const modelCard = await getTTSModel(genieOverride.ttsModelId)
+        if (modelCard) {
+          characterName = modelCard.characterName
+          onnxModelDir = modelCard.onnxModelDir
+          refAudioPath = modelCard.refAudioPath
+          refAudioText = modelCard.refAudioText
+        }
+      }
+      if (!characterName || !onnxModelDir) {
+        throw new Error('未绑定 TTS 模型卡或模型卡配置不完整，请先在「设置 → 语音合成」中创建并绑定')
+      }
+      return synthesizeGenie({
+        config: base,
+        characterName,
+        onnxModelDir,
+        refAudioPath: refAudioPath || undefined,
+        refAudioText: refAudioText || undefined,
+        text: text.trim(),
+        lang: effectiveConfig.language,
+      })
+    }
+
+    // MiMo 引擎：需要参考音频 + API Key
+    assertValidVoiceId(voiceId ?? '')
     const apiKey = await readVoiceApiKey()
     if (!apiKey) {
       throw new Error('未配置 MiMo API Key，请先在「设置 → 语音合成」中填写')
     }
-
-    const config = await getTTSConfig()
     if (!config.model.trim()) {
       throw new Error('未配置 TTS 模型，请先在「设置 → 语音合成」中填写')
     }
-
-    // 角色级语言覆盖：languageOverride 非空时覆盖全局 language
-    const effectiveConfig: TTSConfig = languageOverride
-      ? { ...config, language: languageOverride }
-      : config
 
     const list = await readJson<VoiceReference[]>(paths.voicesIndexFile, DEFAULT_VOICES)
     const voice = list.find((v) => v.id === voiceId)
@@ -271,3 +360,21 @@ export function registerTtsIpc(): void {
     })
   })
 }
+
+// ---- TTS 模型卡 CRUD ----
+
+ipcMain.handle('tts-model:list', async () => {
+  return listTTSModels()
+})
+
+ipcMain.handle('tts-model:create', async (_e, input: TTSModelCardInput) => {
+  return createTTSModel(input)
+})
+
+ipcMain.handle('tts-model:update', async (_e, id: string, input: TTSModelCardInput) => {
+  return updateTTSModel(id, input)
+})
+
+ipcMain.handle('tts-model:delete', async (_e, id: string) => {
+  return deleteTTSModel(id)
+})

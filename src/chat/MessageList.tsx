@@ -37,8 +37,6 @@ export function MessageList() {
   const currentCardName = useCurrentCardName()
   const followReading = useChatReadingStore((s) => s.followReading)
   const readingActive = useChatReadingStore((s) => s.readingActive)
-  // 语音朗读中的文本：仅当确有朗读内容（本轮真正在朗读）时才隐藏定型 message，避免新一轮准备期误藏上一轮回答
-  const readingText = useChatReadingStore((s) => s.text)
   const listRef = useRef<HTMLDivElement>(null)
   /** 内容区外层（观测其实际高度以在打字机/流式增长时自动滚到底） */
   const contentRef = useRef<HTMLDivElement>(null)
@@ -93,10 +91,14 @@ export function MessageList() {
       {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}
       <div ref={contentRef} className="space-y-4">
       {messages.map((msg, i) => {
-        // 语音跟读进行中（readingActive，仅在语音真正开始朗读时为真）即隐藏该条定型 AI，
-        // 由跟读气泡接管。无需再要求 readingText>0，否则语音音频尚未备好时定型全文会先露出再"消失"。
-        if (!streaming && (readingActive || streamingContent.length > 0) && msg.role === 'assistant' && i === lastAssistantIndex)
+        // 隐藏末条定型 AI 的判定（须确有内容可显示，才由跟读/流式气泡接管，避免误藏上一条已落定回答）：
+        //  - 跟读：仅当语音正在朗读（readingActive）时才隐藏；朗读结束即恢复定型消息，
+        //    不依赖 streamingContent（跟读气泡显示 readingText），避免"朗读结束空档"误隐藏。
+        //  - 流式（非跟读）：streamingContent 尚有内容（揭示未完）时隐藏。
+        if (!streaming && ((followReading && readingActive) || (!followReading && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
+          console.log('[sync] chat 隐藏末条AI 下标=%d 原因(followReading=%s,readingActive=%s,sc=%d)', i, followReading, readingActive, streamingContent.length)
           return null
+        }
         const isUser = msg.role === 'user'
         return (
           <motion.div
@@ -133,7 +135,9 @@ export function MessageList() {
         )
       })}
 
-      {streaming || streamingContent.length > 0 || (followReading && readingActive) ? (
+      {/* 流式/跟读气泡显示：跟读仅当语音正在朗读（readingActive）时出现（否则朗读结束后
+          streamingContent 已空会渲染空气泡）；非跟读在 streamingContent 尚有内容时出现 */}
+      {streaming || (!followReading && streamingContent.length > 0) || (followReading && readingActive) ? (
         <StreamingBubble
           name={currentCardName || 'AI'}
           listRef={listRef}
@@ -178,6 +182,14 @@ function StreamingBubble({
   const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? 80)
   const typeSpeed = typingSpeedToMs(textSpeed)
 
+  // 即时模式（textSpeed=0 → typeSpeed<=0）：Typewriter 全量直显、不触发 onDone 清空 streamingContent，
+  // 会导致定型消息被持续隐藏、气泡文字停在流式气泡里。流式一结束即清空，让完整消息上屏。
+  useEffect(() => {
+    if (!streaming && streamingContent.length > 0 && typeSpeed <= 0) {
+      useSessionStore.setState({ streamingContent: '' })
+    }
+  }, [streaming, streamingContent, typeSpeed])
+
   // 流式内容更新时跟随滚动（复用父级列表，仅在接近底部时瞬时滚动）
   useEffect(() => {
     const el = listRef.current
@@ -191,11 +203,12 @@ function StreamingBubble({
       <div className="max-w-[80%] text-left">
         <div className="mb-1 px-1 text-xs text-text-muted">{name}</div>
         <div className="glass selectable rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] px-4 py-2.5 text-sm leading-relaxed text-text">
-          {/* 语音跟读：与宠物窗一致地追加式打字机流式；否则走流式打字机 */}
+          {/* 语音跟读：显示 readingText（宠物窗随语音段落追加的 displayedText 镜像），打字机逐字；
+              与宠物窗完全同源——语音播到哪段、文本跟到哪段，杜绝"全文先出、语音后到"的不同步。
+              打完不清（由朗读结束清），光标仅在输出中显示。 */}
           {followReading ? (
             <span className="whitespace-pre-wrap break-words">
-              {/* 语音跟读轮：仅朗读进行中用朗读文本打字；待输出期显示空+光标，绝不透出上一轮残留文本 */}
-              {readingActive && <Typewriter text={readingText} speed={typeSpeed} />}
+              <Typewriter text={readingText} speed={typeSpeed} noCursor />
               {(streaming || readingActive) && <span className="streaming-cursor" />}
             </span>
           ) : (

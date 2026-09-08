@@ -18,9 +18,9 @@ class WindowManager {
   /** 桌宠 renderer 是否已 ready（did-finish-load）。就绪前触发的语音缓存，避免首个回答丢声 */
   private petSpeakReady = false
   /** 当前缓存的最新的"本轮语音模式"（未就绪时暂存，就绪后先于首批语音补发） */
-  private pendingVoiceMode: { voiceEnabled: boolean; followText: boolean } | null = null
+  private pendingVoiceMode: { voiceEnabled: boolean } | null = null
   /** 最近一次广播的语音模式（窗口就绪后补发用） */
-  private lastVoiceMode: { voiceEnabled: boolean; followText: boolean } | null = null
+  private lastVoiceMode: { voiceEnabled: boolean } | null = null
   /** 当前正在进行 AI 流式回复的会话 id（无则 null）。用于窗口重载/新建后就绪时补发，
    *  让重开/热更的窗口能"认领"进行中的会话，避免漏掉该轮的 stream-user/done 而看起来"生成失败" */
   private activeStreamingSession: string | null = null
@@ -30,6 +30,8 @@ class WindowManager {
     languageOverride: TTSLanguage | null
     chunks?: Array<{ text: string; emotion: StandardEmotion }>
     follow: boolean
+    engine?: 'genie' | 'mimo'
+    genieOverride?: import('../../src/types').CharacterGenieOverride | null
   }> = []
 
   /** app ready 后调用：创建桌宠窗口 + 托盘 */
@@ -151,7 +153,7 @@ class WindowManager {
    * 桌宠窗口收到 pet:speak 事件后：调用 TTS 合成 → 播放音频 → 口型同步。
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean }): void {
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }): void {
     const win = this.pet
     if (!win || win.isDestroyed()) return
     const body: {
@@ -160,12 +162,16 @@ class WindowManager {
       languageOverride: TTSLanguage | null
       chunks?: Array<{ text: string; emotion: StandardEmotion }>
       follow: boolean
+      engine?: 'genie' | 'mimo'
+      genieOverride?: import('../../src/types').CharacterGenieOverride | null
     } = {
       text,
       voiceId,
       languageOverride: languageOverride ?? null,
       chunks: payload?.chunks,
       follow: payload?.follow ?? true,
+      engine: payload?.engine,
+      genieOverride: payload?.genieOverride ?? null,
     }
     // 桌宠 renderer 未就绪（首个回答常发生）→ 先缓存，ready 后补发，避免丢声
     if (!this.petSpeakReady) {
@@ -184,8 +190,8 @@ class WindowManager {
     }
   }
 
-  /** 广播"本轮语音是否跟读/是否有语音"（流式开始时下发），供宠物窗与聊天窗提前决定文本展示方式 */
-  notifyVoiceMode(opts: { voiceEnabled: boolean; followText: boolean }): void {
+  /** 广播"本轮是否有语音"（流式开始时下发），供宠物窗与聊天窗提前决定文本展示方式 */
+  notifyVoiceMode(opts: { voiceEnabled: boolean }): void {
     // 记录最近一次语音模式：供窗口就绪后（renderer-ready）补发，保证两端都拿到
     this.lastVoiceMode = opts
     const win = this.pet
@@ -238,8 +244,9 @@ class WindowManager {
     }
   }
 
-  /** 宠物窗朗读是否进行中 → 转发给聊天窗控制跳动光标显隐 */
+  /** 桌宠窗朗读是否进行中 → 转发给聊天窗控制光标 */
   notifyReadingActive(active: boolean): void {
+    console.log('[sync] pet阅读Active→chat', active)
     if (this.chat && !this.chat.isDestroyed()) {
       this.chat.webContents.send('chat:reading-active', active)
     }

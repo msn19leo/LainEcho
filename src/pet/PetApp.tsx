@@ -88,6 +88,8 @@ export default function PetApp() {
 
   // 跟随聊天窗切换/新建会话：收到当前会话 id 时加载对应消息到宠物窗内容框；null 表示清空
   useEffect(() => api.pet.onCurrentSessionChanged((id) => {
+    const before = useSessionStore.getState()
+    console.log('[sync] pet收到currentSession id=%s 本地cur=%s 本地msgs=%d', id, before.currentSessionId, before.messages.length)
     // 会话变化：清空上一会话的上下文用量，避免串显示
     setCtxStats((prev) => (prev && prev.sessionId !== id ? null : prev))
     if (!id) {
@@ -200,7 +202,7 @@ export default function PetApp() {
   // 旧串行架构间隔 = 合成时间 + 播放时间；新架构间隔 ≈ max(合成时间, 播放时间)。
 
   /** 待合成的文本队列（入队顺序 = 播放顺序；index 为合成分段索引，null 表示单段整条） */
-  const textQueueRef = useRef<Array<{ text: string; voiceId: string; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: StandardEmotion }>>([])
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: StandardEmotion; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null }>>([])
   /** 已合成待播放的音频队列（附带块文本与情绪：跟读时用块文本逐字显示、切立绘用情绪） */
   const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer; index: number | null; emotion: StandardEmotion; text: string }>>([])
   /** 合成锁：同时只合成一段，避免 MiMo API 并发请求 */
@@ -242,7 +244,7 @@ export default function PetApp() {
         if (next.index !== null) stageRef.current?.setEmotion(next.emotion)
         return
       }
-      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride })
+      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride, emotion: next.emotion, engine: next.engine, genieOverride: next.genieOverride })
       // 合完时若已被新一轮/终止清场，丢弃这段，避免旧音频串到新一轮（杂音/串场）
       if (audio && speechRoundRef.current === round) {
         audioQueueRef.current.push({ buffer: audio, index: next.index, emotion: next.emotion, text: next.text })
@@ -251,11 +253,23 @@ export default function PetApp() {
       }
     } catch (err) {
       console.error('[pet] TTS 合成失败', err)
+      // 即使该段合成失败，也把文本顶上跟读气泡，避免"该回复静默消失/气泡不同步"：
+      // 否则 active 卡住会把最后一条 AI 消息持续隐藏，pet 内容框就看不到这条回复。
+      if (next.text) {
+        usePetReadingStore.getState().appendText(next.text)
+      }
+      if (next.index !== null) stageRef.current?.setEmotion(next.emotion)
     } finally {
       isSynthesizingRef.current = false
       // 继续合成下一段（预合成），不等播放
       if (textQueueRef.current.length > 0) {
         void synthesizeLoop()
+      } else if (audioQueueRef.current.length === 0 && !isPlayingRef.current) {
+        // 无待合成、无待播音频（可能前序全部合成失败）：立即收尾朗读状态，让定型消息正常上屏。
+        // 清空 displayedText 同 playLoop 收尾，避开 zustand subscribe 回调内重入
+        usePetReadingStore.getState().setPlaying(false)
+        usePetReadingStore.getState().setActive(false)
+        usePetReadingStore.getState().clearText()
       }
     }
   }
@@ -289,9 +303,12 @@ export default function PetApp() {
       if (audioQueueRef.current.length > 0) {
         void playLoop()
       } else if (!isSynthesizingRef.current && textQueueRef.current.length === 0) {
-        // 全部段落播完：结束朗读流程与播放状态（气泡让位给定型消息）
+        // 全部段落播完：结束朗读流程与播放状态（气泡让位给定型消息）。
+        // 注意：清空 displayedText 必须在订阅回调之外执行（zustand setState 在 subscribe 回调内
+        // 重入会无限循环），故在 setActive(false) 之后、同一调用栈内完成收尾
         usePetReadingStore.getState().setPlaying(false)
         usePetReadingStore.getState().setActive(false)
+        usePetReadingStore.getState().clearText()
       }
     }
   }
@@ -299,13 +316,16 @@ export default function PetApp() {
   // 订阅"说话"事件：聊天窗口流式完成后触发，按主进程拆好的合成分段（dialogue 逐项）段级合成播放
   useEffect(() => {
     const unsub = api.pet.onSpeak((payload) => {
-      const { text, voiceId, languageOverride, chunks, follow } = payload ?? {}
-      if (!voiceId || !text?.trim()) return
+      const { text, voiceId, languageOverride, chunks, follow, engine, genieOverride } = payload ?? {}
+      if (!text?.trim()) return
+      console.log('[sync] pet onSpeak text=%s chunks=%d engine=%s', text.slice(0, 16), chunks?.length ?? 0, engine ?? '?')
       const isFollow = follow === true
       // 仅"跟读文本"开启时用段落跟读气泡（段随语音，active 置真）；
       // 关闭跟读时语音在整段文本生成后播放，不改文本展示（保持流式打字机，active 不置真）
       if (isFollow) {
         usePetReadingStore.getState().setMode('follow')
+        // 新一轮朗读开始：先清空上一轮跟读残留文本，避免上一轮全文在新一轮被瞬间渲染
+        usePetReadingStore.getState().clearText()
         usePetReadingStore.getState().setActive(true)
       }
       const list = chunks && chunks.length > 0 ? chunks : [{ text: text.trim(), emotion: DEFAULT_EMOTION }]
@@ -318,6 +338,8 @@ export default function PetApp() {
           languageOverride: languageOverride ?? null,
           index: chunks && chunks.length > 0 ? i : null,
           emotion: c.emotion,
+          engine,
+          genieOverride: genieOverride ?? null,
         }))
       if (items.length === 0) return
       textQueueRef.current.push(...items)
@@ -327,13 +349,12 @@ export default function PetApp() {
     return unsub
   }, [])
 
-  // 流式开始时订阅本轮语音模式：仅当"有语音 且 开启跟读文本"时用段落跟读打字，
-  // 否则（无语音 / 关闭跟读）走流式打字机整段流式输出。
+  // 流式开始时订阅本轮语音模式：有语音时用段落跟读打字，无语音时走流式打字机整段流式输出。
   // 注意：这里只切 mode 并清空文本，不让 active 直接为真——active 反映"语音真正开始朗读"，
   // 由 onSpeak（语音块实际调度）接管置真，避免 LLM 生成快于语音时先露出整段再消失。
-  useEffect(() => api.pet.onVoiceMode(({ voiceEnabled, followText }) => {
+  useEffect(() => api.pet.onVoiceMode(({ voiceEnabled }) => {
     const st = usePetReadingStore.getState()
-    st.setMode(voiceEnabled && followText ? 'follow' : 'typewriter')
+    st.setMode(voiceEnabled ? 'follow' : 'typewriter')
     // 新一轮开始：立即清空已显示文本（不等流式开始），避免上一轮残留文本被透给聊天窗
     st.clearText()
   }), [])
@@ -347,9 +368,19 @@ export default function PetApp() {
 
   // 订阅朗读 store：朗读文本追加/重置、朗读进行状态变化时，同步到聊天窗（文本 + 朗读进行中）
   useEffect(() => {
+    let prevActive = usePetReadingStore.getState().active
     return usePetReadingStore.subscribe((s) => {
       api.pet.reportReadingText(s.displayedText)
       api.pet.reportReadingActive(s.active)
+      // 朗读结束（active 下降沿）且流式已结束：清空 streamingContent，让定型消息上屏。
+      // 注意：此处不可调用 pet store 的 setter（如 clearText）——zustand 在 subscribe 回调内
+      // setState 会因每次新建对象引用而无限重入循环（刷屏 + 阻塞渲染）。
+      // displayedText 的清空已在 playLoop/synthesizeLoop 收尾处（setActive(false) 之后）完成。
+      if (prevActive && !s.active) {
+        const st = useSessionStore.getState()
+        if (!st.streaming) useSessionStore.setState({ streamingContent: '' })
+      }
+      prevActive = s.active
     })
   }, [])
 

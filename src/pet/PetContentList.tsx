@@ -13,9 +13,6 @@ import { Typewriter } from '../components/Typewriter'
 import { cn } from '../lib/utils'
 import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
 
-/** 语音跟读文字逐字速度：跟随音频节奏，不随「文字显示速度」设置（打字速度仅作用于无语音流式） */
-const FOLLOW_SPEED = 25
-
 /** 当前使用中的角色名（AI 名牌用） */
 function useCurrentCardName(): string {
   const cards = useCharacterStore((s) => s.cards)
@@ -25,7 +22,7 @@ function useCurrentCardName(): string {
 }
 
 export function PetContentList() {
-  // 逐字速度：从全局设置读文字显示速度档（0-100）并换算为每字间隔毫秒
+  /** 逐字速度：从全局设置读文字显示速度档（0-100）并换算为每字间隔毫秒；跟读与流式共用同一速度 */
   const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? 80)
   const typeSpeed = typingSpeedToMs(textSpeed)
   const messages = useSessionStore((s) => s.messages)
@@ -37,8 +34,6 @@ export function PetContentList() {
   const playing = usePetReadingStore((s) => s.playing)
   /** 语音跟读模式：从第一刻起就用段级跟读气泡（空内容+跳动光标占位，等首块语音） */
   const following = revealMode === 'follow'
-  /** 本轮语音跟读流程是否进行中：期间用语音气泡，并隐藏已落定的完整定型消息，避免先露出整段再消失 */
-  const voiceFollowing = readingActive
   /** 朗读期间隐藏最后一条已落定的 AI 消息（由跟读气泡顶替，避免与定型全文重复） */
   const lastAssistantIndex = (() => {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -56,16 +51,28 @@ export function PetContentList() {
   // 内容高度增长（打字机逐字 reveal、流式、跟读追加段）时自动滚到底
   useAutoScrollBottom(scrollRef, contentRef, followRef, [messages, streaming, streamingContent, displayedText])
 
+  // 即时模式（textSpeed=0 → typeSpeed<=0）下 Typewriter 全量直显、不会触发 onDone 清空 streamingContent，
+  // 会导致"定型消息被持续隐藏、气泡不同步"。流式一结束即清空，让已落定的完整消息上屏。
+  useEffect(() => {
+    if (!streaming && streamingContent.length > 0 && typeSpeed <= 0) {
+      useSessionStore.setState({ streamingContent: '' })
+    }
+  }, [streaming, streamingContent, typeSpeed])
+
   return (
     <div ref={scrollRef} className="h-full overflow-y-auto px-2 py-1 text-[13px] leading-[16px] text-text" onWheel={(e) => e.stopPropagation()}>
       {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}
       <div ref={contentRef}>
       {messages.map((msg, i) => {
-        // 本轮语音跟读流程进行中（active）即隐藏最后一条已定型的 AI 消息，由跟读气泡接管。
-        // active 仅在语音真正开始朗读（onSpeak）为真，故此处无需再要求 displayedText>0——
-        // 否则 LLM 已跟读完成但语音音频尚未备好（displayedText 仍为空）时，会先露出整段再"消失"。
-        if (!streaming && (voiceFollowing || streamingContent.length > 0) && msg.role === 'assistant' && i === lastAssistantIndex)
+        // 隐藏末条定型 AI 的判定（须确有内容可显示，才由跟读/流式气泡接管，避免误藏上一条已落定回答）：
+        //  - 跟读：仅当语音正在朗读（readingActive）时才隐藏；朗读结束（active 下降沿）即恢复定型消息，
+        //    不依赖 displayedText——否则朗读结束只清 streamingContent 而 displayedText 残留，
+        //    会把定型消息持续隐藏、跟读气泡又已让位 = "气泡消失"。
+        //  - 流式（非跟读）：streamingContent 尚有内容（揭示未完）时隐藏。
+        if (!streaming && ((following && readingActive) || (!following && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
+          console.log('[sync] pet 隐藏末条AI 下标=%d 原因(following=%s,readingActive=%s,dt=%d,sc=%d)', i, following, readingActive, displayedText.length, streamingContent.length)
           return null
+        }
         const isUser = msg.role === 'user'
         return (
           <div key={i} className={cn('my-1 flex flex-col', isUser ? 'items-end' : 'items-start')}>
@@ -92,23 +99,25 @@ export function PetContentList() {
         )
       })}
 
-      {(streaming || streamingContent.length > 0 || voiceFollowing) && (
+      {/* 跟读气泡显示：跟读仅当语音正在朗读（readingActive）时出现（语音未到先空位+光标等待）；
+          非跟读在 streamingContent 尚有内容时出现。均排除"朗读结束后的残留态"，避免空气泡 */}
+      {(streaming || (!following && streamingContent.length > 0) || (following && readingActive)) && (
         <div className="my-1 flex flex-col items-start">
           <span className="mb-0.5 select-none px-1 text-[10px] font-medium text-[var(--primary-400)]">{aiName}</span>
           <span className="max-w-[90%] whitespace-pre-wrap break-words rounded-[5px] border border-[var(--border-strong)] bg-[var(--bg-surface)]/70 px-2 py-1 text-text">
-            {/* 跟读：确有朗读文本时随音频逐字 reveal；否则走即时或固定速度打字机，
-                避免无语音轮因 mode 残留而显示空白 */}
+            {/* 跟读显示 displayedText（随语音段落逐段追加，段随语音推进）；非跟读显示 streamingContent（LLM 流式全文）。
+                跟读用语音驱动文本：杜绝"全文先打字完、语音后到"的不同步；打完不清（由朗读结束清），
+                非跟读 complete+onDone 打完即清。 */}
             {following ? (
               <span className="whitespace-pre-wrap break-words">
-                {/* 追加式打字机：整段回复随语音段追加写入 displayedText，打字机流式打出，无替换/无闪烁；速度跟随音频节奏 */}
-                <Typewriter text={displayedText} speed={FOLLOW_SPEED} />
+                <Typewriter text={displayedText} speed={typeSpeed} noCursor />
                 {(streaming || playing || readingActive) && <span className="streaming-cursor" />}
               </span>
             ) : (
-              /* 无语音流式：textSpeed 逐字；流式结束后 complete 时 reveal 追平才 onDone 清空落定 */
               <Typewriter
                 text={streamingContent}
                 speed={typeSpeed}
+                className="whitespace-pre-wrap break-words"
                 complete={!streaming}
                 onDone={() => useSessionStore.setState({ streamingContent: '' })}
               />

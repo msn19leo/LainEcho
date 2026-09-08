@@ -670,6 +670,7 @@ export function CharacterModelPanel() {
         open={!!emotionEditing}
         onClose={() => setEmotionEditing(null)}
         title={`情绪映射 · ${emotionEditing?.name ?? ''}`}
+        width={420}
         footer={
           <>
             <Button variant="ghost" onClick={() => setEmotionEditing(null)}>

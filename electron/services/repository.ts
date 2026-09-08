@@ -17,6 +17,8 @@ import type {
   ModelSettings,
   SessionDetail,
   SessionIndexItem,
+  TTSModelCard,
+  TTSModelCardInput,
 } from '../../src/types'
 import { CHARACTER_CARD_VERSION } from '../../src/types'
 import { paths, readJson, writeJson, mutateJson, deleteFile, fileExists } from './storage'
@@ -29,7 +31,7 @@ export function genId(prefix: string): string {
  * 校验资源 ID 是否为系统生成的合法格式。
  * 会话/模型 ID 会拼入文件路径，必须校验，防止渲染进程构造路径穿越 ID（如 ../../secure/apiKey）。
  */
-export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'sprite' | 'card' | 'mem'): void {
+export function assertValidResourceId(id: string, kind: 'session' | 'model' | 'sprite' | 'card' | 'mem' | 'tts-model'): void {
   if (typeof id !== 'string' || !new RegExp(`^${kind}_[0-9a-f]{12}$`).test(id)) {
     throw new Error('非法资源 ID')
   }
@@ -112,6 +114,9 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     messageExample: raw.messageExample ?? '',
     modelId: raw.modelId ?? null,
     voiceId: raw.voiceId ?? null,
+    // 声音模式：旧卡按是否绑定参考音频迁移（绑定=mimo，否则 none）
+    voiceMode: raw.voiceMode ?? (raw.voiceId ? 'mimo' : 'none'),
+    genieOverride: raw.genieOverride ?? null,
     ttsOverride: raw.ttsOverride ?? null,
     modelOverride: raw.modelOverride ?? null,
     // 形象呈现（2D 立绘）；旧卡缺省 → Live2D 模式、未绑立绘
@@ -145,6 +150,8 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     messageExample: input.messageExample ?? '',
     modelId: input.modelId || null,
     voiceId: input.voiceId || null,
+    voiceMode: input.voiceMode ?? (input.voiceId ? 'mimo' : 'none'),
+    genieOverride: input.genieOverride ?? null,
     ttsOverride: input.ttsOverride ?? null,
     modelOverride: input.modelOverride ?? null,
     renderMode: input.renderMode ?? null,
@@ -784,4 +791,57 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     selectedModelId: result?.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
     selectedSpriteId: result?.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }
+}
+
+// ---------------- TTS 模型卡 ----------------
+
+const DEFAULT_TTS_MODELS: TTSModelCard[] = []
+
+export async function listTTSModels(): Promise<TTSModelCard[]> {
+  return readJson<TTSModelCard[]>(paths.ttsModelsIndexFile, DEFAULT_TTS_MODELS)
+}
+
+export async function getTTSModel(id: string): Promise<TTSModelCard | null> {
+  assertValidResourceId(id, 'tts-model')
+  const models = await listTTSModels()
+  return models.find((m) => m.id === id) ?? null
+}
+
+export async function createTTSModel(input: TTSModelCardInput): Promise<TTSModelCard> {
+  const card: TTSModelCard = {
+    id: genId('tts-model'),
+    name: input.name.trim(),
+    characterName: input.characterName.trim(),
+    onnxModelDir: input.onnxModelDir.trim(),
+    refAudioPath: input.refAudioPath.trim(),
+    refAudioText: input.refAudioText.trim(),
+    createdAt: Date.now(),
+  }
+  await mutateJson<TTSModelCard[]>(paths.ttsModelsIndexFile, DEFAULT_TTS_MODELS, (list) => [...list, card])
+  return card
+}
+
+export async function updateTTSModel(id: string, input: TTSModelCardInput): Promise<TTSModelCard> {
+  assertValidResourceId(id, 'tts-model')
+  const updated = await mutateJson<TTSModelCard[]>(paths.ttsModelsIndexFile, DEFAULT_TTS_MODELS, (list) => {
+    const idx = list.findIndex((m) => m.id === id)
+    if (idx === -1) throw new Error('TTS 模型卡不存在')
+    const existing = list[idx]!
+    const next: TTSModelCard = {
+      ...existing,
+      name: input.name.trim(),
+      characterName: input.characterName.trim(),
+      onnxModelDir: input.onnxModelDir.trim(),
+      refAudioPath: input.refAudioPath.trim(),
+      refAudioText: input.refAudioText.trim(),
+    }
+    list[idx] = next
+    return list
+  })
+  return updated.find((m) => m.id === id)!
+}
+
+export async function deleteTTSModel(id: string): Promise<void> {
+  assertValidResourceId(id, 'tts-model')
+  await mutateJson<TTSModelCard[]>(paths.ttsModelsIndexFile, DEFAULT_TTS_MODELS, (list) => list.filter((m) => m.id !== id))
 }

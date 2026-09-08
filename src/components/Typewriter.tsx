@@ -17,6 +17,7 @@ export function Typewriter({
   className,
   complete = false,
   onDone,
+  noCursor = false,
 }: {
   text: string
   speed: number
@@ -25,6 +26,8 @@ export function Typewriter({
   complete?: boolean
   /** reveal 把完整文本全部打完之后调用（仅 complete 为 true 时触发一次） */
   onDone?: () => void
+  /** 关闭组件内部光标，改由调用方用 .streaming-cursor 统一控制（用于跟读等需"间隙也常亮"场景，避免双光标） */
+  noCursor?: boolean
 }) {
   const [visible, setVisible] = useState(0)
   const visibleRef = useRef(0)
@@ -66,7 +69,7 @@ export function Typewriter({
   return (
     <span className={className}>
       {text.slice(0, Math.min(visible, text.length))}
-      {visible < text.length && <span className="streaming-cursor" />}
+      {!noCursor && visible < text.length && <span className="streaming-cursor" />}
     </span>
   )
 }

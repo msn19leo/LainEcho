@@ -13,7 +13,7 @@ import {
   useEffect,
   useState,
 } from 'react'
-import { ChevronDown, RotateCcw, X } from 'lucide-react'
+import { ChevronDown, RotateCcw, XCircle } from 'lucide-react'
 import { cn } from '../lib/utils'
 
 // ---------------- Button ----------------
@@ -155,20 +155,20 @@ export function Modal({ open, onClose, title, children, footer, width = 480 }: M
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-[20px]" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div
-        className="glass-strong glow-primary max-h-[85vh] overflow-auto rounded-[var(--radius-xl)] p-6"
-        style={{ width }}
+        className="w-full max-h-[85vh] overflow-auto rounded-[var(--radius-lg)] border border-border bg-surface p-4 shadow-xl"
+        style={{ maxWidth: width }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-4 flex items-center justify-between">
-          <h3 className="text-base font-semibold text-text">{title}</h3>
-          <button onClick={onClose} className="rounded-[var(--radius-sm)] p-1 text-text-muted hover:bg-card-hover hover:text-text">
-            <X size={16} strokeWidth={1.75} />
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium text-text">{title}</span>
+          <button onClick={onClose} className="rounded p-1 text-text-muted hover:text-text">
+            <XCircle size={16} />
           </button>
         </div>
         <div>{children}</div>
-        {footer && <div className="mt-5 flex justify-end gap-2">{footer}</div>}
+        {footer && <div className="mt-4 flex justify-end gap-2">{footer}</div>}
       </div>
     </div>
   )
@@ -204,7 +204,7 @@ export function ConfirmModal({
       open={open}
       onClose={onClose}
       title={title}
-      width={420}
+      width={380}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>

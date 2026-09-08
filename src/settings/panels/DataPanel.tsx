@@ -224,7 +224,7 @@ export function DataPanel() {
         open={!!pending}
         onClose={() => setPending(null)}
         title="删除会话"
-        width={460}
+        width={420}
         footer={
           <>
             <Button variant="ghost" onClick={() => setPending(null)}>
@@ -258,7 +258,7 @@ export function DataPanel() {
         open={!!renaming}
         onClose={() => setRenaming(null)}
         title="重命名会话"
-        width={420}
+        width={380}
         footer={
           <>
             <Button variant="ghost" onClick={() => setRenaming(null)}>

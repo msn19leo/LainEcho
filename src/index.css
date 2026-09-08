@@ -326,6 +326,7 @@ html {
   -webkit-text-fill-color: transparent;
   animation: stream-blink 0.9s ease-in-out infinite;
 }
+
 @keyframes stream-blink {
   0%,
   100% {

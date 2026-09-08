@@ -25,7 +25,6 @@ import {
 } from 'lucide-react'
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
-import { EmotionMapEditor, emptyEmotionMap, emotionMapToEditor, editorToEmotionMap } from '../../components/EmotionMapEditor'
 import type {
   CharacterCard,
   CharacterCardInput,
@@ -98,6 +97,10 @@ interface EditorState {
   messageExample: string
   modelId: string
   voiceId: string
+  // 声音模式：不启用 / 本地 Genie / 云端克隆
+  voiceMode: import('../../types').CharacterVoiceMode
+  // Genie 覆盖（voiceMode='genie'）：绑定的 TTS 模型卡 id
+  ttsModelId: string
   // TTS 覆盖
   ttsLanguageOverride: 'global' | TTSLanguage
   // 模型覆盖
@@ -108,10 +111,6 @@ interface EditorState {
   renderMode: 'global' | RenderMode
   /** 绑定的立绘集 id */
   spriteId: string
-  /** 情绪 → 立绘文件名 映射（editor 内空串 = 不配置） */
-  emotionMap: Record<StandardEmotion, string>
-  /** 情绪 → exp3 表情名 映射（editor 内空串 = 不配置） */
-  live2dExpressionMap: Record<StandardEmotion, string>
 }
 
 /** 空编辑器状态 */
@@ -122,13 +121,13 @@ const EMPTY_EDITOR: EditorState = {
   messageExample: '',
   modelId: '',
   voiceId: '',
+  voiceMode: 'none',
+  ttsModelId: '',
   ttsLanguageOverride: 'global',
   expressionOverride: 'global',
   idleAnimationOverride: 'global',
   renderMode: 'global',
   spriteId: '',
-  emotionMap: emptyEmotionMap(),
-  live2dExpressionMap: emptyEmotionMap(),
 }
 
 /** 行分隔字符串 → 数组（解析 array 字段的输入值） */
@@ -235,6 +234,7 @@ export function CharacterCardPanel() {
   const { cards, loading, load } = useCharacterStore()
   const [models, setModels] = useState<{ id: string; name: string }[]>([])
   const [voices, setVoices] = useState<VoiceReference[]>([])
+  const [ttsModels, setTtsModels] = useState<import('../../types').TTSModelCard[]>([])
   const [sprites, setSprites] = useState<CharacterSprite[]>([])
   const [expressions, setExpressions] = useState<ExpressionMeta[]>([])
   const [motionGroups, setMotionGroups] = useState<string[]>([])
@@ -258,6 +258,16 @@ export function CharacterCardPanel() {
       setVoices(list)
     } catch {
       setVoices([])
+    }
+  }
+
+  /** 加载 TTS 模型卡列表 */
+  const loadTtsModels = async () => {
+    try {
+      const list = await api.ttsModel.list()
+      setTtsModels(list)
+    } catch {
+      setTtsModels([])
     }
   }
 
@@ -294,15 +304,19 @@ export function CharacterCardPanel() {
     void load()
     void loadModels()
     void loadVoices()
+    void loadTtsModels()
     void loadSprites()
   }, [load])
 
   // 立绘集列表变化（导出/删除）时刷新
   useEffect(() => api.sprite.onChanged(() => void loadSprites()), [])
 
-  // 窗口聚焦时刷新参考音频列表（用户可能在语音合成面板导入新的）
+  // 窗口聚焦时刷新参考音频和 TTS 模型列表（用户可能在语音合成面板导入新的）
   useEffect(() => {
-    const onFocus = () => void loadVoices()
+    const onFocus = () => {
+      void loadVoices()
+      void loadTtsModels()
+    }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [])
@@ -331,13 +345,13 @@ export function CharacterCardPanel() {
       messageExample: card.messageExample,
       modelId: card.modelId ?? '',
       voiceId: card.voiceId ?? '',
+      voiceMode: card.voiceMode ?? (card.voiceId ? 'mimo' : 'none'),
+      ttsModelId: card.genieOverride?.ttsModelId ?? '',
       ttsLanguageOverride: ttsLanguageToEditor(card.ttsOverride),
       expressionOverride: expressionToEditor(card.modelOverride),
       idleAnimationOverride: idleAnimToEditor(card.modelOverride),
       renderMode: card.renderMode ?? 'global',
       spriteId: card.spriteId ?? '',
-      emotionMap: emotionMapToEditor(card.emotionMap),
-      live2dExpressionMap: emotionMapToEditor(card.live2dExpressionMap),
     })
     setActiveTab('persona')
   }
@@ -352,13 +366,18 @@ export function CharacterCardPanel() {
         persona: editorToPersona(editor.persona),
         messageExample: editor.messageExample,
         modelId: editor.modelId || null,
-        voiceId: editor.voiceId || null,
+        voiceId: editor.voiceMode === 'mimo' ? editor.voiceId || null : null,
+        voiceMode: editor.voiceMode,
+        genieOverride:
+          editor.voiceMode === 'genie' && editor.ttsModelId
+            ? { ttsModelId: editor.ttsModelId }
+            : null,
         ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride),
         modelOverride: editorToModelOverride(editor.expressionOverride, editor.idleAnimationOverride),
         renderMode: editor.renderMode === 'global' ? null : editor.renderMode,
         spriteId: editor.spriteId || null,
-        emotionMap: editorToEmotionMap(editor.emotionMap),
-        live2dExpressionMap: editorToEmotionMap(editor.live2dExpressionMap),
+        emotionMap: null,
+        live2dExpressionMap: null,
         avatar: editor.card?.avatar ?? null,
       }
 
@@ -449,7 +468,12 @@ export function CharacterCardPanel() {
                     绑定模型
                   </span>
                 )}
-                {card.voiceId && (
+                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'genie' && (
+                  <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
+                    本地声库
+                  </span>
+                )}
+                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'mimo' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
                     声音克隆
                   </span>
@@ -492,7 +516,7 @@ export function CharacterCardPanel() {
         open={!!editor}
         onClose={() => setEditor(null)}
         title={editor?.card ? '编辑角色卡' : '新建角色卡'}
-        width={640}
+        width={520}
         footer={
           <>
             <Button variant="ghost" onClick={() => setEditor(null)}>
@@ -889,19 +913,7 @@ export function CharacterCardPanel() {
                       </Select>
                     </Field>
                     {!editor.modelId && (
-                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可选择表情/待机动作覆盖并配置情绪映射</p>
-                    )}
-                    {editor.modelId ? (
-                      <EmotionMapEditor
-                        title="情绪 → 表情映射（live2dExpressionMap）"
-                        hint="AI 回复的情绪会切换到对应 exp3 表情。缺项回退角色覆盖/全局表情。"
-                        options={expressions.map((e) => ({ value: e.name, label: e.name }))}
-                        map={editor.live2dExpressionMap}
-                        onChange={(m) => setEditor({ ...editor, live2dExpressionMap: m })}
-                        placeholder="不配置（跟随覆盖/全局）"
-                      />
-                    ) : (
-                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可配置情绪 → 表情映射</p>
+                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可选择表情/待机动作覆盖</p>
                     )}
                   </>
                 ) : editor.renderMode === 'sprite' ? (
@@ -919,20 +931,8 @@ export function CharacterCardPanel() {
                         ))}
                       </Select>
                     </Field>
-                    {editor.spriteId ? (
-                      <EmotionMapEditor
-                        title="情绪 → 立绘图映射（emotionMap）"
-                        hint="AI 回复的情绪会切换到对应立绘图。缺项回退 neutral / 立绘集首图。"
-                        options={(sprites.find((s) => s.id === editor.spriteId)?.images ?? []).map((i) => ({
-                          value: i.filePath,
-                          label: i.filePath,
-                        }))}
-                        map={editor.emotionMap}
-                        onChange={(m) => setEditor({ ...editor, emotionMap: m })}
-                        placeholder="不配置（回退 neutral/首图）"
-                      />
-                    ) : (
-                      <p className="text-xs text-text-muted">绑定立绘集后可配置情绪 → 立绘图映射；未绑定时使用全局当前立绘集</p>
+                    {editor.spriteId && (
+                      <p className="text-xs text-text-muted">情绪映射使用角色模型中 2D 立绘卡所设置的情绪映射</p>
                     )}
                   </>
                 ) : (
@@ -946,34 +946,96 @@ export function CharacterCardPanel() {
             {/* 声音 Tab */}
             {activeTab === 'voice' && (
               <div className="space-y-4">
-                <Field label="绑定参考音频（可选）" hint="绑定后 AI 回复将自动用该声音克隆合成语音并驱动口型同步。需先在「语音合成」中导入参考音频。">
-                  <Select
-                    value={editor.voiceId}
-                    onChange={(e) => setEditor({ ...editor, voiceId: e.target.value })}
-                  >
-                    <option value="">不绑定（不启用 TTS）</option>
-                    {voices.map((v) => (
-                      <option key={v.id} value={v.id}>
-                        {v.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="TTS 语言覆盖（ttsOverride.language）" hint="角色级语言覆盖，解决日文角色/中文角色共用全局语言的问题。跟随全局 = 用全局设置">
-                  <Select
-                    value={editor.ttsLanguageOverride}
-                    onChange={(e) => setEditor({ ...editor, ttsLanguageOverride: e.target.value as 'global' | TTSLanguage })}
-                    disabled={!editor.voiceId}
-                  >
-                    <option value="global">跟随全局</option>
-                    <option value="zh">强制中文</option>
-                    <option value="ja">强制日文</option>
-                  </Select>
-                </Field>
-                {!editor.voiceId && (
-                  <p className="text-xs text-text-muted">
-                    绑定参考音频后可配置 TTS 覆盖
-                  </p>
+                {/* 声音模式选项卡 */}
+                <div className="flex gap-2">
+                  {([
+                    { value: 'none', label: '不启用 TTS' },
+                    { value: 'genie', label: '本地 Genie-TTS' },
+                    { value: 'mimo', label: '云端语音克隆' },
+                  ] as const).map((o) => (
+                    <button
+                      key={o.value}
+                      onClick={() => setEditor({ ...editor, voiceMode: o.value })}
+                      className={`flex-1 rounded-[var(--radius-sm)] border px-3 py-2 text-sm transition-all ${
+                        editor.voiceMode === o.value
+                          ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
+                          : 'border-border text-text-2 hover:border-border-strong hover:text-text'
+                      }`}
+                    >
+                      {o.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* 不启用：无设置 */}
+                {editor.voiceMode === 'none' && (
+                  <p className="text-xs text-text-muted">该角色不合成语音，桌宠回复时将静默（仅文字）。</p>
+                )}
+
+                {/* 本地 Genie-TTS */}
+                {editor.voiceMode === 'genie' && (
+                  <>
+                    <Field label="绑定 TTS 模型" hint="选择本地声库的角色 TTS 模型。需先在「语音合成」中创建模型卡。">
+                      <Select
+                        value={editor.ttsModelId}
+                        onChange={(e) => setEditor({ ...editor, ttsModelId: e.target.value })}
+                      >
+                        <option value="">选择 TTS 模型…</option>
+                        {ttsModels.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    {!editor.ttsModelId && (
+                      <p className="text-[11px] text-warning">请先在「设置 → 语音合成」中创建角色 TTS 模型卡</p>
+                    )}
+                    <Field label="TTS 语言覆盖" hint="角色级语言覆盖（跟随全局 = 用设置页语言）">
+                      <Select
+                        value={editor.ttsLanguageOverride}
+                        onChange={(e) => setEditor({ ...editor, ttsLanguageOverride: e.target.value as 'global' | TTSLanguage })}
+                        disabled={!editor.ttsModelId}
+                      >
+                        <option value="global">跟随全局</option>
+                        <option value="zh">强制中文</option>
+                        <option value="ja">强制日文</option>
+                      </Select>
+                    </Field>
+                  </>
+                )}
+
+                {/* 云端声音克隆 */}
+                {editor.voiceMode === 'mimo' && (
+                  <>
+                    <Field label="绑定参考音频" hint="绑定后该角色回复用此声音克隆合成。需先在「语音合成」中导入参考音频。">
+                      <Select
+                        value={editor.voiceId}
+                        onChange={(e) => setEditor({ ...editor, voiceId: e.target.value })}
+                      >
+                        <option value="">选择参考音频…</option>
+                        {voices.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label="TTS 语言覆盖" hint="角色级语言覆盖（跟随全局 = 用设置页语言）">
+                      <Select
+                        value={editor.ttsLanguageOverride}
+                        onChange={(e) => setEditor({ ...editor, ttsLanguageOverride: e.target.value as 'global' | TTSLanguage })}
+                        disabled={!editor.voiceId}
+                      >
+                        <option value="global">跟随全局</option>
+                        <option value="zh">强制中文</option>
+                        <option value="ja">强制日文</option>
+                      </Select>
+                    </Field>
+                    {!editor.voiceId && (
+                      <p className="text-xs text-text-muted">选择参考音频后可配置语言覆盖</p>
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -986,7 +1048,7 @@ export function CharacterCardPanel() {
         open={!!genModal}
         onClose={() => setGenModal(null)}
         title="AI 生成角色人设"
-        width={520}
+        width={420}
         footer={
           <>
             <Button variant="ghost" onClick={() => setGenModal(null)}>

@@ -461,7 +461,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         if (speakingNow !== lastSpeakingRef.current) {
           lastSpeakingRef.current = speakingNow
           if (speakingNow) {
-            if (displayStateRef.current !== 'thinking') displayStateRef.current = 'speaking'
+            // 语音真正开始播放 = 角色此刻真正发声：无论当前是否思考态，都退出思考并切到说话立绘。
+            // （思考立绘需保持到"首个语音/文本真正发声"，播放瞬间正是开始发声的时机。）
+            console.log('[thinking] pet lipSync start, displayState=', displayStateRef.current, '-> speaking')
+            displayStateRef.current = 'speaking'
           } else if (displayStateRef.current === 'speaking') {
             displayStateRef.current = 'idle'
           }
@@ -741,6 +744,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     // 订阅"思考中"状态：立绘模式切换到思考立绘（开始准备回答到输出文本前）
     unsubThinking = api.pet.onThinking((thinking: boolean) => {
+      console.log('[thinking] pet onThinking=%s mode=%s', thinking, modeRef.current)
       if (modeRef.current !== 'sprite') return
       if (thinking) {
         // 新一轮输入：情绪归零（natural 平静），进入思考态

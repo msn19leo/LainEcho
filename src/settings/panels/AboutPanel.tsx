@@ -115,7 +115,7 @@ export function AboutPanel() {
       <Modal
         open={phase === 'available'}
         title="发现新版本"
-        width={420}
+        width={380}
         onClose={() => setPhase('idle')}
         footer={
           <>
@@ -137,7 +137,7 @@ export function AboutPanel() {
       <Modal
         open={phase === 'downloading'}
         title="正在下载更新"
-        width={420}
+        width={380}
         onClose={() => setPhase('idle')}
         footer={<Button variant="ghost" onClick={() => setPhase('idle')}>后台下载</Button>}
       >
@@ -156,7 +156,7 @@ export function AboutPanel() {
       <Modal
         open={phase === 'downloaded'}
         title="更新已就绪"
-        width={420}
+        width={380}
         onClose={() => setPhase('idle')}
         footer={
           <>

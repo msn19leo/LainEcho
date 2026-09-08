@@ -223,6 +223,8 @@ export function bindPersistentSessionSync(): () => void {
       useSessionStore.setState({ streaming: false })
       try {
         const detail = await api.session.get(payload.sessionId!)
+        // 落定 messages；streamingContent 保留给打字机"揭示完再落定"：跟读场景由朗读结束（pet active 下降沿）清空，
+        // 非跟读场景由 Typewriter complete+onDone 清空。避免此处过早清空导致跟读时"先全文后清空"闪跳。
         useSessionStore.setState({ messages: detail.messages, streamError: null })
         console.log('[bind] DONE setMsg=' + detail.messages.length, 'usr=' + detail.messages.filter((m) => m.role === 'user').length)
       } catch {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AI 请求 IPC。
  * - 主进程组装 system prompt（人设 + 记忆体）、发起流式请求、持久化消息
  * - API Key 只在主进程内存中解密使用，不经过 IPC 传给渲染进程
@@ -94,6 +94,10 @@ export function registerAiIpc(): void {
 
     // 进入"思考中"：通知桌宠切换到思考立绘
     windowManager.notifyThinking(true)
+    // 首个可读文本块到达后即退出思考立绘（见 flushChunks）的一次性标记
+    let needExitThinking = true
+    // 语音是否启用（由 onChunk 在 voiceActive 求值后同步，供 flushChunks 闭包安全读取）
+    let voiceActiveRef = false
 
     // 合并推送：把模型原始输出实时提取成纯净台词文本，累积后按 CHUNK_FLUSH_MS 窗口一次性 send，
     // 避免把 JSON（花括号/键名）暴露给聊天窗，也减少 IPC 往返。lastDisplayLen 用于只发新增片段。
@@ -106,6 +110,11 @@ export function registerAiIpc(): void {
       lastDisplayLen = Math.max(lastDisplayLen, display.length)
       if (delta) {
         windowManager.broadcastAI('ai:stream-chunk', delta)
+        // 未启用语音：思考立绘显示到首个文本开始输出（首个可读文本块即退出）
+        if (!voiceActiveRef && needExitThinking) {
+          needExitThinking = false
+          windowManager.notifyThinking(false)
+        }
       }
     }
 
@@ -170,26 +179,34 @@ export function registerAiIpc(): void {
         window: settings.contextWindowTokens,
       })
 
-      // ---- 语音生成策略（由"是否跟读文本"决定） ----
-      // - 跟读开启（followText=true）：情绪块"边生成边读"，桌宠按音频段随语音逐段显示。
-      // - 跟读关闭（followText=false）：不边生成边读；整段文本流式输出完毕后，统一触发一次语音。
-      const ttsCfg = await getTTSConfig()
-      const followText = ttsCfg.followText
-      // 流式一开始即广播本轮语音模式与技术策略，让宠物窗提前用正确的展示方式（跟读=段级输出，否则流式打字机）
-      windowManager.notifyVoiceMode({ voiceEnabled: !!card?.voiceId, followText })
+      // ---- 语音生成策略（始终跟读文本） ----
+      // 启用语音后，桌宠始终"边生成边读"，按音频段随语音逐段显示。
+      // 角色卡声音模式：none 不发音；genie 用本地声库(无需参考音频)；mimo 用云端克隆(需 voiceId)
+      const effMode = card?.voiceMode ?? (card?.voiceId ? 'mimo' : 'none')
+      const voiceEngine: 'genie' | 'mimo' | null =
+        effMode === 'genie' ? 'genie' : effMode === 'mimo' ? 'mimo' : null
+      const voiceActive =
+        effMode === 'genie' ? true : effMode === 'mimo' ? !!card?.voiceId : false
+      const genieOverride = effMode === 'genie' ? (card?.genieOverride ?? null) : null
+      // 流式一开始即广播本轮语音模式，让宠物窗提前用跟读展示方式
+      windowManager.notifyVoiceMode({ voiceEnabled: voiceActive })
       let speechCursor = 0
       let pendingBlock: { texts: string[]; emotion: StandardEmotion } | null = null
       /** 是否已通过流式触发过至少一次语音（用于非流式/分块失败的兜底判定） */
       let speechEmitted = false
-      // 结算当前情绪块并触发桌宠语音（仅当该会话角色卡配置了 voiceId，沿用现有"语音启用"判定）
+      // 结算当前情绪块并触发桌宠语音（语音启用时才发声）
       const flushPendingBlock = () => {
         const b = pendingBlock
         pendingBlock = null
-        if (!b || b.texts.length === 0 || !card?.voiceId) return
+        if (!b || b.texts.length === 0 || !card || !voiceActive) return
         speechEmitted = true
         const text = b.texts.join('\n')
         const langOverride = card.ttsOverride?.language ?? null
-        windowManager.speak(text, card.voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: followText })
+        const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
+        // 不在此处退出思考立绘：speak 仅代表"发起合成"，此刻语音尚未真正发声。
+        // 思考立绘的退出改由渲染端在 lipSync 真正开始播放音频时触发（见 PetStage），
+        // 让思考态覆盖到"首个语音/文本真正发声"这一瞬，而非合成发起时。
+        windowManager.speak(text, voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride })
       }
       // 流式 onChunk 中实时结算：新 dialogue 项并入当前块，情绪变化或块足够大即结算旧块，保持"边生成边读"
       const pumpSpeech = () => {
@@ -206,6 +223,8 @@ export function registerAiIpc(): void {
         }
       }
 
+      // 【诊断】本轮流式开关实际值：区分非流式(stream=false)还是chunk被合并
+      console.log('[diag] settings.stream=', settings.stream)
       const content = await sendChatCompletion(fullMessages, {
         model: settings.model,
         baseURL: settings.baseURL,
@@ -215,10 +234,12 @@ export function registerAiIpc(): void {
         stream: settings.stream,
         signal: abort.signal,
         onChunk: (chunk) => {
+          // 同步语音启用标志，供 flushChunks 在首个文本块时正确判断退出思考的时机
+          voiceActiveRef = voiceActive
           partial += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
-          // 仅跟读开启时才边生成边读；关闭跟读时不做逐段语音（留到整段生成完统一播）
-          if (followText) pumpSpeech()
+          // 始终边生成边读
+          pumpSpeech()
         },
       })
 
@@ -228,21 +249,33 @@ export function registerAiIpc(): void {
         chunkTimer = null
       }
       flushChunks()
-      // 结算最后一个未闭合的情绪块（仅跟读时"边生成边读"才有未闭块；关闭跟读时无块）
-      if (followText) flushPendingBlock()
-      // 未触发"边生成边读"时（跟读关闭 / 非流式 / 分块一直未触发）：
-      // 兜底在整段文本生成完毕后，一次性按 dialogue 块触发语音（满足"等语音生成完再输出语音"）。
-      if (!speechEmitted && card?.voiceId) {
+      // 结算最后一个未闭合的情绪块
+      flushPendingBlock()
+      // 未触发"边生成边读"时（非流式 / 分块一直未触发）：
+      // 兜底在整段文本生成完毕后，一次性按 dialogue 块触发语音。
+      if (!speechEmitted && voiceActive && card) {
         const parsedChunks = parseDialogueJson(content).chunks
         const langOverride = card.ttsOverride?.language ?? null
+        const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
         for (const c of parsedChunks) {
-          windowManager.speak(c.text, card.voiceId, langOverride, { chunks: [c], follow: followText })
+          windowManager.speak(c.text, voiceId, langOverride, { chunks: [c], follow: true, engine: voiceEngine ?? undefined, genieOverride })
         }
       }
 
       // 持久化：user 消息 + assistant 完整回复（解析 JSON dialogue，落盘句子/情绪段供句级同步与联动）
       const now = Date.now()
+      // 仅无语音/未发音兜底：内容已解析落定，若仍未退出思考（且本轮无语音发声），在此退出。
+      // 关键：有语音时（voiceActive=true），思考立绘必须由渲染端在 lipSync 真正播放音频时
+      // 切换为说话立绘；此处绝不能提前 notifyThinking(false)，否则会在语音真正发声前切走思考立绘。
+      console.log('[thinking] parseDone needExitThinking=%s voiceActive=%s speechEmitted=%s', needExitThinking, voiceActive, speechEmitted)
+      if (needExitThinking && !voiceActive) {
+        needExitThinking = false
+        console.log('[thinking] no-voice fallback: exit thinking')
+        windowManager.notifyThinking(false)
+      }
       const { text, emotion, sentences, emotionSegments, chunks } = parseDialogueJson(content)
+      // 【诊断】模型原始输出 vs 解析文本：定位空内容是模型层(0)还是解析层(>0但text=0)
+      console.log('[diag] content.len=%d parse.text.len=%d chunks=%d | head=%j', (content??0).length, (text??'').length, chunks?.length??0, String(content??'').slice(0,160))
       const asstMsg: ChatMessage = { role: 'assistant', content: text, emotion, sentences, emotionSegments, chunks, timestamp: now }
       await appendSessionMessages(sessionId, [userMsg, asstMsg])
 
@@ -262,7 +295,9 @@ export function registerAiIpc(): void {
       // - 有语音（voiceId）：立绘由语音块驱动（宠物窗 playLoop 逐块 setEmotion），此处不广播情绪，
       //   避免"文本输出时切一次、语音输出时又切一次"的重叠切换。
       // - 无语音：立绘由文本输出驱动，此处广播归一化情绪。
-      if (!card?.voiceId) windowManager.notifyEmotion(emotion)
+      // 关键：判断须用 voiceActive（genie 本地声库时 card.voiceId 为空但确有语音），
+      // 否则 genie 模式会误广播 notifyEmotion → 渲染端 unsubEmotion 把思考立绘切回 idle（提前退出思考）。
+      if (!voiceActive) windowManager.notifyEmotion(emotion)
       return asstMsg
     } catch (err) {
       cancelled = abort.signal.aborted
@@ -290,8 +325,15 @@ export function registerAiIpc(): void {
       if (currentAbort === abort) currentAbort = null
       // 流式结束/出错/取消：清除"进行中的流"标记，避免窗口在之后才就绪时误认领已结束的会话
       windowManager.setActiveStreamingSession(null)
-      // 退出"思考中"：无论成功/出错/取消都复位（情绪事件已在成功路径驱动形象）
-      windowManager.notifyThinking(false)
+      // 退出思考立绘：仅无语音场景在此复位。
+      // 关键：有语音时语音合成是异步执行、可能晚于此 finally 才真正播放，
+      // 若在此无条件 notifyThinking(false)，会在语音真正发声前切走思考立绘。
+      // 有语音场景的思考立绘退出由渲染端在 lipSync 真正播放时负责（见 PetStage）。
+      console.log('[thinking] finally voiceActiveRef=%s needExitThinking=%s', voiceActiveRef, needExitThinking)
+      if (!voiceActiveRef && needExitThinking) {
+        needExitThinking = false
+        windowManager.notifyThinking(false)
+      }
     }
   })
 

@@ -7,7 +7,7 @@
   "license": "SEE LICENSE IN README.md",
   "private": true,
   "scripts": {
-    "dev": "vite",
+    "dev": "chcp 65001 && vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "icon": "node scripts/png-to-ico.mjs",

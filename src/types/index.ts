@@ -45,6 +45,15 @@ export interface CharacterTTSOverride {
   language: TTSLanguage | null
 }
 
+/** 角色卡声音模式：不启用 / 本地 Genie-TTS / 云端声音克隆 */
+export type CharacterVoiceMode = 'none' | 'genie' | 'mimo'
+
+/** 角色级 Genie-TTS 覆盖：该角色绑定哪个本地 TTS 模型卡（null = 用全局默认） */
+export interface CharacterGenieOverride {
+  /** 绑定的 TTS 模型卡 id */
+  ttsModelId: string
+}
+
 /** 角色级模型设置覆盖：让同一 Live2D 模型在不同角色下有不同表情/待机动作。null 字段表示跟随全局 */
 export interface CharacterModelOverride {
   /** null = 跟随全局；空串 = 清除表情 */
@@ -149,8 +158,12 @@ export interface CharacterCard {
   // --- 绑定 ---
   /** 绑定的 Live2D 模型 id（null = 使用全局当前模型） */
   modelId: string | null
-  /** 绑定的参考音频 id（null = 不启用 TTS） */
+  /** 绑定的参考音频 id（仅 voiceMode='mimo' 时使用；null = 无） */
   voiceId: string | null
+  /** 角色声音模式：不启用 / 本地 Genie-TTS / 云端声音克隆 */
+  voiceMode: CharacterVoiceMode
+  /** 角色级 Genie-TTS 覆盖（voiceMode='genie' 时；null = 跟随全局 Genie 配置） */
+  genieOverride: CharacterGenieOverride | null
 
   // --- 形象呈现（2D 立绘 / Live2D 并行切换）---
   /** 形象渲染模式：'live2d'（默认）| 'sprite'（2D 静态立绘） */
@@ -200,6 +213,8 @@ export type CharacterCardInput = Pick<
   | 'messageExample'
   | 'modelId'
   | 'voiceId'
+  | 'voiceMode'
+  | 'genieOverride'
   | 'ttsOverride'
   | 'modelOverride'
   | 'renderMode'
@@ -234,10 +249,45 @@ export type TTSLanguage = 'zh' | 'ja'
 export interface TTSConfig {
   /** 输出语言：中文 / 日文 */
   language: TTSLanguage
-  /** MiMo 模型名（如 mimo-v2.5-tts-voiceclone） */
+  /** MiMo 模型名（如 mimo-v2.5-tts-voiceclone）；engine=genie 时忽略 */
   model: string
-  /** 语音是否跟读文本：开启后桌宠"说一个字出一个字"，文本随音频播放逐段 reveal */
-  followText: boolean
+  /** 语音引擎：genie 本地声库语音服务(GenieTTS) / mimo 云端声音克隆 */
+  engine: 'genie' | 'mimo'
+}
+
+/** GenieTTS(本地声库语音服务) 配置 */
+export interface TTSGenieConfig {
+  /** 服务地址（GenieTTS start_server 默认 8000 端口） */
+  baseUrl: string
+  /** GenieTTS 环境/项目目录（含 python.exe；用于自动拉起服务，可空则用系统 python） */
+  workPath: string
+  /** GenieData 资源目录（含 speaker_encoder.onnx、chinese-hubert-base 等；spawn 时写入 GENIE_DATA_DIR） */
+  dataDir: string
+}
+
+/** 角色 TTS 模型卡：一组本地 GenieTTS 声库参数 */
+export interface TTSModelCard {
+  id: string
+  /** 模型卡名称（如 "莉可"） */
+  name: string
+  /** GenieTTS 角色名（对应 onnx 模型） */
+  characterName: string
+  /** 角色 onnx 模型目录（包含转换后的 *.onnx） */
+  onnxModelDir: string
+  /** 参考音频路径（可选，用于语气/情绪素材；留空用声库默认） */
+  refAudioPath: string
+  /** 参考音频对应文本（可选） */
+  refAudioText: string
+  createdAt: number
+}
+
+/** 创建/更新 TTS 模型卡的输入 */
+export interface TTSModelCardInput {
+  name: string
+  characterName: string
+  onnxModelDir: string
+  refAudioPath: string
+  refAudioText: string
 }
 
 /** 记忆主题分类：用户信息 / 长期经历 / 约定与承诺 */
@@ -653,7 +703,7 @@ export interface WindowApi {
       text: string,
       voiceId: string | null,
       languageOverride?: TTSLanguage | null,
-      payload?: { chunks?: DialogueChunk[] },
+      payload?: { chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null },
     ) => void
     /** 上报当前会话（聊天窗切会话/新建会话时调用，主进程转发给宠物窗同步内容框；null 表示清空） */
     notifyCurrentSession: (sessionId: string | null) => void
@@ -677,13 +727,13 @@ export interface WindowApi {
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
      *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放 */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean }) => void) => () => void
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => void) => () => void
     /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘） */
     onEmotion: (cb: (emotion: StandardEmotion) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
-    /** 订阅流式开始时的"本轮语音模式"（是否有语音 / 是否跟读），宠物窗提前决定文本展示方式 */
-    onVoiceMode: (cb: (opts: { voiceEnabled: boolean; followText: boolean }) => void) => () => void
+    /** 订阅流式开始时的"本轮语音模式"（是否有语音），宠物窗提前决定文本展示方式 */
+    onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** 上报宠物窗"当前已朗读到"的段落文本（段变化时调用），经主进程转发给聊天窗随语音显示 */
     reportReadingText: (text: string) => void
     /** 上报语音朗读是否进行中（经主进程转发给聊天窗控制光标显隐） */
@@ -715,10 +765,34 @@ export interface WindowApi {
     /** 删除指定参考音频（同时删除文件与索引条目） */
     removeReference: (id: string) => Promise<void>
     /** 合成语音：传入文本与参考音频 id，返回 wav 格式的 ArrayBuffer。
-     *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）。 */
-    synthesize: (params: { text: string; voiceId: string; languageOverride?: TTSLanguage | null }) => Promise<ArrayBuffer | null>
+     *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）；
+     *  engine=genie 时 voiceId 可空（本地声库语音服务不需要参考音频）。 */
+    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: StandardEmotion | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => Promise<ArrayBuffer | null>
     /** 重命名参考音频，返回更新后的对象 */
     renameReference: (id: string, name: string) => Promise<VoiceReference>
+    /** 读取 GenieTTS(本地声库语音服务) 配置 */
+    genieConfig: () => Promise<TTSGenieConfig>
+    /** 保存 GenieTTS 配置（部分合并） */
+    genieSaveConfig: (patch: Partial<TTSGenieConfig>) => Promise<TTSGenieConfig>
+    /** 检测 GenieTTS 服务是否在线 */
+    genieCheck: (baseUrl: string) => Promise<{ ok: boolean; error?: string }>
+    /** 用 GenieTTS 环境 + GenieData 目录自动拉起服务 */
+    genieStart: (workPath: string, dataDir: string) => Promise<{ ok: boolean; error?: string }>
+    /** 弹目录选择框，返回选中目录（取消返回 null） */
+    chooseFolder: () => Promise<string | null>
+    /** 弹文件选择框选择音频（wav/mp3），返回路径（取消返回 null） */
+    chooseAudioFile: () => Promise<string | null>
+  }
+  /** 角色 TTS 模型卡管理 */
+  ttsModel: {
+    /** 列出所有 TTS 模型卡 */
+    list: () => Promise<TTSModelCard[]>
+    /** 创建 TTS 模型卡 */
+    create: (input: TTSModelCardInput) => Promise<TTSModelCard>
+    /** 更新 TTS 模型卡 */
+    update: (id: string, input: TTSModelCardInput) => Promise<TTSModelCard>
+    /** 删除 TTS 模型卡 */
+    delete: (id: string) => Promise<void>
   }
   /** 模型设置（缩放/位置/动画/参数） */
   modelSettings: {
@@ -736,7 +810,7 @@ export interface WindowApi {
     /** 订阅"语音朗读是否进行中"（控制聊天窗跳动光标显隐） */
     onReadingActive: (cb: (active: boolean) => void) => () => void
     /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
-    onVoiceMode: (cb: (opts: { voiceEnabled: boolean; followText: boolean }) => void) => () => void
+    onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
     reportRendererReady: () => void
   }

@@ -65,7 +65,7 @@ export async function migrateDataDir(newDir: string): Promise<void> {
   await fs.mkdir(newDir, { recursive: true })
 
   // 需要迁移的子目录
-  const subDirs = ['data', 'models', 'live2d-core', 'sprites']
+  const subDirs = ['data', 'models', 'live2d-core', 'sprites', 'tts-models']
   for (const sub of subDirs) {
     const src = path.join(srcRoot, sub)
     const dest = path.join(newDir, sub)
@@ -127,6 +127,14 @@ export const paths = {
   get spritesDir() {
     return path.join(getRootDir(), 'sprites')
   },
+  /** 角色 TTS 模型卡目录 */
+  get ttsModelsDir() {
+    return path.join(getRootDir(), 'tts-models')
+  },
+  /** GenieTTS(本地声库语音服务) 配置：地址/项目路径/GenieData 目录 */
+  get ttsGenieConfigFile() {
+    return path.join(this.dataDir, 'tts-genie.json')
+  },
   /** 参考音频目录（用于 TTS 声音克隆） */
   get voicesDir() {
     return path.join(this.dataDir, 'voices')
@@ -165,6 +173,10 @@ export const paths = {
   get spritesIndexFile() {
     return path.join(this.spritesDir, 'index.json')
   },
+  /** TTS 模型卡索引文件 */
+  get ttsModelsIndexFile() {
+    return path.join(this.ttsModelsDir, 'index.json')
+  },
   get coreFile() {
     return path.join(this.coreDir, 'live2dcubismcore.min.js')
   },
@@ -196,6 +208,7 @@ export async function ensureDataDirs() {
     ensureDir(paths.coreDir),
     ensureDir(paths.voicesDir),
     ensureDir(paths.spritesDir),
+    ensureDir(paths.ttsModelsDir),
   ])
 }
 
