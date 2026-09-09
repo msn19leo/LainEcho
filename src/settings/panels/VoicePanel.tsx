@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 语音合成配置面板。
  * 双引擎：
  * - 本地声库（engine=genie，默认）：本地 GenieTTS 服务，声库自带性格；自动拉起 + 健康检测。
@@ -414,6 +414,21 @@ export function VoicePanel() {
               ))}
             </div>
           </Field>
+          <Field
+            label="整段合音"
+            hint="开启后一段回复整段一次合成（音调更连贯），中文/日文均适用；失去逐句实时朗读与逐句切立绘。"
+          >
+            <button
+              onClick={() => void handleSaveConfig({ mergeSpeech: !(config.mergeSpeech ?? false) })}
+              className={`rounded-[var(--radius-sm)] border px-4 py-2 text-sm transition-all ${
+                config.mergeSpeech
+                  ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
+                  : 'border-border text-text-2 hover:border-border-strong hover:text-text'
+              }`}
+            >
+              {config.mergeSpeech ? '已开启' : '已关闭'}
+            </button>
+          </Field>
         </div>
       </Card>
 
@@ -726,7 +741,7 @@ export function VoicePanel() {
             <Input
               value={editor.name}
               onChange={(e) => setEditor((prev) => ({ ...prev, name: e.target.value }))}
-              placeholder="例如：莉可"
+              placeholder="例如：菲比"
             />
           </Field>
           <Field label="onnx 模型目录" hint="包含该角色转换后 *.onnx 的目录">

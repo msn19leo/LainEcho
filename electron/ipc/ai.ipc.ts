@@ -122,6 +122,9 @@ export function registerAiIpc(): void {
     currentAbort = abort
     try {
       const settings = await getSettings()
+      const ttsCfg = await getTTSConfig()
+      // 整段合音：开启时主进程关闭"边生成边读"，流式结束后整段一次合成（音调连贯）；关闭时保持逐句实时朗读
+      const mergeSpeech = ttsCfg.mergeSpeech === true
       const apiKey = await readApiKey()
       if (!apiKey) throw new Error('未配置 API Key，请先在「设置 → AI API 配置」中填写')
       if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
@@ -238,8 +241,9 @@ export function registerAiIpc(): void {
           voiceActiveRef = voiceActive
           partial += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
-          // 始终边生成边读
-          pumpSpeech()
+          // 文本流式输出照常（flushChunks）；语音侧：仅未开启整段合音时"边生成边读"，
+          // 开启整段合音则等流式结束后整段兜底一次合成，避免逐块独立推理导致语气不连贯
+          if (!mergeSpeech) pumpSpeech()
         },
       })
 
@@ -251,14 +255,25 @@ export function registerAiIpc(): void {
       flushChunks()
       // 结算最后一个未闭合的情绪块
       flushPendingBlock()
-      // 未触发"边生成边读"时（非流式 / 分块一直未触发）：
-      // 兜底在整段文本生成完毕后，一次性按 dialogue 块触发语音。
+      // 未触发"边生成边读"时（非流式 / 整段合音开启 / 分块一直未触发）：
+      // 兜底在整段文本生成完毕后触发语音。整段合音开启时整段一次 speak；
+      // 关闭时保持原逐块兜底（与修改前一致）。
       if (!speechEmitted && voiceActive && card) {
-        const parsedChunks = parseDialogueJson(content).chunks
+        const parsed = parseDialogueJson(content)
         const langOverride = card.ttsOverride?.language ?? null
         const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
-        for (const c of parsedChunks) {
-          windowManager.speak(c.text, voiceId, langOverride, { chunks: [c], follow: true, engine: voiceEngine ?? undefined, genieOverride })
+        if (mergeSpeech) {
+          // 整段合音：整段文本一次合成（前端按整段朗读，情绪用整体情绪）
+          windowManager.speak(parsed.text, voiceId, langOverride, {
+            chunks: [{ text: parsed.text, emotion: parsed.emotion }],
+            follow: true,
+            engine: voiceEngine ?? undefined,
+            genieOverride,
+          })
+        } else {
+          for (const c of parsed.chunks) {
+            windowManager.speak(c.text, voiceId, langOverride, { chunks: [c], follow: true, engine: voiceEngine ?? undefined, genieOverride })
+          }
         }
       }
 
@@ -389,6 +404,9 @@ export function registerAiIpc(): void {
       const { sessionId } = params ?? {}
       if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
       const settings = await getSettings()
+      const ttsCfg = await getTTSConfig()
+      // 整段合音：开启时主进程关闭"边生成边读"，流式结束后整段一次合成（音调连贯）；关闭时保持逐句实时朗读
+      const mergeSpeech = ttsCfg.mergeSpeech === true
       const apiKey = await readApiKey()
       if (!apiKey) throw new Error('未配置 API Key')
       if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
@@ -430,6 +448,9 @@ export function registerAiIpc(): void {
   ipcMain.handle('ai:test-connection', async () => {
     try {
       const settings = await getSettings()
+      const ttsCfg = await getTTSConfig()
+      // 整段合音：开启时主进程关闭"边生成边读"，流式结束后整段一次合成（音调连贯）；关闭时保持逐句实时朗读
+      const mergeSpeech = ttsCfg.mergeSpeech === true
       const apiKey = await readApiKey()
       if (!apiKey) return { ok: false, error: '未配置 API Key' }
       if (!settings.baseURL.trim()) return { ok: false, error: '未配置 API 地址（baseURL）' }

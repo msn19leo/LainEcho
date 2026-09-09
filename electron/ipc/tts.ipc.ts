@@ -29,6 +29,7 @@ const DEFAULT_TTS_CONFIG: TTSConfig = {
   language: 'zh',
   model: '',
   engine: 'genie',
+  mergeSpeech: false,
 }
 
 /** 默认参考音频列表（空数组） */

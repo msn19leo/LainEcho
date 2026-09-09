@@ -3,6 +3,12 @@
  * - 已确认记忆：注入 system prompt（当前角色 + 全局背景），可新增/编辑/删除
  * - 待确认候选：会话自动沉淀产物，保留后入已确认（注入生效），删除则丢弃
  * - 新增区的分类/归属下拉同时充当列表筛选（选择后即时过滤已确认记忆）
+ *
+ * 手动添加的轻量引导：
+ * - 最小有效长度：过短的语气词/标签（如「对方是用户酱」）不构成长期记忆，提交时拦截
+ * - 去重：与已确认记忆完全相同或互相包含时列出重复项，提交时硬拦截
+ * - 可疑标签词（用户/角色/AI）：输入时黄色弱提示，引导改用标准人称「对方/你」，不强制拦截。
+ *   注意「对方」「你」是合法人称（自动沉淀记忆即用这套），不在警告范围内。
  */
 import { useEffect, useState } from 'react'
 import { BrainCircuit, Check, Clock, Trash2 } from 'lucide-react'
@@ -12,7 +18,7 @@ import { useCharacterStore } from '../../store/characterStore'
 import { useSettingsStore } from '../../store/settingsStore'
 import { Button, Card, Empty, Input, Loading, Select, Switch } from '../../components/ui'
 import { toast } from '../../components/toast'
-import type { MemoryCategory } from '../../types'
+import type { MemoryCategory, MemoryItem } from '../../types'
 
 /** 记忆主题分类选项（hint 为给用户的一句话介绍） */
 const CATEGORY_OPTIONS: Array<{ value: MemoryCategory; label: string; hint: string }> = [
@@ -20,6 +26,16 @@ const CATEGORY_OPTIONS: Array<{ value: MemoryCategory; label: string; hint: stri
   { value: 'long_term', label: '长期经历', hint: '重要事件与剧情' },
   { value: 'promises', label: '约定承诺', hint: '答应过的事/待办' },
 ]
+
+/** 手动添加记忆的最小有效长度（过短的语气词/标签不构成长期记忆） */
+const MIN_MANUAL_MEMORY_LEN = 6
+/**
+ * 可疑标签词：命中即弱提示。
+ * 仅当用了「用户/角色/AI」这类会在注入前被 normalizeMemoryPerspective 转写掉的原始词才提示，
+ * 引导用户改用系统统一的标准人称「对方(用户)/你(角色)」；
+ * 「对方」「你」是合法人称，不在此列（自动沉淀记忆本就用这套人称，手动添加应保持一致）。
+ */
+const SELF_REFERENT_WORDS = ['用户', '角色', 'AI']
 
 /** 分类显示名（不含介绍，用于列表标签） */
 function categoryLabel(cat: MemoryCategory): string {
@@ -30,6 +46,29 @@ function categoryLabel(cat: MemoryCategory): string {
 function ownerLabel(cards: Array<{ id: string; name: string }>, cardId: string | null): string {
   if (!cardId) return '全局'
   return cards.find((c) => c.id === cardId)?.name ?? '已删除角色'
+}
+
+/** 判断文本是否命中可疑标签词（弱提示用） */
+function containsSelfReferent(text: string): boolean {
+  return SELF_REFERENT_WORDS.some((w) => text.includes(w))
+}
+
+/**
+ * 判断新记忆是否与现有已确认记忆重复（完全相同，或互相包含且两段都较长）。
+ * 与主进程 memoryExtraction 的去重口径保持一致，避免无价值重复占满 MAX_MEMORIES 注入名额。
+ * @param content 待判断的新记忆内容
+ * @param existing 已有的已确认记忆列表
+ */
+function isDuplicateMemory(content: string, existing: MemoryItem[]): boolean {
+  const c = content.trim()
+  if (!c) return false
+  return existing.some((item) => {
+    const et = (item.content ?? '').trim()
+    if (!et) return false
+    if (et === c) return true
+    // 互相包含且较长才算重复：避免把常见的短词误判（如「对方」被长句包含）
+    return et.length > MIN_MANUAL_MEMORY_LEN && c.length > MIN_MANUAL_MEMORY_LEN && (et.includes(c) || c.includes(et))
+  })
 }
 
 export function MemoryPanel() {
@@ -73,10 +112,20 @@ export function MemoryPanel() {
       (filterOwner === 'all' || (filterOwner === 'global' ? m.characterCardId == null : m.characterCardId === filterOwner)),
   )
 
-  /** 新增已确认记忆（分类/归属取下拉当前值，'all' 回退默认） */
+  /** 新增已确认记忆（分类/归属取下拉当前值，'all' 回退默认）：提交前做轻量引导校验 */
   const handleAdd = async () => {
     const text = newContent.trim()
     if (!text) return
+    // 最小有效长度拦截：过短的「对方是用户酱」这类元信息/语气词不构成长期记忆
+    if (text.length < MIN_MANUAL_MEMORY_LEN) {
+      toast('内容太短，可能不是有效长期记忆', 'error')
+      return
+    }
+    // 去重硬拦截：与已有已确认记忆冲突则不重复添加
+    if (isDuplicateMemory(text, items)) {
+      toast('已存在相同或相似记忆，无需重复添加', 'error')
+      return
+    }
     const ok = await add({
       content: text,
       category: filterCat === 'all' ? 'long_term' : filterCat,
@@ -84,7 +133,11 @@ export function MemoryPanel() {
     })
     if (ok) {
       setNewContent('')
-      toast('已添加记忆')
+      if (containsSelfReferent(text)) {
+        toast('已添加（提示：含「用户/角色/AI」等标签词，建议改用「对方/你」人称，请复核）', 'info')
+      } else {
+        toast('已添加记忆')
+      }
     } else {
       toast('添加失败', 'error')
     }
@@ -125,6 +178,12 @@ export function MemoryPanel() {
     }`
   const metaTag = 'rounded-full border border-[var(--border-strong)] bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-text-muted'
 
+  // 新增输入的实时引导状态（仅展示，不阻断输入）
+  const trimmedNew = newContent.trim()
+  const newTooShort = trimmedNew.length > 0 && trimmedNew.length < MIN_MANUAL_MEMORY_LEN
+  const newDuplicate = trimmedNew.length > 0 && isDuplicateMemory(trimmedNew, items)
+  const newSelfReferent = trimmedNew.length >= MIN_MANUAL_MEMORY_LEN && !newDuplicate && containsSelfReferent(trimmedNew)
+
   return (
     <div className="space-y-3">
       {/* 自动沉淀记忆开关 */}
@@ -161,11 +220,25 @@ export function MemoryPanel() {
             <Input
               value={newContent}
               onChange={(e) => setNewContent(e.target.value)}
-              placeholder="输入一条长期记忆，如：用户喜欢的称呼是「亲爱的」"
+              placeholder="输入一条长期记忆，如：对方喜欢的称呼是「亲爱的」"
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void handleAdd()
               }}
             />
+            {/* 实时轻量引导：过短 / 重复 / 可疑标签词提示条（仅展示，不阻断输入） */}
+            {newTooShort && (
+              <p className="text-xs" style={{ color: 'var(--warning)' }}>
+                内容过短，可能不是有效长期记忆（建议 ≥{MIN_MANUAL_MEMORY_LEN} 字）。
+              </p>
+            )}
+            {newDuplicate && (
+              <p className="text-xs" style={{ color: 'var(--danger)' }}>与已有已确认记忆重复，无需重复添加。</p>
+            )}
+            {newSelfReferent && (
+              <p className="text-xs" style={{ color: 'var(--warning)' }}>
+                含「用户/角色/AI」等标签词（系统用「对方/你」统一人称），请确认后改为标准说法。
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <Select value={filterCat} onChange={(e) => setFilterCat(e.target.value as MemoryCategory | 'all')} className="flex-1">
                 <option value="all">全部分类</option>

@@ -10,7 +10,8 @@
  * - 合成      POST /tts                 { character_name, text, split_sentence?, save_path? }
  *             返回 audio/wav 流（32kHz、1ch、int16，也可能是 RIFF/WAV）
  * - 停止任务  POST /stop
- * 语言码：en / zh / jp / kr（日文是 jp，不是 ja）。
+ * 语言码：en / zh / jp / ko（日语是 jp；Genie 官方语言码，见其官方 README/API，
+ * 传 'ja' 反而会走错 G2P）。
  * 服务默认端口 8000（start_server(host, port=8000)）。
  */
 import { spawn, type ChildProcess } from 'child_process'
@@ -59,9 +60,9 @@ function parsePort(baseUrl: string): number {
   }
 }
 
-/** 把我们的语言码(zh/ja)映射为 genie 语言码(zh/jp) */
+/** 我们的语言码(zh/ja)映射为 genie 语言码(zh/jp)：Genie 官方日语是 'jp'（非 'ja'），见其官方 README/API。 */
 function toGenieLang(lang: string): string {
-  return lang === 'ja' ? 'jp' : lang === 'zh' ? 'zh' : lang
+  return lang === 'ja' ? 'jp' : lang
 }
 
 /** 当前已加载的角色（避免重复加载） */
@@ -187,6 +188,30 @@ export async function downloadGenieData(dataDir: string): Promise<{ ok: boolean;
   return { ok: false, error: `下载失败(exit=${code})。请检查网络/代理。${err.slice(-300)}` }
 }
 
+/**
+ * 从角色模型目录自动解析默认参考音频。
+ * Genie 官方角色在角色目录内置 prompt_wav.json（含 Normal/Sad/Fear 等情绪）与 prompt_wav/*.wav；
+ * 取 Normal 项的音频与配套文本作为合成参考音频，避免 Genie /tts 因未设置参考音频返回 404。
+ * @param onnxModelDir 角色 onnx 模型目录（形如 .../角色名/tts_models）
+ * @returns {path,text} 参考音频绝对路径与文本；解析失败返回 null
+ */
+async function resolveDefaultReferenceAudio(onnxModelDir: string): Promise<{ path: string; text: string } | null> {
+  const roleDir = path.dirname(onnxModelDir || '')
+  const promptJson = path.join(roleDir, 'prompt_wav.json')
+  if (!existsSync(promptJson)) return null
+  try {
+    const meta = await readJson<{ Normal?: { wav?: string; text?: string } }>(promptJson, {})
+    const wav = meta?.Normal?.wav
+    const text = meta?.Normal?.text
+    if (!wav || !text) return null
+    const wavPath = path.join(roleDir, 'prompt_wav', wav)
+    if (!existsSync(wavPath)) return null
+    return { path: wavPath, text }
+  } catch {
+    return null
+  }
+}
+
 /** 加载角色（POST /load_character），角色名/语言变化时才重新加载；可选设置参考音频 */
 async function ensureCharacterLoaded(params: { characterName: string; onnxModelDir: string; refAudioPath?: string; refAudioText?: string }, base: string, lang: string): Promise<void> {
   const name = params.characterName.trim()
@@ -303,13 +328,18 @@ function sanitizeGenieText(text: string): string {
   // 4) 其余字符原样保留；Genie 会用 pattern_filter 清理剩余非常规符号
   return t
 }
-async function genieFetchWav(base: string, name: string, text: string): Promise<ArrayBuffer | null> {
+/**
+ * 调用 Genie /tts 合成并把裸 PCM/RIFF 封装为 WAV。
+ * @param splitSentence 是否让服务端按语种分句拼接。中文用 true 更稳定；
+ *       日语建议 false（Genie 日语分句脆弱，易返回空音频，参考 Shinsekai 亦用 false）。
+ */
+async function genieFetchWav(base: string, name: string, text: string, splitSentence = true): Promise<ArrayBuffer | null> {
   // 【诊断】确认实际发送给 Genie 的合成文本（判断是否因 stripBrackets 剥太薄而诱发复诵参考音频文本）
   console.log('[genie] tts text=%j', String(text).slice(0,120))
   const resp = await net.fetch(`${base}/tts`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ character_name: name, text, split_sentence: true }),
+    body: JSON.stringify({ character_name: name, text, split_sentence: splitSentence }),
     signal: AbortSignal.timeout(120000),
   })
   if (!resp.ok) return null
@@ -367,7 +397,7 @@ async function translateText(text: string, targetLang: 'ja' | 'zh'): Promise<str
  * @param params.refAudioPath 参考音频路径（可选）
  * @param params.refAudioText 参考音频文本（可选）
  * @param params.text 文本
- * @param params.lang 目标语言（zh/ja，映射为 genie 的 zh/jp）
+ * @param params.lang 目标语言（zh/ja；传给 Genie 时日语映射为 jp）
  * @returns WAV 字节的 ArrayBuffer
  */
 export async function synthesizeGenie(params: {
@@ -395,19 +425,28 @@ export async function synthesizeGenie(params: {
 
   const name = characterName.trim()
   if (!name) throw new Error('未配置角色名，无法合成')
-  await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath, refAudioText }, base, lang)
+  // Genie /tts 强制要求已设置参考音频，否则返回 404。未显式配置时，自动用角色目录
+  // 内置参考音频（prompt_wav.json 的 Normal 项），保证日语声库开箱即用。
+  const autoRef = !refAudioPath ? await resolveDefaultReferenceAudio(onnxModelDir) : null
+  const effRefPath = refAudioPath || (autoRef?.path ?? '')
+  const effRefText = refAudioText || (autoRef?.text ?? '')
+  await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
 
   // 日语模式：将中文文本翻译为日语后再合成（AI 生成中文，TTS 输出日语语音）
   let synthText = text
-  if (lang === 'ja') {
+  // 仅语言不符才翻译：日语模式下若文本已含日文（平假名/片假名），直接用原文合成，避免二次翻译扭曲语气
+  const alreadyJa = lang === 'ja' && /[\u3040-\u309F\u30A0-\u30FF]/.test(text)
+  if (lang === 'ja' && !alreadyJa) {
     console.log('[genie] 日语模式：翻译中文文本为日语')
     synthText = await translateText(text, 'ja')
     console.log('[genie] 翻译结果:', synthText.slice(0, 50))
+  } else if (lang === 'ja') {
+    console.log('[genie] 日语模式：文本已含日文，跳过翻译')
   }
 
   // 文本预处理规避 G2P 越界崩溃，再单次合成（保证参考音频只播一遍、不重复）
   const safeText = sanitizeGenieText(synthText)
-  const wav = await genieFetchWav(base, name, safeText)
+  const wav = await genieFetchWav(base, name, safeText, lang !== 'ja')
   if (!wav) {
     throw new Error(`GenieTTS 生成为空音频（文本经安全化后仍无法合成，可疑片段：${safeText.slice(0, 30)}` + (safeText.length > 30 ? '…' : '') + '）')
   }

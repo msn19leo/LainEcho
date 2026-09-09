@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 共享类型定义 —— 主进程（electron/）与渲染进程（src/）复用。
  * 主进程通过 preload.ts 将 window.api 白名单方法暴露给渲染进程。
  */
@@ -253,6 +253,8 @@ export interface TTSConfig {
   model: string
   /** 语音引擎：genie 本地声库语音服务(GenieTTS) / mimo 云端声音克隆 */
   engine: 'genie' | 'mimo'
+  /** 整段合音（默认为关）：开启时一段回复的多个合成分段合并为整段一次合成（音调更连贯），代价是失去逐句实时朗读与逐句切立绘。中文/日文均适用。 */
+  mergeSpeech?: boolean
 }
 
 /** GenieTTS(本地声库语音服务) 配置 */
@@ -268,7 +270,7 @@ export interface TTSGenieConfig {
 /** 角色 TTS 模型卡：一组本地 GenieTTS 声库参数 */
 export interface TTSModelCard {
   id: string
-  /** 模型卡名称（如 "莉可"） */
+  /** 模型卡名称（如 "菲比"） */
   name: string
   /** GenieTTS 角色名（对应 onnx 模型） */
   characterName: string
