@@ -16,10 +16,11 @@
 | 2D 立绘 | 立绘集管理（多张情绪图 + 说话图 + 思考图）；情绪 → 立绘映射，随对话情绪切换立绘 |
 | 主题系统 | 深色 / 浅色 / 跟随系统三模式，跨窗口实时同步，防白屏闪烁 |
 | AI 对话 | 兼容 OpenAI 格式 API，SSE 流式输出（打字机效果）；**结构化 JSON 输出**，一段回复内按情绪节拍切换立绘 |
-| 语音合成 | 小米 MiMo 声音克隆 TTS，参考音频管理，**段级合成**保证语速稳定，口型同步驱动 |
+| 语音合成 | **双引擎**：小米 MiMo 声音克隆（云端）+ **GenieTTS 本地声库**（离线）；段级/整段合音可选，口型同步驱动 |
 | 桌面迷你聊天 | 桌宠上直接内置会话内容框 + 输入框，**与聊天窗口实时同步**（流式、高亮、切换会话、发送） |
 | 角色卡 | 动漫角色复刻人设（锚点/内心结构/感知方式/关系模式/「你的身份」/语言质感/状态系统/世界观碎片/禁止项，支持 AI 生成草稿），可绑定模型/立绘/参考音频/表情映射 |
-| 记忆体 | 用户手动维护的全局固定记忆条目，每次请求前实时拼接 |
+| 记忆体 | 用户手动维护的全局固定记忆条目 + **自动沉淀候选**（会话结束后自动抽取，需确认后生效） |
+| 上下文管理 | 自动摘要压缩（旧历史超阈值时 LLM 生成摘要）、Token 预算装填、手动压缩 |
 | 会话管理 | 多会话、切换、删除、搜索/筛选、重命名、导出 Markdown；桌宠与聊天窗双端同步 |
 | 数据管理 | 自定义数据存放位置并一键迁移 |
 | 应用更新 | 基于 electron-updater，GitHub Actions 在推送 `v*` 标签时自动构建发布 |
@@ -46,14 +47,46 @@
 
 ### 语音合成（TTS）
 
+双引擎架构，支持云端声音克隆与本地离线合成：
+
+#### MiMo 声音克隆（云端）
+
 基于小米 [MiMo](https://mimo.mi.com/docs/zh-CN/api/audio/tts) 声音克隆模型（`mimo-v2.5-tts-voiceclone`）：
 
 - **参考音频管理**：导入 wav/mp3（建议 5-30s 干净人声），重命名/删除，导入时检测 WAV 时长并给质量提示
 - **段级合成**：回复按 dialogue 段逐段合成并播放，语速稳定、句间顺滑；双队列流水线并行（播第 N 段已合成第 N+1 段）
 - **低延迟**：剥离括号旁白只朗读台词，整段纯旁白跳过不合成
+
+#### GenieTTS 本地声库（离线）
+
+基于 [GenieTTS](https://github.com/High-Logic/Genie-TTS) 本地声库语音服务（GPT-SoVITS 轻量 CPU 推理引擎）：
+
+- **本地推理**：~200MB 运行时 + 声库模型，无需联网，隐私安全
+- **角色 TTS 模型卡**：管理多个本地声库角色，每个角色绑定 onnx 模型目录与参考音频
+- **自动服务管理**：可一键启动/停止 GenieTTS 服务，支持自动检测服务状态
+- **多语言支持**：中文/日文，日语模式自动翻译中文文本为日语合成
+- **G2P 崩溃规避**：文本预处理规避 Genie 中文 G2P 越界崩溃，保证合成稳定性
+
+#### 通用特性
+
 - **口型同步**：桌面窗 AudioContext 实时驱动嘴部开合
-- **角色级覆盖**：每角色可独立配置 TTS 语言与自动播放
+- **整段合音**：开启后一段回复的多个合成分段合并为整段一次合成（音调更连贯），代价是失去逐句实时朗读与逐句切立绘
+- **角色级覆盖**：每角色可独立配置 TTS 语言、声音模式（MiMo/GenieTTS/禁用）与自动播放
 - **触发无关入口**：无论从聊天窗或桌宠入口发送，回复完成后由主进程统一触发语音
+
+## 🧠 记忆系统
+
+### 手动记忆
+
+用户手动维护的全局固定记忆条目，每次请求前实时拼接注入 system prompt。
+
+### 自动沉淀
+
+会话结束后，后台自动从对话内容抽取候选记忆（用户信息/长期经历/约定与承诺），需用户确认后生效：
+
+- **候选机制**：自动抽取的记忆为"待确认"状态，不注入 system prompt，避免错误记忆污染对话
+- **分类管理**：按主题分类（用户信息/长期经历/约定与承诺），支持按角色隔离
+- **确认流程**：设置 → 记忆 → 查看待确认候选 → 确认/删除
 
 ## 角色卡 · 人设体系
 
@@ -141,10 +174,21 @@ Cubism Core（`live2dcubismcore.min.js`）是 Live2D 官方闭源专有 SDK，**
 
 ## 🗣️ 配置语音合成
 
+### MiMo 声音克隆（云端）
+
 1. 前往 [MiMo 开放平台](https://mimo.mi.com/) 注册并获取 API Key
-2. 设置 → **语音合成** → 填写 MiMo API Key 和模型名（如 `mimo-v2.5-tts-voiceclone`）
+2. 设置 → **语音合成** → 引擎选择「MiMo 声音克隆」→ 填写 MiMo API Key 和模型名（如 `mimo-v2.5-tts-voiceclone`）
 3. 导入参考音频（建议 5-30 秒干净人声，wav/mp3 格式）
 4. 在角色卡中绑定参考音频，即可在 AI 回复时自动合成语音并驱动桌宠口型同步
+
+### GenieTTS 本地声库（离线）
+
+1. 下载并安装 [GenieTTS](https://github.com/High-Logic/Genie-TTS)
+2. 设置 → **语音合成** → 引擎选择「GenieTTS 本地声库」
+3. 配置 GenieTTS 环境目录（含 python.exe）和 GenieData 资源目录
+4. 点击【启动服务】等待服务就绪（或手动启动 GenieTTS 服务）
+5. 创建 TTS 模型卡：填写角色名、onnx 模型目录、参考音频（可选）
+6. 在角色卡中绑定 TTS 模型卡，即可在 AI 回复时自动合成语音
 
 > TTS API Key 与 LLM API Key 隔离加密存储，互不影响。
 
@@ -156,10 +200,12 @@ Cubism Core（`live2dcubismcore.min.js`）是 Live2D 官方闭源专有 SDK，**
 userData/
 ├── data/
 │   ├── characterCards.json     # 角色卡
-│   ├── memory.json             # 全局记忆体
-│   ├── settings.json           # 非敏感配置（baseURL、model 等）
+│   ├── memory.json             # 全局记忆体（含待确认候选）
+│   ├── settings.json           # 非敏感配置（baseURL、model、textSpeed 等）
 │   ├── model-settings.json     # 模型设置（缩放/位置/动画/表情）
-│   ├── voice-settings.json     # TTS 非敏感配置（语言、自动播放）
+│   ├── voice-settings.json     # TTS 非敏感配置（语言、引擎、整段合音）
+│   ├── tts-genie-config.json   # GenieTTS 本地声库配置（baseUrl、workPath、dataDir）
+│   ├── tts-model-cards.json    # TTS 模型卡（本地声库角色绑定）
 │   ├── sprites-index.json      # 2D 立绘集索引
 │   ├── secure/
 │   │   ├── apiKey.enc          # safeStorage 加密的 LLM API Key
@@ -167,7 +213,7 @@ userData/
 │   ├── voices/
 │   │   ├── index.json          # 参考音频索引
 │   │   └── voice_xxx.wav       # 参考音频文件
-│   └── sessions/               # 会话索引 + 单个会话消息
+│   └── sessions/               # 会话索引 + 单个会话消息（含摘要）
 ├── models/{modelId}/           # 导入的 Live2D 模型副本
 ├── sprites/{spriteId}/         # 导入的 2D 立绘图片
 ├── live2d-core/                # 用户手动导入的 Cubism Core
@@ -183,7 +229,7 @@ userData/
 - **样式**：Tailwind CSS v4
 - **动画**：framer-motion；**状态**：Zustand
 - **Live2D**：pixi.js v6 + pixi-live2d-display（动态 import `/cubism4` 子路径）
-- **TTS**：小米 MiMo voiceclone API + Web Audio API 口型同步
+- **TTS**：小米 MiMo voiceclone API（云端）+ GenieTTS（本地离线）+ Web Audio API 口型同步
 - **打包**：electron-builder（Windows NSIS，可选安装目录，卸载时删除应用数据）
 - **更新**：electron-updater + GitHub Actions
 - **自定义协议**：`pet-res://` 服务本地模型/立绘资源（路径穿越防护）
@@ -200,8 +246,8 @@ userData/
 
 - 记忆条目过多时的 token 截断策略（目前全量拼接）
 - 模型空闲动作的细节待优化
-- 模型日文语音输出暂未实现
 - 目前仅支持 Windows 打包目标
+- GenieTTS 仅支持 CPU 推理，无 GPU 加速
 
 ## 🔒 安全设计要点
 
