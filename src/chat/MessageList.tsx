@@ -63,7 +63,7 @@ export function MessageList() {
 
   if (messages.length === 0 && !streaming) {
     return (
-      <div className="flex flex-1 items-center justify-center px-6 py-8">
+      <div className="flex flex-1 items-center justify-center px-6 py-8" style={{ background: 'var(--bg-base)' }}>
         <motion.div
           initial={{ opacity: 0, scale: 0.92 }}
           animate={{ opacity: 1, scale: 1 }}
@@ -87,7 +87,7 @@ export function MessageList() {
   }
 
   return (
-    <div ref={listRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-4">
+    <div ref={listRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-4" style={{ background: 'var(--bg-base)' }}>
       {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}
       <div ref={contentRef} className="space-y-4">
       {messages.map((msg, i) => {

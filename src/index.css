@@ -215,8 +215,7 @@ body.pet-body {
   overflow: hidden;
 }
 
-/* 聊天窗口：窗口已设 transparent: true，body 保持透明，
- * 仅显示 FloatingDock 浮动面板，窗口紧贴 Dock 可视区域无多余透明区。 */
+/* 聊天窗口：窗口已设 transparent: true，body 保持透明 */
 body.chat-body {
   background: transparent;
   color: var(--text-primary);

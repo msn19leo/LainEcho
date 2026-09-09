@@ -93,7 +93,7 @@ export function ApiConfigPanel() {
           />
         </Field>
 
-        <Field label="模型（model）" hint="如 gpt-4o-mini / deepseek-chat 等，需与 API 兼容">
+        <Field label="模型（model）" hint="如 gpt-4o-mini等，需与 API 兼容">
           <Input value={settings.model} onChange={(e) => save({ model: e.target.value })} placeholder="gpt-4o-mini" />
         </Field>
 
@@ -133,7 +133,7 @@ export function ApiConfigPanel() {
         {/* 上下文管理（A1/A2）：按 Token 预算装填历史 + 自动摘要压缩 */}
         <div className="space-y-4 border-t border-border pt-4">
           <div className="flex flex-col gap-2 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
-            <div className="text-sm text-text">模型上下文窗口（tokens）</div>
+            <div className="text-sm text-text">历史消息预算（tokens）</div>
             <Input
               className="w-full"
               type="number"
@@ -147,7 +147,8 @@ export function ApiConfigPanel() {
               }}
             />
             <div className="text-xs text-text-muted">
-              历史按此预算从近到远装填；0 = 不限制（关闭自动收窄）。常见：32768 / 131072 / 1M
+              控制发送给模型的历史消息总量上限。超出时自动裁剪较早对话，避免超过模型上下文限制。
+              设置为 0 表示不限制（由模型自身限制）。建议值：模型上下文窗口的 70%-80%（为 system prompt 和回复预留空间）。
             </div>
           </div>
 
