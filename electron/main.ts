@@ -4,6 +4,7 @@
 import { app } from 'electron'
 import { ensureDataDirs } from './services/storage'
 import { pruneEmptySessions } from './services/repository'
+import { compensateMissingVectors } from './services/memory/memoryVectors'
 import { registerPetSchemesPrivileged, registerPetProtocolHandler } from './services/petProtocol'
 import { registerAllIpc } from './ipc'
 import { windowManager } from './windows/windowManager'
@@ -26,6 +27,9 @@ if (!gotLock) {
     registerPetProtocolHandler()
     registerAllIpc()
     windowManager.init()
+
+    // 记忆向量启动补偿：为缺失/模型过期的已确认记忆后台补嵌（未配置嵌入时静默跳过）
+    void compensateMissingVectors()
 
     app.on('activate', () => {
       // macOS Dock 点击时恢复桌宠窗口（兼容处理）

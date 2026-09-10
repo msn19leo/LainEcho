@@ -13,6 +13,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   contextWindowTokens: 32768,
   enableAutoCompact: true,
   enableMemoryExtraction: true,
+  // 记忆向量检索：默认关闭（需配置嵌入 API 地址/模型/Key 后开启）
+  memoryRetrievalEnabled: false,
+  embeddingBaseURL: '',
+  embeddingModel: '',
+  memoryDedupThreshold: 0.92,
   userName: '用户',
   // 文字显示速度：0-100 速度档（越大越快；0=即时显示，不逐字）
   textSpeed: 80,
@@ -50,6 +55,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           contextWindowTokens: data.contextWindowTokens,
           enableAutoCompact: data.enableAutoCompact,
           enableMemoryExtraction: data.enableMemoryExtraction,
+          memoryRetrievalEnabled: data.memoryRetrievalEnabled,
+          embeddingBaseURL: data.embeddingBaseURL,
+          embeddingModel: data.embeddingModel,
+          memoryDedupThreshold: data.memoryDedupThreshold,
           userName: data.userName,
           textSpeed: data.textSpeed,
         },

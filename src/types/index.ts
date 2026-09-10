@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 共享类型定义 —— 主进程（electron/）与渲染进程（src/）复用。
  * 主进程通过 preload.ts 将 window.api 白名单方法暴露给渲染进程。
  */
@@ -310,6 +310,34 @@ export interface MemoryItem {
   sourceSessionId?: string | null
 }
 
+/** 编年史条目（长期经历的按期滚动摘要，分层压缩产物） */
+export interface ChronicleEntry {
+  id: string
+  text: string
+  createdAt: number
+}
+
+/** 单个角色（或全局）的记忆分层压缩档案 */
+export interface MemoryProfile {
+  /** 归属键：角色卡 id，'_global' = 全局 */
+  key: string
+  /** 用户画像压缩稿（已采纳生效，常驻注入 system prompt；空串 = 尚无） */
+  personaDigest: string
+  personaUpdatedAt: number
+  /** 已被画像吸收的 user_info 记忆 id 列表（增量整理的游标） */
+  personaSourceIds: string[]
+  /** 待采纳的画像草稿（LLM 整理产物，用户确认后转正） */
+  pendingDigest: string | null
+  /** 待采纳草稿对应的来源记忆 id 列表（采纳时并入 personaSourceIds） */
+  pendingSourceIds: string[]
+  /** 编年史条目（滚动摘要，作为长期经历的检索候选与兜底注入） */
+  chronicle: ChronicleEntry[]
+  /** 已被编年史吸收的 long_term 记忆 id 列表 */
+  chronicleSourceIds: string[]
+  /** 最近一次整理（画像+编年史）时间 */
+  lastConsolidatedAt: number
+}
+
 /** 会话索引条目（sessions/index.json，不含消息正文，用于列表/搜索/筛选） */
 export interface SessionIndexItem {
   id: string
@@ -345,6 +373,14 @@ export interface AppSettings {
   enableAutoCompact: boolean
   /** 是否启用记忆自动沉淀（会话结束后后台从对话抽取候选记忆，需用户确认后生效） */
   enableMemoryExtraction: boolean
+  /** 是否启用记忆向量检索（按当前对话语义检索相关记忆注入；关闭或未配置嵌入模型时回退「最近 N 条」） */
+  memoryRetrievalEnabled: boolean
+  /** 嵌入 API 地址（OpenAI 兼容 /embeddings 端点；独立于主 LLM 的 baseURL，灵活性更高） */
+  embeddingBaseURL: string
+  /** 嵌入模型名（对应 embeddingBaseURL 的服务商；Key 走独立加密存储，不随 settings 明文保存） */
+  embeddingModel: string
+  /** 语义去重相似度阈值（0-1，cos ≥ 该值的候选记忆视为重复；默认 0.92） */
+  memoryDedupThreshold: number
   /** 你的称呼（%player% 占位符在人设/示例对话中的替换值，默认「用户」） */
   userName: string
   /** 文字显示速度（0-100 速度档，越大越快；参考 LingChat，默认 80；0 = 即时显示，不逐字） */
@@ -624,6 +660,26 @@ export interface WindowApi {
     remove: (id: string) => Promise<void>
     /** 订阅记忆变更（自动沉淀 / 其它窗口修改后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
+    /** 语义搜索已确认记忆（向量检索；嵌入未配置时返回空数组，前端回退本地过滤） */
+    semanticSearch: (query: string, topK?: number) => Promise<Array<{ item: MemoryItem; score: number }>>
+    /** 手动重嵌全部已确认记忆（换嵌入模型/大量缺失时用） */
+    reembedAll: () => Promise<{ embedded: number; failed: number; unavailable?: boolean }>
+    /** 测试嵌入配置连通性（独立地址/模型/Key），成功返回向量维度 */
+    testEmbedding: () => Promise<{ ok: boolean; dim?: number; error?: string }>
+    /** 读取指定角色（或全局）的画像/编年史档案 */
+    getProfile: (cardId?: string | null) => Promise<MemoryProfile | null>
+    /** 触发画像/编年史整理（画像草稿待采纳，编年史直接生效） */
+    consolidateProfile: (cardId?: string | null) => Promise<{ ok: boolean; draft: string | null; chronicleAdded: number; error?: string }>
+    /** 采纳/放弃画像草稿（采纳后常驻注入 system prompt） */
+    adoptProfile: (cardId: string | null, adopt: boolean) => Promise<void>
+    /** 编辑已生效画像文本（面板手动修改整理结果；空串 = 清除画像） */
+    updateProfileDigest: (cardId: string | null, text: string) => Promise<void>
+    /** 删除已生效画像（来源记忆恢复"未吸收"，可重新整理生成） */
+    deleteProfileDigest: (cardId: string | null) => Promise<void>
+    /** 编辑单条编年史条目文本 */
+    updateChronicleEntry: (cardId: string | null, entryId: string, text: string) => Promise<void>
+    /** 删除单条编年史条目（原始记忆保持不变，仅移除摘要） */
+    deleteChronicleEntry: (cardId: string | null, entryId: string) => Promise<void>
   }
   session: {
     list: () => Promise<SessionIndexItem[]>
@@ -663,11 +719,15 @@ export interface WindowApi {
     onChanged: (cb: () => void) => () => void
   }
   settings: {
-    /** 返回非敏感配置 + 是否已配置 Key（不回显明文） */
-    get: () => Promise<AppSettings & { hasApiKey: boolean }>
+    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey 为嵌入服务独立 Key 状态） */
+    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean }>
     save: (settings: Partial<AppSettings>) => Promise<void>
     saveApiKey: (key: string) => Promise<void>
     hasApiKey: () => Promise<boolean>
+    /** 保存嵌入服务独立 API Key（safeStorage 加密落盘，与主 LLM Key 隔离） */
+    saveEmbeddingApiKey: (key: string) => Promise<void>
+    /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
+    hasEmbeddingApiKey: () => Promise<boolean>
     /** 获取当前数据目录信息（当前路径、默认路径、是否自定义） */
     getDataDir: () => Promise<{ current: string; default: string; isCustom: boolean }>
     /** 选择新目录并迁移数据，成功后需手动重启应用 */

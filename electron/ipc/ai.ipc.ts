@@ -1,4 +1,4 @@
-﻿/**
+/**
  * AI 请求 IPC。
  * - 主进程组装 system prompt（人设 + 记忆体）、发起流式请求、持久化消息
  * - API Key 只在主进程内存中解密使用，不经过 IPC 传给渲染进程
@@ -22,6 +22,9 @@ import {
   listConfirmedMemories,
   updateSessionSummary,
 } from '../services/repository'
+import { buildSystemParts } from '../services/prompt/sections'
+import { composeSystemPrompt } from '../services/prompt/composer'
+import { retrieveMemories } from '../services/memory/retriever'
 import { windowManager } from '../windows/windowManager'
 
 let currentAbort: AbortController | null = null
@@ -130,15 +133,17 @@ export function registerAiIpc(): void {
       if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
       if (!settings.model.trim()) throw new Error('未配置模型名（model）')
 
-      // 组装 system prompt：人设字段 + 示例对话 + 最近 MAX_MEMORIES 条全局记忆体
-      // （每次请求前实时读取，保证记忆更新即时生效）
+      // 组装 system prompt：人设字段 + 示例对话 + 记忆注入
+      // 记忆来源由检索器决定：向量模式（语义检索 top-k + 画像/约定常驻）或降级模式（最近 N 条，旧行为）
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
-      const memories = await listConfirmedMemories(session.characterCardId, MAX_MEMORIES)
+      const lastUserText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+      const retrieval = await retrieveMemories(session.characterCardId, lastUserText, MAX_MEMORIES)
       const systemMessage: ChatMessage = {
         role: 'system',
-        content: buildSystemPrompt(card, memories, settings.userName),
+        content: buildSystemPrompt(card, retrieval.items, settings.userName, retrieval.profileDigest),
       }
+      console.log('[memory] 注入模式=%s 条数=%d 画像=%s', retrieval.mode, retrieval.items.length, retrieval.profileDigest ? 'yes' : 'no')
 
       // A1+A2 上下文组装：净化消息 → 按 Token 预算装填（A1）；总 token 超阈值时，
       // 旧历史交给独立请求生成摘要并落盘复用（A2）。摘要走独立 prompt，不污染主对话的 JSON 输出约束。
@@ -354,6 +359,29 @@ export function registerAiIpc(): void {
 
   ipcMain.on('ai:cancel', () => {
     currentAbort?.abort()
+  })
+
+  /**
+   * 调试预览：返回指定会话「下次请求实际会发送」的 system prompt 组装报表。
+   * 复用 send-message 的记忆检索路径（向量/降级模式一致），列出各段落 id/token/是否注入，
+   * 供设置窗排查 token 占用；只读、不触发摘要、不发消息。
+   */
+  ipcMain.handle('prompt:preview', async (_event, params: { sessionId: string }) => {
+    try {
+      const { sessionId } = params ?? {}
+      if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
+      const settings = await getSettings()
+      const session = await getSession(sessionId)
+      const card = await getCharacterCard(session.characterCardId)
+      const lastUserText = [...session.messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+      const retrieval = await retrieveMemories(session.characterCardId, lastUserText, MAX_MEMORIES)
+      const composed = composeSystemPrompt(buildSystemParts(card, retrieval.items, retrieval.profileDigest), {
+        userName: settings.userName,
+      })
+      return { ok: true, mode: retrieval.mode, memoryCount: retrieval.items.length, text: composed.text, sections: composed.sections }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
   })
 
   /**

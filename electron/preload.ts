@@ -65,6 +65,27 @@ const api: WindowApi = {
       ipcRenderer.on('memory:changed', listener)
       return () => ipcRenderer.removeListener('memory:changed', listener)
     },
+    /** 语义搜索已确认记忆（向量检索；嵌入未配置返回空数组） */
+    semanticSearch: (query, topK) => ipcRenderer.invoke('memory:semantic-search', { query, topK }),
+    /** 手动重嵌全部已确认记忆 */
+    reembedAll: () => ipcRenderer.invoke('memory:reembed-all'),
+    /** 测试嵌入配置连通性（独立地址/模型/Key） */
+    testEmbedding: () => ipcRenderer.invoke('memory:test-embedding'),
+    /** 读取画像/编年史档案 */
+    getProfile: (cardId) => ipcRenderer.invoke('memory:get-profile', { cardId }),
+    /** 触发画像/编年史整理 */
+    consolidateProfile: (cardId) => ipcRenderer.invoke('memory:consolidate-profile', { cardId }),
+    /** 采纳/放弃画像草稿 */
+    adoptProfile: (cardId, adopt) => ipcRenderer.invoke('memory:adopt-profile', { cardId, adopt }),
+    /** 编辑已生效画像文本（空串 = 清除画像） */
+    updateProfileDigest: (cardId, text) => ipcRenderer.invoke('memory:update-profile-digest', { cardId, text }),
+    /** 删除已生效画像 */
+    deleteProfileDigest: (cardId) => ipcRenderer.invoke('memory:delete-profile-digest', { cardId }),
+    /** 编辑单条编年史条目 */
+    updateChronicleEntry: (cardId, entryId, text) =>
+      ipcRenderer.invoke('memory:update-chronicle-entry', { cardId, entryId, text }),
+    /** 删除单条编年史条目 */
+    deleteChronicleEntry: (cardId, entryId) => ipcRenderer.invoke('memory:delete-chronicle-entry', { cardId, entryId }),
   },
   session: {
     list: () => ipcRenderer.invoke('session:list'),
@@ -104,6 +125,10 @@ const api: WindowApi = {
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
     saveApiKey: (key) => ipcRenderer.invoke('settings:save-api-key', key),
     hasApiKey: () => ipcRenderer.invoke('settings:has-api-key'),
+    /** 保存嵌入服务独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
+    saveEmbeddingApiKey: (key) => ipcRenderer.invoke('settings:save-embedding-api-key', key),
+    /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
+    hasEmbeddingApiKey: () => ipcRenderer.invoke('settings:has-embedding-api-key'),
     getDataDir: () => ipcRenderer.invoke('settings:get-data-dir'),
     changeDataDir: () => ipcRenderer.invoke('settings:change-data-dir'),
     resetDataDir: () => ipcRenderer.invoke('settings:reset-data-dir'),

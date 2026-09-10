@@ -10,6 +10,7 @@
     "dev": "chcp 65001 && vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
+    "test:prompt": "node scripts/run-prompt-golden.mjs",
     "icon": "node scripts/png-to-ico.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",

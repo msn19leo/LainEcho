@@ -7,9 +7,11 @@
  * - 与现有记忆做简单内容去重（完全相同或互相包含即跳过）；
  * - 任何失败静默，不阻塞聊天。
  */
-import type { ChatMessage, MemoryCategory } from '../../src/types'
+import type { ChatMessage, MemoryCategory, MemoryItem } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
-import { addPendingMemory, listMemories } from './repository'
+import { embedTexts, type EmbeddingConfig } from './memory/embeddingService'
+import { resolveEmbeddingConfig, syncMemoryVectors } from './memory/memoryVectors'
+import { addPendingMemory, getSettings, listMemories } from './repository'
 import { windowManager } from '../windows/windowManager'
 
 /** 每次沉淀抽取的最近对话条数 */
@@ -60,6 +62,43 @@ function isDuplicate(content: string, existing: string[]): boolean {
     const et = e.trim()
     return et === c || (et.length > 8 && (et.includes(c) || c.includes(et)))
   })
+}
+
+/** 向量点积（embedTexts 输出已 L2 归一化，点积即余弦相似度） */
+function cosine(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 0
+  let dot = 0
+  for (let i = 0; i < a.length; i++) dot += a[i]! * b[i]!
+  return dot
+}
+
+/**
+ * 语义去重：把字符串去重后的候选与同角色已有记忆（含待确认候选）批量嵌入比对，
+ * cos ≥ 阈值（memoryDedupThreshold，默认 0.92）即视为语义重复剔除。
+ * 嵌入不可用/失败时原样返回（保留字符串去重结果，不阻塞沉淀）。
+ * @returns 通过语义去重的候选子集
+ */
+async function semanticDedup(
+  fresh: Array<{ category: MemoryCategory; content: string }>,
+  existingScoped: MemoryItem[],
+  cfg: EmbeddingConfig,
+  threshold: number,
+): Promise<Array<{ category: MemoryCategory; content: string }>> {
+  if (fresh.length === 0 || existingScoped.length === 0) return fresh
+  try {
+    const [candVecs, existVecs] = await Promise.all([
+      embedTexts(fresh.map((f) => f.content), cfg),
+      embedTexts(existingScoped.map((m) => m.content), cfg),
+    ])
+    return fresh.filter((_, i) => {
+      const cv = candVecs[i]
+      if (!cv) return false
+      return !existVecs.some((ev) => ev !== undefined && cosine(cv, ev) >= threshold)
+    })
+  } catch (err) {
+    console.warn('[memory] 语义去重不可用（跳过，仅保留字符串去重）：', err instanceof Error ? err.message : err)
+    return fresh
+  }
 }
 
 /**
@@ -140,7 +179,7 @@ export async function extractMemoriesFromSession(params: {
     // 太短/纯语气词的直接丢弃；限定每批最多 MAX_PER_BATCH 条
     const existing = (await listMemories()).map((m) => m.content)
     const seenInBatch: string[] = []
-    const fresh: Array<{ category: MemoryCategory; content: string }> = []
+    let fresh: Array<{ category: MemoryCategory; content: string }> = []
     for (const m of parsed) {
       if (fresh.length >= MAX_PER_BATCH) break
       const content = normalizePerspective(m.content)
@@ -152,18 +191,38 @@ export async function extractMemoriesFromSession(params: {
     }
     if (fresh.length === 0) return
 
-    for (const m of fresh) {
-      await addPendingMemory({
-        content: m.content,
-        category: m.category,
-        characterCardId: cardId,
-        sourceSessionId: sessionId,
-      })
+    // 语义去重（可选）：嵌入配置完整时，与同角色已有记忆（含待确认候选）做向量比对，
+    // cos ≥ memoryDedupThreshold 的候选剔除；嵌入不可用时静默跳过
+    const embedCfg = await resolveEmbeddingConfig()
+    if (embedCfg) {
+      const appSettings = await getSettings()
+      const scoped = (await listMemories()).filter(
+        (m) => m.characterCardId === cardId || m.characterCardId === null,
+      )
+      fresh = await semanticDedup(fresh, scoped, embedCfg, appSettings.memoryDedupThreshold)
+      if (fresh.length === 0) {
+        console.log('[memory] 全部候选被语义去重拦截')
+        return
+      }
     }
-    if (fresh.length > 0) {
+
+    const written: MemoryItem[] = []
+    for (const m of fresh) {
+      written.push(
+        await addPendingMemory({
+          content: m.content,
+          category: m.category,
+          characterCardId: cardId,
+          sourceSessionId: sessionId,
+        }),
+      )
+    }
+    if (written.length > 0) {
       // 广播记忆变更给设置窗刷新（待确认列表）
       windowManager.broadcast('memory:changed')
-      console.log('[memory] 自动沉淀 %d 条候选记忆', fresh.length)
+      console.log('[memory] 自动沉淀 %d 条候选记忆', written.length)
+      // 候选即时嵌入向量（确认后无需重算；失败由启动补偿兜底）
+      void syncMemoryVectors(written)
     }
   } catch (err) {
     // 沉淀失败静默：不阻塞聊天、不影响用户

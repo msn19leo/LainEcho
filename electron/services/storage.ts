@@ -145,6 +145,14 @@ export const paths = {
   get memoryFile() {
     return path.join(this.dataDir, 'memory.json')
   },
+  /** 记忆向量索引（id → 嵌入向量，含模型标识），由 vectorIndex 维护 */
+  get memoryVectorsFile() {
+    return path.join(this.dataDir, 'memory-vectors.json')
+  },
+  /** 记忆分层压缩产物（用户画像 + 编年史，按角色隔离），由 profile 维护 */
+  get memoryProfileFile() {
+    return path.join(this.dataDir, 'memory-profile.json')
+  },
   get settingsFile() {
     return path.join(this.dataDir, 'settings.json')
   },
@@ -162,6 +170,10 @@ export const paths = {
   /** MiMo TTS API Key 加密存储文件（与 LLM API Key 隔离） */
   get voiceApiKeyFile() {
     return path.join(this.secureDir, 'voiceApiKey.enc')
+  },
+  /** 嵌入 API Key 加密存储文件（与主 LLM API Key 隔离，嵌入服务独立配置） */
+  get embeddingApiKeyFile() {
+    return path.join(this.secureDir, 'embeddingApiKey.enc')
   },
   get sessionsIndexFile() {
     return path.join(this.sessionsDir, 'index.json')

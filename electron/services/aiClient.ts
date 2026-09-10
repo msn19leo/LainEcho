@@ -19,7 +19,8 @@ export interface ChatRequestOptions {
   maxTokensOverride?: number
 }
 
-function normalizeBaseURL(baseURL: string): string {
+/** 规范化 baseURL：去首尾空白与末尾斜杠（chat 与 embeddings 请求共用） */
+export function normalizeBaseURL(baseURL: string): string {
   return baseURL.trim().replace(/\/+$/, '')
 }
 

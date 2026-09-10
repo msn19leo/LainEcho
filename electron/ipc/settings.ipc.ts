@@ -3,16 +3,17 @@
  */
 import { ipcMain, dialog } from 'electron'
 import type { AppSettings } from '../../src/types'
-import { hasApiKey, saveApiKey } from '../services/crypto'
+import { hasApiKey, saveApiKey, hasSecret, saveSecret } from '../services/crypto'
 import { getSettings, saveSettings } from '../services/repository'
-import { getDataDirInfo, migrateDataDir, resetDataDir } from '../services/storage'
+import { getDataDirInfo, migrateDataDir, resetDataDir, paths } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
 export function registerSettingsIpc(): void {
   ipcMain.handle('settings:get', async () => {
     const settings = await getSettings()
     const keyPresent = await hasApiKey()
-    return { ...settings, hasApiKey: keyPresent }
+    const embeddingKeyPresent = await hasSecret(paths.embeddingApiKeyFile)
+    return { ...settings, hasApiKey: keyPresent, hasEmbeddingApiKey: embeddingKeyPresent }
   })
 
   ipcMain.handle('settings:save', async (_e, patch: Partial<AppSettings>) => {
@@ -25,6 +26,12 @@ export function registerSettingsIpc(): void {
   ipcMain.handle('settings:save-api-key', (_e, key: string) => saveApiKey(key))
 
   ipcMain.handle('settings:has-api-key', () => hasApiKey())
+
+  /** 保存嵌入服务独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
+  ipcMain.handle('settings:save-embedding-api-key', (_e, key: string) => saveSecret(paths.embeddingApiKeyFile, key))
+
+  /** 嵌入服务 Key 是否已配置（仅回显掩码用，不返回明文） */
+  ipcMain.handle('settings:has-embedding-api-key', () => hasSecret(paths.embeddingApiKeyFile))
 
   /** 获取当前数据目录信息 */
   ipcMain.handle('settings:get-data-dir', () => {
