@@ -6,7 +6,7 @@
  * 任何差异（文本漂移、段落顺序变化、空段处理差异）都会使脚本以非零码退出。
  */
 import type { CharacterCard, CharacterPersona, MemoryItem } from '../src/types'
-import { buildSystemParts } from '../electron/services/prompt/sections'
+import { buildSystemParts, PROACTIVE_HINT_PROMPT } from '../electron/services/prompt/sections'
 import { composeSystemPrompt } from '../electron/services/prompt/composer'
 
 // ---------- 参考实现（重构前 buildSystemPrompt 的逐字节拷贝，禁止修改） ----------
@@ -187,8 +187,9 @@ function newBuildSystemPrompt(
   memories: MemoryItem[],
   userName = '用户',
   profileDigest?: string | null,
+  proactiveHint?: boolean,
 ): string {
-  return composeSystemPrompt(buildSystemParts(card, memories, profileDigest), { userName }).text
+  return composeSystemPrompt(buildSystemParts(card, memories, profileDigest, proactiveHint), { userName }).text
 }
 
 // ---------- 夹具与断言 ----------
@@ -203,6 +204,7 @@ interface Fixture {
   memories: MemoryItem[]
   userName?: string
   profileDigest?: string | null
+  proactiveHint?: boolean
 }
 
 const fullPersona: Persona = {
@@ -254,13 +256,30 @@ const fixtures: Fixture[] = [
     mem('m6', 'long_term', '有效记忆内容'),
   ] },
   { name: '注入画像段（新能力，非金样比对，仅验证可拼接）', card: fullCard, memories: [mem('m7', 'user_info', '对方喜欢星空')], profileDigest: '对方是一名喜欢天文的大学生。' },
+  { name: '注入主动搭话说明（新能力，非金样比对，仅验证可拼接）', card: fullCard, memories: [], proactiveHint: true },
 ]
 
 function main(): number {
   let failed = 0
   for (const fx of fixtures) {
     const reference = referenceBuildSystemPrompt(fx.card, fx.memories, fx.userName ?? '用户')
-    const actual = newBuildSystemPrompt(fx.card, fx.memories, fx.userName ?? '用户', fx.profileDigest)
+    const actual = newBuildSystemPrompt(fx.card, fx.memories, fx.userName ?? '用户', fx.profileDigest, fx.proactiveHint)
+    if (fx.proactiveHint) {
+      // 主动搭话说明段为新增能力：验证其位于末尾且之前的正文与金样一致
+      const hintTail = `\n\n${PROACTIVE_HINT_PROMPT}`
+      if (!actual.endsWith(hintTail)) {
+        console.error(`[FAIL] ${fx.name}: 主动搭话说明段缺失或位置错误`)
+        failed++
+        continue
+      }
+      if (actual.slice(0, actual.length - hintTail.length) !== reference) {
+        console.error(`[FAIL] ${fx.name}: 说明段之前的正文与金样不一致`)
+        failed++
+      } else {
+        console.log(`[PASS] ${fx.name}`)
+      }
+      continue
+    }
     if (fx.profileDigest) {
       // 画像段为新增能力：只验证画像段位于最前且其余内容与金样一致
       const digestPart = `## 对方的画像（长期了解）\n${fx.profileDigest.trim()}\n\n`

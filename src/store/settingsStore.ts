@@ -18,6 +18,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   embeddingBaseURL: '',
   embeddingModel: '',
   memoryDedupThreshold: 0.92,
+  // 主动搭话：默认关闭（需用户显式开启；屏幕感知级联于本开关）
+  enableProactive: false,
+  enableScreenSense: false,
+  maxProactivePerDay: 3,
+  proactiveLlmNarration: true,
+  quietHours: { start: '', end: '' },
+  visionBaseURL: '',
+  visionModel: '',
   userName: '用户',
   // 文字显示速度：0-100 速度档（越大越快；0=即时显示，不逐字）
   textSpeed: 80,
@@ -59,6 +67,13 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           embeddingBaseURL: data.embeddingBaseURL,
           embeddingModel: data.embeddingModel,
           memoryDedupThreshold: data.memoryDedupThreshold,
+          enableProactive: data.enableProactive,
+          enableScreenSense: data.enableScreenSense,
+          maxProactivePerDay: data.maxProactivePerDay,
+          proactiveLlmNarration: data.proactiveLlmNarration,
+          quietHours: data.quietHours,
+          visionBaseURL: data.visionBaseURL,
+          visionModel: data.visionModel,
           userName: data.userName,
           textSpeed: data.textSpeed,
         },
@@ -86,7 +101,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   },
 }))
 
-/** 文字速度档（0-100）→ 每字间隔毫秒（参考 LingChat：1→200ms，100→10ms）；<=0 视为即时显示 */
+/** 文字速度档（0-100）→ 每字间隔毫秒（1→200ms，100→10ms）；<=0 视为即时显示 */
 export function typingSpeedToMs(speed: number): number {
   if (speed <= 0) return 0
   const s = Math.min(100, Math.max(1, speed))

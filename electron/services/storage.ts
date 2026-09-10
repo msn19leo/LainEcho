@@ -175,6 +175,14 @@ export const paths = {
   get embeddingApiKeyFile() {
     return path.join(this.secureDir, 'embeddingApiKey.enc')
   },
+  /** 屏幕感知视觉模型 API Key 加密存储文件（独立配置） */
+  get visionApiKeyFile() {
+    return path.join(this.secureDir, 'visionApiKey.enc')
+  },
+  /** 主动搭话调度状态（兴趣值/当日计数，重启不丢） */
+  get proactiveStateFile() {
+    return path.join(this.dataDir, 'proactive-state.json')
+  },
   get sessionsIndexFile() {
     return path.join(this.sessionsDir, 'index.json')
   },

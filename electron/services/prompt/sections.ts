@@ -176,18 +176,23 @@ const MEMORY_TOPICS: Array<{ title: string; note: string; category: MemoryCatego
   { title: '你与对方的约定', note: '以下约定需要你记住并遵守', category: 'promises' },
 ]
 
+/** 主动搭话常驻说明（仅 enableProactive 时注入）：让角色知道自己可以主动开口，并教它消化系统旁白 */
+export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要等待对方先说话。若出现系统旁白提示，请以你自己的口吻自然地开口，不要提及旁白或系统。）`
+
 /**
  * 构造 system prompt 的全部段落（顺序与旧版 buildSystemPrompt 逐字节一致）：
- * 记忆（画像 + 三分段）→ EMOTION_PROMPT → 人设各段 → 示例对话 → 分段规范 → 旁白规范。
+ * 记忆（画像 + 三分段）→ EMOTION_PROMPT → 人设各段 → 示例对话 → 分段规范 → 旁白规范 →（可选）主动搭话说明。
  *
  * @param card 角色卡（取人设字段）
  * @param memories 参与注入的记忆列表（来源由检索器决定：向量检索 or 最近 N 条）
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；null/空 = 不注入）
+ * @param proactiveHint 是否注入主动搭话说明（enableProactive 开启时为 true）
  */
 export function buildSystemParts(
   card: { persona?: Partial<CharacterPersona> | null; messageExample?: string } | null,
   memories: MemoryItem[],
   profileDigest?: string | null,
+  proactiveHint?: boolean,
 ): PromptSection[] {
   const sections: PromptSection[] = []
   let order = 0
@@ -224,6 +229,8 @@ export function buildSystemParts(
   }
   push('format.paragraph', PARAGRAPH_PROMPT, false)
   push('format.narration', NARRATION_PROMPT, false)
+  // 主动搭话说明（仅开启时注入；位于段落末尾，作为行为能力说明而非人设）
+  if (proactiveHint) push('proactive', PROACTIVE_HINT_PROMPT, false)
 
   return sections
 }

@@ -19,10 +19,25 @@ export interface DialogueChunk {
 }
 
 /** 单条聊天消息（落盘到 sessions/{id}.json 的 messages 数组） */
+/** 消息来源标记（落盘持久化，用于 UI 弱化渲染与记忆抽取豁免等） */
+export interface ChatMessageMeta {
+  /** 主动搭话旁白消息（主进程写入，渲染为弱化旁白样式，不参与记忆抽取） */
+  proactive?: boolean
+  /** 剧情模式消息（预留：剧情引擎写入，跳过常规记忆抽取） */
+  story?: boolean
+}
+
 export interface ChatMessage {
   role: ChatRole
   content: string
   timestamp?: number
+  /** 消息来源标记（普通聊天无此字段） */
+  meta?: ChatMessageMeta
+  /**
+   * 本轮生成失败的错误信息（仅 user 消息；轮次失败时由主进程落盘）。
+   * 渲染端据此在「末条无回复」提示中展示具体原因，重开窗口后依然可见。
+   */
+  error?: string
   /**
    * AI 回复的结构化情绪标签（仅 assistant 消息；缺省 = 未解析/平静）。
    * 由主进程从回复末尾的 {@emotion:xxx} 标签解析并归一化到标准情绪。
@@ -373,6 +388,20 @@ export interface AppSettings {
   enableAutoCompact: boolean
   /** 是否启用记忆自动沉淀（会话结束后后台从对话抽取候选记忆，需用户确认后生效） */
   enableMemoryExtraction: boolean
+  /** 是否启用主动搭话（桌宠在长时间无交互后由角色主动开口；旁白入史走完整聊天管线） */
+  enableProactive: boolean
+  /** 是否启用屏幕感知（与主动搭话同时开启时：先感知屏幕内容再搭话；截图不落盘） */
+  enableScreenSense: boolean
+  /** 每日主动搭话次数上限（用户回复后会重置计数） */
+  maxProactivePerDay: number
+  /** 话题搭话旁白由 LLM 随机生成（关闭 = 固定模板；LLM 失败自动回退模板） */
+  proactiveLlmNarration: boolean
+  /** 免打扰时段（'HH:MM' 24 小时制；start/end 任一为空 = 不启用；支持跨零点，如 23:00-08:00） */
+  quietHours: { start: string; end: string }
+  /** 屏幕感知视觉模型 API 地址（OpenAI 兼容 chat/completions，支持图片输入；独立配置） */
+  visionBaseURL: string
+  /** 屏幕感知视觉模型名（Key 走独立加密存储，不随 settings 明文保存） */
+  visionModel: string
   /** 是否启用记忆向量检索（按当前对话语义检索相关记忆注入；关闭或未配置嵌入模型时回退「最近 N 条」） */
   memoryRetrievalEnabled: boolean
   /** 嵌入 API 地址（OpenAI 兼容 /embeddings 端点；独立于主 LLM 的 baseURL，灵活性更高） */
@@ -383,7 +412,7 @@ export interface AppSettings {
   memoryDedupThreshold: number
   /** 你的称呼（%player% 占位符在人设/示例对话中的替换值，默认「用户」） */
   userName: string
-  /** 文字显示速度（0-100 速度档，越大越快；参考 LingChat，默认 80；0 = 即时显示，不逐字） */
+  /** 文字显示速度（0-100 速度档，越大越快；参考 默认 80；0 = 即时显示，不逐字） */
   textSpeed: number
 }
 
@@ -600,6 +629,22 @@ export interface StreamUserPayload {
   sessionId: string
   content: string
   timestamp: number
+  /** 消息来源标记（主动搭话旁白 → 渲染端弱化样式） */
+  meta?: ChatMessageMeta | null
+}
+
+/** 主动搭话调度状态（proactive:get-state / proactive:state 广播负载） */
+export interface ProactiveState {
+  /** 当前兴趣值（0-100；>50 后按概率触发搭话，用户回复清零） */
+  interest: number
+  /** 今日（按本地日期）已搭话次数 */
+  timesToday: number
+  /** 每日上限（settings.maxProactivePerDay 快照，展示用） */
+  maxPerDay: number
+  /** 最近一次成功搭话时间（null = 本次安装后尚未搭话） */
+  lastSpokeAt: number | null
+  /** 用户最近一次发消息时间（2 分钟冷却与兴趣重置依据） */
+  lastUserMessageAt: number | null
 }
 
 /** 桌宠窗口交互（拖动/缩放） */
@@ -719,8 +764,8 @@ export interface WindowApi {
     onChanged: (cb: () => void) => () => void
   }
   settings: {
-    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey 为嵌入服务独立 Key 状态） */
-    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean }>
+    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey/hasVisionApiKey 为独立服务 Key 状态） */
+    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean; hasVisionApiKey: boolean }>
     save: (settings: Partial<AppSettings>) => Promise<void>
     saveApiKey: (key: string) => Promise<void>
     hasApiKey: () => Promise<boolean>
@@ -728,6 +773,10 @@ export interface WindowApi {
     saveEmbeddingApiKey: (key: string) => Promise<void>
     /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
     hasEmbeddingApiKey: () => Promise<boolean>
+    /** 保存屏幕感知视觉模型独立 API Key（safeStorage 加密落盘） */
+    saveVisionApiKey: (key: string) => Promise<void>
+    /** 视觉模型 Key 是否已配置（仅回显掩码用） */
+    hasVisionApiKey: () => Promise<boolean>
     /** 获取当前数据目录信息（当前路径、默认路径、是否自定义） */
     getDataDir: () => Promise<{ current: string; default: string; isCustom: boolean }>
     /** 选择新目录并迁移数据，成功后需手动重启应用 */
@@ -875,6 +924,13 @@ export interface WindowApi {
     onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
     reportRendererReady: () => void
+  }
+  /** 主动搭话（调度状态查询/订阅；开关与屏幕感知配置在 settings） */
+  proactive: {
+    /** 读取调度状态（兴趣值/当日次数/最近搭话时间） */
+    getState: () => Promise<ProactiveState>
+    /** 订阅调度状态变化（每次成功搭话/用户消息重置后广播） */
+    onState: (cb: (state: ProactiveState) => void) => () => void
   }
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

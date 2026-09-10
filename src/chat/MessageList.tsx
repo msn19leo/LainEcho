@@ -100,6 +100,14 @@ export function MessageList() {
           return null
         }
         const isUser = msg.role === 'user'
+        // 主动搭话旁白：弱化的居中斜体行（非用户气泡），标识"角色主动开口"的舞台指示
+        if (isUser && msg.meta?.proactive) {
+          return (
+            <motion.div key={i} {...popSlideUp} transition={{ ...popSlideUp.transition, delay: Math.min(i * 0.04, 0.32) }} className="my-3 flex justify-center">
+              <p className="max-w-[85%] text-center text-xs italic leading-relaxed text-text-muted selectable">{msg.content}</p>
+            </motion.div>
+          )
+        }
         return (
           <motion.div
             key={i}
@@ -145,14 +153,40 @@ export function MessageList() {
         />
       ) : null}
 
-      {streamError && !streaming && (
-        <div className="flex justify-center">
-          <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-            <AlertTriangle size={14} strokeWidth={1.75} />
-            {streamError}
-          </div>
-        </div>
-      )}
+      {/* 两窗统一的失败提示（基于消息流判定，窗口重载后依然可见）：
+          末条是用户消息且不在生成中 = 这轮没有 AI 回复落盘；消息上的 error 字段携带具体原因。
+          发送下一条消息并成功落定后（末条变为 assistant）自动消失。 */}
+      {(() => {
+        const lastMessage = messages[messages.length - 1]
+        const lastIsUser = !!lastMessage && lastMessage.role === 'user' && !lastMessage.meta?.proactive
+        // streamError 横幅仅覆盖"末条不是用户消息"的失败（如建会话失败）；末条挂起时由下方提示接管，避免重复
+        return (
+          <>
+            {streamError && !streaming && !lastIsUser && (
+              <div className="flex justify-center">
+                <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+                  <AlertTriangle size={14} strokeWidth={1.75} />
+                  {streamError}
+                </div>
+              </div>
+            )}
+            {!streaming && lastIsUser && (
+              <div className="flex justify-center">
+                <div
+                  className="flex max-w-[85%] items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-xs"
+                  style={{ color: 'var(--warning)' }}
+                >
+                  <AlertTriangle size={14} strokeWidth={1.75} />
+                  <span>
+                    上一条消息未收到回复
+                    {lastMessage!.error ? `：${lastMessage.error}` : '（可能网络中断或服务暂不可用）'}
+                  </span>
+                </div>
+              </div>
+            )}
+          </>
+        )
+      })()}
       </div>
     </div>
   )

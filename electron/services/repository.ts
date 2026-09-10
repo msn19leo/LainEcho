@@ -318,14 +318,16 @@ export async function removeMemory(id: string): Promise<void> {
  * @param memories 参与注入的记忆列表（来源由检索器决定：向量检索 or 最近 N 条）
  * @param userName 你的称呼（%player% 占位符替换值）
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；缺省不注入）
+ * @param proactiveHint 是否注入主动搭话常驻说明（enableProactive 开启时为 true）
  */
 export function buildSystemPrompt(
   card: CharacterCard | null,
   memories: MemoryItem[],
   userName = '用户',
   profileDigest?: string | null,
+  proactiveHint?: boolean,
 ): string {
-  const sections = buildSystemParts(card, memories, profileDigest)
+  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint)
   return composeSystemPrompt(sections, { userName }).text
 }
 
@@ -523,6 +525,19 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableAutoCompact: true,
   // 记忆自动沉淀：默认开启（会话结束后台抽取候选记忆，需用户确认后生效）
   enableMemoryExtraction: true,
+  // 主动搭话：默认关闭（调度循环每 30s 一轮；需用户显式开启）
+  enableProactive: false,
+  // 屏幕感知：默认关闭（与主动搭话级联；开启后搭话前先感知屏幕内容）
+  enableScreenSense: false,
+  // 每日主动搭话上限（用户回复后重置计数）
+  maxProactivePerDay: 3,
+  // 话题搭话旁白由 LLM 随机生成（每次搭话多一次小调用；失败回退固定模板）
+  proactiveLlmNarration: true,
+  // 免打扰时段（空串 = 不启用；支持跨零点）
+  quietHours: { start: '', end: '' },
+  // 屏幕感知视觉模型（OpenAI 兼容 chat/completions + 图片输入；Key 独立加密存储）
+  visionBaseURL: '',
+  visionModel: '',
   // 记忆向量检索：默认关闭（需在设置中填入嵌入 API 地址/模型/Key 后开启；开启前回退「最近 N 条」注入）
   memoryRetrievalEnabled: false,
   // 嵌入 API 地址（OpenAI 兼容 /embeddings；独立于主 LLM 的 baseURL）
@@ -556,6 +571,13 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.contextWindowTokens !== undefined) next.contextWindowTokens = patch.contextWindowTokens
     if (patch.enableAutoCompact !== undefined) next.enableAutoCompact = patch.enableAutoCompact
     if (patch.enableMemoryExtraction !== undefined) next.enableMemoryExtraction = patch.enableMemoryExtraction
+    if (patch.enableProactive !== undefined) next.enableProactive = patch.enableProactive
+    if (patch.enableScreenSense !== undefined) next.enableScreenSense = patch.enableScreenSense
+    if (patch.maxProactivePerDay !== undefined) next.maxProactivePerDay = Math.max(0, Math.floor(patch.maxProactivePerDay))
+    if (patch.proactiveLlmNarration !== undefined) next.proactiveLlmNarration = patch.proactiveLlmNarration
+    if (patch.quietHours !== undefined) next.quietHours = patch.quietHours
+    if (patch.visionBaseURL !== undefined) next.visionBaseURL = patch.visionBaseURL
+    if (patch.visionModel !== undefined) next.visionModel = patch.visionModel
     if (patch.memoryRetrievalEnabled !== undefined) next.memoryRetrievalEnabled = patch.memoryRetrievalEnabled
     if (patch.embeddingBaseURL !== undefined) next.embeddingBaseURL = patch.embeddingBaseURL
     if (patch.embeddingModel !== undefined) next.embeddingModel = patch.embeddingModel

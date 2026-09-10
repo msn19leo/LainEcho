@@ -129,6 +129,10 @@ const api: WindowApi = {
     saveEmbeddingApiKey: (key) => ipcRenderer.invoke('settings:save-embedding-api-key', key),
     /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
     hasEmbeddingApiKey: () => ipcRenderer.invoke('settings:has-embedding-api-key'),
+    /** 保存屏幕感知视觉模型独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
+    saveVisionApiKey: (key) => ipcRenderer.invoke('settings:save-vision-api-key', key),
+    /** 视觉模型 Key 是否已配置（仅回显掩码用） */
+    hasVisionApiKey: () => ipcRenderer.invoke('settings:has-vision-api-key'),
     getDataDir: () => ipcRenderer.invoke('settings:get-data-dir'),
     changeDataDir: () => ipcRenderer.invoke('settings:change-data-dir'),
     resetDataDir: () => ipcRenderer.invoke('settings:reset-data-dir'),
@@ -297,6 +301,17 @@ const api: WindowApi = {
   modelSettings: {
     get: () => ipcRenderer.invoke('model-settings:get'),
     save: (patch) => ipcRenderer.invoke('model-settings:save', patch),
+  },
+  /** 主动搭话：调度状态查询/订阅 */
+  proactive: {
+    /** 读取调度状态（兴趣值/当日次数/最近搭话时间） */
+    getState: () => ipcRenderer.invoke('proactive:get-state') as Promise<import('../src/types').ProactiveState>,
+    /** 订阅调度状态变化（每次成功搭话/用户消息重置后广播），返回取消订阅函数 */
+    onState: (cb: (state: import('../src/types').ProactiveState) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, state: import('../src/types').ProactiveState) => cb(state)
+      ipcRenderer.on('proactive:state', listener)
+      return () => ipcRenderer.removeListener('proactive:state', listener)
+    },
   },
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

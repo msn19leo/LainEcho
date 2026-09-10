@@ -18,6 +18,7 @@ import {
   AudioLines,
   Info,
   SlidersHorizontal,
+  MessagesSquare,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -32,11 +33,12 @@ import { CharacterCardPanel } from './panels/CharacterCardPanel'
 import { CharacterModelPanel } from './panels/CharacterModelPanel'
 import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
+import { ProactivePanel } from './panels/ProactivePanel'
 import { VoicePanel } from './panels/VoicePanel'
 import { AboutPanel } from './panels/AboutPanel'
 import { GeneralPanel } from './panels/GeneralPanel'
 
-export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'data' | 'voice' | 'about'
+export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'proactive' | 'data' | 'voice' | 'about'
 
 interface ModuleDef {
   id: ModuleId
@@ -52,6 +54,7 @@ const MODULES: ModuleDef[] = [
   { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
   { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。', icon: AudioLines },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
+  { id: 'proactive', title: '主动搭话', desc: '桌宠在长时间无交互后主动开口，可选先感知屏幕内容再搭话。', icon: MessagesSquare },
   { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
   { id: 'about', title: '关于与更新', desc: '检查并安装新版本，查看应用信息。', icon: Info },
 ]
@@ -258,6 +261,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       {id === 'api' && <ApiConfigPanel />}
       {id === 'voice' && <VoicePanel />}
       {id === 'memory' && <MemoryPanel />}
+      {id === 'proactive' && <ProactivePanel />}
       {id === 'data' && <DataPanel />}
       {id === 'about' && <AboutPanel />}
     </div>

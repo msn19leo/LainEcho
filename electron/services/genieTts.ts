@@ -331,7 +331,7 @@ function sanitizeGenieText(text: string): string {
 /**
  * 调用 Genie /tts 合成并把裸 PCM/RIFF 封装为 WAV。
  * @param splitSentence 是否让服务端按语种分句拼接。中文用 true 更稳定；
- *       日语建议 false（Genie 日语分句脆弱，易返回空音频，参考 Shinsekai 亦用 false）。
+ *       日语建议 false（Genie 日语分句脆弱，易返回空音频，用 false）。
  */
 async function genieFetchWav(base: string, name: string, text: string, splitSentence = true): Promise<ArrayBuffer | null> {
   // 【诊断】确认实际发送给 Genie 的合成文本（判断是否因 stripBrackets 剥太薄而诱发复诵参考音频文本）

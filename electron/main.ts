@@ -5,6 +5,7 @@ import { app } from 'electron'
 import { ensureDataDirs } from './services/storage'
 import { pruneEmptySessions } from './services/repository'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
+import { startProactiveScheduler } from './services/proactive/scheduler'
 import { registerPetSchemesPrivileged, registerPetProtocolHandler } from './services/petProtocol'
 import { registerAllIpc } from './ipc'
 import { windowManager } from './windows/windowManager'
@@ -30,6 +31,9 @@ if (!gotLock) {
 
     // 记忆向量启动补偿：为缺失/模型过期的已确认记忆后台补嵌（未配置嵌入时静默跳过）
     void compensateMissingVectors()
+
+    // 主动搭话调度器：每 30s 一轮，enableProactive 关闭时循环空转（开销可忽略）
+    startProactiveScheduler()
 
     app.on('activate', () => {
       // macOS Dock 点击时恢复桌宠窗口（兼容处理）

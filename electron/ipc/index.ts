@@ -6,6 +6,7 @@ import { registerCharacterCardIpc } from './characterCard.ipc'
 import { registerMemoryIpc } from './memory.ipc'
 import { registerModelIpc } from './model.ipc'
 import { registerModelSettingsIpc } from './modelSettings.ipc'
+import { registerProactiveIpc } from './proactive.ipc'
 import { registerSessionIpc } from './session.ipc'
 import { registerSettingsIpc } from './settings.ipc'
 import { registerSpritesIpc } from './sprites.ipc'
@@ -20,6 +21,7 @@ export function registerAllIpc(): void {
   registerMemoryIpc()
   registerModelIpc()
   registerModelSettingsIpc()
+  registerProactiveIpc()
   registerSessionIpc()
   registerSettingsIpc()
   registerSpritesIpc()

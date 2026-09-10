@@ -190,6 +190,12 @@ export function bindPersistentSessionSync(): () => void {
       console.log('[bind] streamUser IGNORE sid=' + payload?.sessionId, 'cur=' + st.currentSessionId)
       return
     }
+    // 镜像窗口从收到 stream-user 起就进入 streaming 态，与发起方 send() 的本地状态对齐：
+    // 否则在"用户气泡已上屏、首个 chunk 未到"的 LLM 延迟窗口内，镜像窗口会因
+    // 「末条是用户消息 && !streaming」误判为发送失败，弹出黄色"未收到回复"警告。
+    // 主进程保证 stream-user 之后必有 stream-chunk/done/error 之一复位该状态。
+    // 同时清空上一轮残留的 streamingContent（发起方在 send() 里同样清空），避免镜像流式首块拼上旧文。
+    useSessionStore.setState({ streaming: true, streamingContent: '', streamError: null })
     // 幂等追加：仅在 messages 末尾还没有这条 user 消息时补上，避免发起方收到自身广播时重复
     const last = st.messages[st.messages.length - 1]
     if (last?.role === 'user' && last.content === payload.content) return
@@ -197,7 +203,10 @@ export function bindPersistentSessionSync(): () => void {
     // 让新会话的第一个用户气泡立即同步出现，无需等主进程 session:current 或 stream-done
     useSessionStore.setState((s) => ({
       currentSessionId: payload.sessionId,
-      messages: [...s.messages, { role: 'user', content: payload.content, timestamp: payload.timestamp }],
+      messages: [
+        ...s.messages,
+        { role: 'user', content: payload.content, timestamp: payload.timestamp, meta: payload.meta ?? undefined },
+      ],
     }))
     console.log('[bind] streamUser ADD usr=' + payload.content.slice(0, 12))
   })

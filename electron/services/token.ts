@@ -5,7 +5,6 @@
  * 消息一共占多少 token」，避免只按「最近 N 条」固定截断。
  *
  * cl100k_base 与 OpenAI gpt-4 系编码一致，中文/英文计数都较准；
- * 与 Shinsekai 的 compact_manager 使用同一编码，便于对齐压缩阈值。
  */
 import { encode } from 'gpt-tokenizer'
 

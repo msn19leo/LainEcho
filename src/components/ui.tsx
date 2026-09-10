@@ -85,16 +85,21 @@ interface SwitchProps {
   checked: boolean
   onChange: (checked: boolean) => void
   label?: string
+  /** 禁用态：不可点击并降低不透明度（如级联开关的前置条件未满足时） */
+  disabled?: boolean
 }
 
-export function Switch({ checked, onChange, label }: SwitchProps) {
+export function Switch({ checked, onChange, label, disabled = false }: SwitchProps) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
-      onClick={() => onChange(!checked)}
-      className="flex items-center gap-2"
+      disabled={disabled}
+      onClick={() => {
+        if (!disabled) onChange(!checked)
+      }}
+      className={cn('flex items-center gap-2', disabled && 'cursor-not-allowed opacity-40')}
     >
       <span
         className={cn(

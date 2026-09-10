@@ -74,6 +74,14 @@ export function PetContentList() {
           return null
         }
         const isUser = msg.role === 'user'
+        // 主动搭话旁白：弱化的居中斜体行（非用户气泡），标识"角色主动开口"的舞台指示
+        if (isUser && msg.meta?.proactive) {
+          return (
+            <div key={i} className="my-2 flex justify-center">
+              <p className="max-w-[92%] text-center text-[11px] italic leading-relaxed text-text-muted selectable">{msg.content}</p>
+            </div>
+          )
+        }
         return (
           <div key={i} className={cn('my-1 flex flex-col', isUser ? 'items-end' : 'items-start')}>
             {/* 名牌：用户=你；AI=角色名（用角色色表达说话人/情绪） */}
@@ -98,6 +106,24 @@ export function PetContentList() {
           </div>
         )
       })}
+
+      {/* 失败提示（与聊天窗统一）：末条是用户消息且不在生成中 = 这轮没有 AI 回复落盘；
+          消息上的 error 字段携带具体原因，窗口重载后依然可见。下一条消息成功落定后自动消失。 */}
+      {(() => {
+        const lastMessage = messages[messages.length - 1]
+        const lastIsUser = !!lastMessage && lastMessage.role === 'user' && !lastMessage.meta?.proactive
+        return lastIsUser && !streaming ? (
+          <div className="my-1 flex justify-center">
+            <p
+              className="max-w-[92%] rounded-[5px] border border-border bg-[var(--bg-surface)]/70 px-2 py-1 text-center text-[10px]"
+              style={{ color: 'var(--warning)' }}
+            >
+              上一条消息未收到回复
+              {lastMessage!.error ? `：${lastMessage.error}` : '（可能网络中断或服务暂不可用）'}
+            </p>
+          </div>
+        ) : null
+      })()}
 
       {/* 跟读气泡显示：跟读仅当语音正在朗读（readingActive）时出现（语音未到先空位+光标等待）；
           非跟读在 streamingContent 尚有内容时出现。均排除"朗读结束后的残留态"，避免空气泡 */}
