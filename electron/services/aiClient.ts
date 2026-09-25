@@ -14,6 +14,13 @@ export interface ChatRequestOptions {
   stream?: boolean
   /** 流式时的 token 回调 */
   onChunk?: (chunk: string) => void
+  /** 思考通道回调（思考型模型的 reasoning_content / reasoning 字段，OpenAI 兼容网关常见）。
+   *  content 通道为空时，调用方可从思考文本中抢救正文。 */
+  onReasoning?: (chunk: string) => void
+  /** 尝试关闭思考模式（结构化生成任务用）：GLM 系列走 body.thinking={type:'disabled'}。
+   *  思考型模型的 reasoning 计入 max_tokens 预算，任务不需要思考时关闭可避免预算被吃光。
+   *  仅在调用方显式传 true 时附加该参数（部分网关不认识会忽略，OpenAI 官方端点不接受此参数）。 */
+  disableThinking?: boolean
   signal?: AbortSignal
   /** 测试连接时覆盖 max_tokens（默认 5） */
   maxTokensOverride?: number
@@ -43,7 +50,7 @@ export async function sendChatCompletion(
   messages: ChatMessage[],
   options: ChatRequestOptions,
 ): Promise<string> {
-  const { model, baseURL, apiKey, temperature, maxTokens, stream = true, onChunk, signal, maxTokensOverride } = options
+  const { model, baseURL, apiKey, temperature, maxTokens, stream = true, onChunk, onReasoning, disableThinking, signal, maxTokensOverride } = options
 
   if (!baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
   if (!model.trim()) throw new Error('未配置模型名（model）')
@@ -57,6 +64,8 @@ export async function sendChatCompletion(
     max_tokens: maxTokensOverride ?? maxTokens,
   }
   if (temperature !== undefined && temperature !== null) body.temperature = temperature
+  // GLM 系列（智谱 OpenAI 兼容协议）：显式关闭思考，防止 reasoning 耗尽 max_tokens 后 content 为空
+  if (disableThinking) body.thinking = { type: 'disabled' }
 
   let res: Response
   try {
@@ -81,9 +90,12 @@ export async function sendChatCompletion(
 
   if (!stream) {
     const json = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>
+      choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string } }>
     }
-    return json.choices?.[0]?.message?.content ?? ''
+    const msg = json.choices?.[0]?.message
+    const think = msg?.reasoning_content ?? msg?.reasoning
+    if (think) onReasoning?.(think)
+    return msg?.content ?? ''
   }
 
   // --- SSE 流式解析 ---
@@ -93,6 +105,24 @@ export async function sendChatCompletion(
   let buffer = ''
   let full = ''
   let done = false
+
+  /** 处理单条 SSE data JSON：思考通道 → onReasoning，正文通道 → onChunk 累积 */
+  const handleChunkJson = (json: {
+    choices?: Array<{ delta?: { content?: string; reasoning_content?: string; reasoning?: string } }>
+    error?: { message?: string }
+  }): void => {
+    // OpenAI 兼容网关可能在 200 流中下发 error 事件（如上游模型报错）
+    if (json.error?.message) {
+      throw new Error(`模型返回错误：${json.error.message}`)
+    }
+    const delta = json.choices?.[0]?.delta
+    const think = delta?.reasoning_content ?? delta?.reasoning
+    if (think) onReasoning?.(think)
+    if (delta?.content) {
+      full += delta.content
+      onChunk?.(delta.content)
+    }
+  }
 
   while (!done) {
     let chunk: ReadableStreamReadResult<Uint8Array>
@@ -114,19 +144,7 @@ export async function sendChatCompletion(
       if (data === '[DONE]') continue
       if (data) {
         try {
-          const json = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>
-            error?: { message?: string }
-          }
-          // OpenAI 兼容网关可能在 200 流中下发 error 事件（如上游模型报错）
-          if (json.error?.message) {
-            throw new Error(`模型返回错误：${json.error.message}`)
-          }
-          const delta = json.choices?.[0]?.delta?.content
-          if (delta) {
-            full += delta
-            onChunk?.(delta)
-          }
+          handleChunkJson(JSON.parse(data))
         } catch (err) {
           if (err instanceof Error) throw err
           // 忽略无法解析的行（如 keep-alive 心跳）
@@ -142,16 +160,7 @@ export async function sendChatCompletion(
       const data = trimmed.slice(5).trim()
       if (data && data !== '[DONE]') {
         try {
-          const json = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>
-            error?: { message?: string }
-          }
-          if (json.error?.message) throw new Error(`模型返回错误：${json.error.message}`)
-          const delta = json.choices?.[0]?.delta?.content
-          if (delta) {
-            full += delta
-            onChunk?.(delta)
-          }
+          handleChunkJson(JSON.parse(data))
         } catch (err) {
           if (err instanceof Error) throw err
         }

@@ -76,7 +76,7 @@ export function InputArea() {
           <button
             onClick={handleSend}
             disabled={!canSend}
-            className="bg-accent-gradient glow-accent inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] px-6 text-sm font-semibold text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+            className="bg-accent-gradient glow-primary inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] px-6 text-sm font-semibold text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
           >
             <Send size={15} strokeWidth={2} />
             发送

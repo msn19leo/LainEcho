@@ -68,6 +68,7 @@ export const PARAGRAPH_PROMPT = `【节拍/分段规范（作用于上方 JSON �
 export const NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON 的 "text" 字段内部）】
 严格区分"台词"与"不可说出口"的内容：
 - 台词：角色真正说出的话，不裹任何括号。
+- 【最高优先】台词绝对不能用（）或()包裹——括号内的内容一律被视为心理/动作/场景，系统不会朗读它；把台词写进括号等于让角色闭嘴。
 - 心理活动、内心独白、动作描写、环境/氛围描写、第三人称旁白：必须用圆括号（）完整包裹。
 规则：
 - 一个描述性句子即使是"心理感受/内心活动"，只要它不发出声音，就必须整句放进圆括号，例如：
@@ -76,6 +77,7 @@ export const NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON �
   （虽然嘴上在找借口，但手指却悄悄收紧了） 正确
   虽然嘴上在找借口，但手指却悄悄收紧了   错误（会被误读）
 - 括号内容仅供阅读与演出，绝不朗读；你的"台词"应简短、口语，是真正能用嘴唇说出来的话。
+- 【动作归属】（括号）动作的归属以消息归属为准：你发出的消息里的动作是你做的，对方消息里的动作是对方做的。回忆此前互动时不要因人称"你"而改变归属——例如你写过"戳了戳对方的手心"，事后回忆仍是你戳了对方，绝不是对方戳了你。
 - 每项 "text" 的 "emotion" 字段即该节拍的立绘/表情；情绪转折时另起一项并写对应 emotion。`
 
 /**
@@ -176,8 +178,10 @@ const MEMORY_TOPICS: Array<{ title: string; note: string; category: MemoryCatego
   { title: '你与对方的约定', note: '以下约定需要你记住并遵守', category: 'promises' },
 ]
 
-/** 主动搭话常驻说明（仅 enableProactive 时注入）：让角色知道自己可以主动开口，并教它消化系统旁白 */
-export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要等待对方先说话。若出现系统旁白提示，请以你自己的口吻自然地开口，不要提及旁白或系统。）`
+/** 主动搭话常驻说明（仅 enableProactive 时注入）：让角色知道自己可以主动开口，并教它消化系统旁白。
+ *  措辞与 chatTurn.PROACTIVE_NARRATION_PREFIX 的【系统旁白】标记呼应：明确"user 消息里的旁白描述的是
+ *  角色本人（你）的动作"，防止模型把旁白当成对方说的话（曾因此把搭话旁白当成用户发言来回应）。 */
+export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要等待对方先说话。当"用户消息"里出现以【系统旁白】开头的舞台指示时：它描述的是角色本人（你）的动作与心情，不是对方说的话——请把它当作你自己的举动来消化，以你自己的口吻自然开口，不要提及旁白或系统，也不要复述旁白。）`
 
 /**
  * 构造 system prompt 的全部段落（顺序与旧版 buildSystemPrompt 逐字节一致）：
@@ -187,12 +191,14 @@ export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要
  * @param memories 参与注入的记忆列表（来源由检索器决定：向量检索 or 最近 N 条）
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；null/空 = 不注入）
  * @param proactiveHint 是否注入主动搭话说明（enableProactive 开启时为 true）
+ * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入，金样输出不变）
  */
 export function buildSystemParts(
   card: { persona?: Partial<CharacterPersona> | null; messageExample?: string } | null,
   memories: MemoryItem[],
   profileDigest?: string | null,
   proactiveHint?: boolean,
+  storyDirective?: string | null,
 ): PromptSection[] {
   const sections: PromptSection[] = []
   let order = 0
@@ -231,6 +237,8 @@ export function buildSystemParts(
   push('format.narration', NARRATION_PROMPT, false)
   // 主动搭话说明（仅开启时注入；位于段落末尾，作为行为能力说明而非人设）
   if (proactiveHint) push('proactive', PROACTIVE_HINT_PROMPT, false)
+  // 剧情导演指令（仅剧情演出轮次注入；让 AI 保持演出节奏与叙事边界）
+  if (storyDirective?.trim()) push('story', storyDirective.trim(), false)
 
   return sections
 }

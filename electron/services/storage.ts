@@ -117,6 +117,18 @@ export const paths = {
   get sessionsDir() {
     return path.join(getRootDir(), 'data', 'sessions')
   },
+  /** 剧本库根目录（每个剧本一个子目录：<id>/story.yaml + chapters/ + 素材） */
+  get storiesDir() {
+    return path.join(getRootDir(), 'data', 'stories')
+  },
+  /** 剧情 run 存档目录（与聊天会话完全分离：一次演出 = 一个 run 文件） */
+  get storyRunsDir() {
+    return path.join(getRootDir(), 'data', 'story-runs')
+  },
+  /** 剧情背景库目录（用户上传的背景图；剧本 background 事件以 user:文件名 引用） */
+  get storyBackgroundsDir() {
+    return path.join(getRootDir(), 'data', 'story-backgrounds')
+  },
   get modelsDir() {
     return path.join(getRootDir(), 'models')
   },
@@ -218,12 +230,32 @@ async function ensureDir(dir: string) {
   await fs.mkdir(dir, { recursive: true })
 }
 
+/** rename 重试：Windows 下目标文件被杀软/索引器瞬时占用会抛 EPERM，短暂重试即可恢复 */
+async function renameWithRetry(from: string, to: string, attempts = 4): Promise<void> {
+  for (let i = 0; ; i++) {
+    try {
+      await fs.rename(from, to)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if ((code === 'EPERM' || code === 'EACCES') && i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 60 * (i + 1)))
+        continue
+      }
+      throw err
+    }
+  }
+}
+
 /** 确保所有数据目录存在（app ready 时调用一次） */
 export async function ensureDataDirs() {
   await Promise.all([
     ensureDir(paths.dataDir),
     ensureDir(paths.secureDir),
     ensureDir(paths.sessionsDir),
+    ensureDir(paths.storiesDir),
+    ensureDir(paths.storyRunsDir),
+    ensureDir(paths.storyBackgroundsDir),
     ensureDir(paths.modelsDir),
     ensureDir(paths.coreDir),
     ensureDir(paths.voicesDir),
@@ -250,7 +282,7 @@ export function writeJson<T>(filePath: string, data: T): Promise<void> {
     const tmpPath = `${filePath}.tmp`
     const serialized = JSON.stringify(data, null, 2)
     await fs.writeFile(tmpPath, serialized, 'utf-8')
-    await fs.rename(tmpPath, filePath)
+    await renameWithRetry(tmpPath, filePath)
   })
 }
 
@@ -265,7 +297,7 @@ export function mutateJson<T>(filePath: string, fallback: T, mutator: (current: 
     await ensureDir(path.dirname(filePath))
     const tmpPath = `${filePath}.tmp`
     await fs.writeFile(tmpPath, JSON.stringify(next, null, 2), 'utf-8')
-    await fs.rename(tmpPath, filePath)
+    await renameWithRetry(tmpPath, filePath)
     return next
   })
 }

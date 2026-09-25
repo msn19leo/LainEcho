@@ -143,7 +143,9 @@ async function describeWithVLM(jpegBase64: string, cfg: VisionConfig): Promise<s
     }),
   })
   if (!res.ok) {
-    console.warn('[proactive] 视觉模型请求失败（HTTP %d）', res.status)
+    // 响应体含 error.message（模型无权限/不支持图像/参数不兼容等具体原因），截断打印便于定位配置问题
+    const body = await res.text().catch(() => '')
+    console.warn('[proactive] 视觉模型请求失败（HTTP %d）：%s', res.status, body.slice(0, 300))
     return null
   }
   const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }

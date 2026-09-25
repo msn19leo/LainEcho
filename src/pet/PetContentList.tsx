@@ -65,11 +65,12 @@ export function PetContentList() {
       <div ref={contentRef}>
       {messages.map((msg, i) => {
         // 隐藏末条定型 AI 的判定（须确有内容可显示，才由跟读/流式气泡接管，避免误藏上一条已落定回答）：
-        //  - 跟读：仅当语音正在朗读（readingActive）时才隐藏；朗读结束（active 下降沿）即恢复定型消息，
-        //    不依赖 displayedText——否则朗读结束只清 streamingContent 而 displayedText 残留，
+        //  - 跟读：语音正在朗读（readingActive）或已有前置旁白（displayedText 非空，语音尚未开始）时隐藏；
+        //    朗读结束（active 下降沿）即恢复定型消息，不依赖 displayedText——
+        //    否则朗读结束只清 streamingContent 而 displayedText 残留，
         //    会把定型消息持续隐藏、跟读气泡又已让位 = "气泡消失"。
         //  - 流式（非跟读）：streamingContent 尚有内容（揭示未完）时隐藏。
-        if (!streaming && ((following && readingActive) || (!following && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
+        if (!streaming && ((following && (readingActive || displayedText.length > 0)) || (!following && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
           console.log('[sync] pet 隐藏末条AI 下标=%d 原因(following=%s,readingActive=%s,dt=%d,sc=%d)', i, following, readingActive, displayedText.length, streamingContent.length)
           return null
         }
@@ -97,7 +98,7 @@ export function PetContentList() {
               className={cn(
                 'max-w-[90%] selectable whitespace-pre-wrap break-words rounded-[5px] px-2 py-1',
                 isUser
-                  ? 'bg-primary-gradient text-white'
+                  ? 'bg-primary-gradient text-[var(--on-brand)]'
                   : 'border border-[var(--border-strong)] bg-[var(--bg-surface)]/70 text-text',
               )}
             >
@@ -111,6 +112,7 @@ export function PetContentList() {
           消息上的 error 字段携带具体原因，窗口重载后依然可见。下一条消息成功落定后自动消失。 */}
       {(() => {
         const lastMessage = messages[messages.length - 1]
+        // 末条是旁白/剧情消息（非真实用户输入）时不提示"未收到回复"
         const lastIsUser = !!lastMessage && lastMessage.role === 'user' && !lastMessage.meta?.proactive
         return lastIsUser && !streaming ? (
           <div className="my-1 flex justify-center">
@@ -125,9 +127,10 @@ export function PetContentList() {
         ) : null
       })()}
 
-      {/* 跟读气泡显示：跟读仅当语音正在朗读（readingActive）时出现（语音未到先空位+光标等待）；
-          非跟读在 streamingContent 尚有内容时出现。均排除"朗读结束后的残留态"，避免空气泡 */}
-      {(streaming || (!following && streamingContent.length > 0) || (following && readingActive)) && (
+      {/* 跟读气泡显示：跟读在语音正在朗读（readingActive）或已有前置旁白（displayedText 非空，
+          语音尚未开始，旁白先行上屏）时出现；非跟读在 streamingContent 尚有内容时出现。
+          均排除"朗读结束后的残留态"，避免空气泡 */}
+      {(streaming || (!following && streamingContent.length > 0) || (following && (readingActive || displayedText.length > 0))) && (
         <div className="my-1 flex flex-col items-start">
           <span className="mb-0.5 select-none px-1 text-[10px] font-medium text-[var(--primary-400)]">{aiName}</span>
           <span className="max-w-[90%] whitespace-pre-wrap break-words rounded-[5px] border border-[var(--border-strong)] bg-[var(--bg-surface)]/70 px-2 py-1 text-text">

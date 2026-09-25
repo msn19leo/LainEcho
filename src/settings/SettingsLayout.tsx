@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Bot,
+  BookOpen,
   BrainCircuit,
   ChevronLeft,
   ChevronRight,
@@ -34,11 +35,12 @@ import { CharacterModelPanel } from './panels/CharacterModelPanel'
 import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { ProactivePanel } from './panels/ProactivePanel'
+import { StoryPanel } from './panels/StoryPanel'
 import { VoicePanel } from './panels/VoicePanel'
 import { AboutPanel } from './panels/AboutPanel'
 import { GeneralPanel } from './panels/GeneralPanel'
 
-export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'proactive' | 'data' | 'voice' | 'about'
+export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'proactive' | 'story' | 'data' | 'voice' | 'about'
 
 interface ModuleDef {
   id: ModuleId
@@ -55,6 +57,7 @@ const MODULES: ModuleDef[] = [
   { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。', icon: AudioLines },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
   { id: 'proactive', title: '主动搭话', desc: '桌宠在长时间无交互后主动开口，可选先感知屏幕内容再搭话。', icon: MessagesSquare },
+  { id: 'story', title: '剧情系统', desc: '剧本导入管理、galgame 式剧情演出（独立剧情窗）与多周目存档。', icon: BookOpen },
   { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
   { id: 'about', title: '关于与更新', desc: '检查并安装新版本，查看应用信息。', icon: Info },
 ]
@@ -95,7 +98,7 @@ export function SettingsLayout() {
         {/* 左侧导航 */}
         <nav className="flex w-48 shrink-0 flex-col border-r border-border bg-surface-2/40 p-4">
           <Logo />
-          <div className="mt-4 space-y-1">
+          <div className="mt-4 min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
             <NavButton active={view === 'home'} onClick={() => setView('home')} icon={House} label="主页" />
             <div className="my-2 border-t border-border" />
             {MODULES.map((m) => (
@@ -262,6 +265,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       {id === 'voice' && <VoicePanel />}
       {id === 'memory' && <MemoryPanel />}
       {id === 'proactive' && <ProactivePanel />}
+      {id === 'story' && <StoryPanel />}
       {id === 'data' && <DataPanel />}
       {id === 'about' && <AboutPanel />}
     </div>

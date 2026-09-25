@@ -23,8 +23,23 @@ export interface DialogueChunk {
 export interface ChatMessageMeta {
   /** 主动搭话旁白消息（主进程写入，渲染为弱化旁白样式，不参与记忆抽取） */
   proactive?: boolean
-  /** 剧情模式消息（预留：剧情引擎写入，跳过常规记忆抽取） */
+  /** 剧情演出消息标记（仅存在于剧情 run 存档的 messages 中，聊天会话不会出现） */
   story?: boolean
+  /**
+   * 剧情消息子类（仅 meta.story=true 时有意义）：
+   * - narration：剧本旁白/导演指令 → 剧情窗居中斜体呈现；
+   * - player：剧本编排的玩家独白 → 剧情窗对话框呈现（backlog 同步）；
+   * - choice：玩家选择的选项文本 → 只入 backlog，不占对话框；
+   * - free：自由对话轮的真实用户输入 → 只入 backlog，不占对话框；
+   * - 缺省：assistant 台词 → 正常呈现。
+   */
+  storyKind?: 'narration' | 'player' | 'choice' | 'free'
+  /**
+   * AI 背景联动（仅剧情 AI 轮次的 assistant 消息；设计文档 7.3）：
+   * 模型在输出 JSON 顶层输出的可选 "background" 键原样透传，
+   * 引擎校验其在背景清单内后走现有 background 事件通道。
+   */
+  storyBackground?: string
 }
 
 export interface ChatMessage {
@@ -394,6 +409,8 @@ export interface AppSettings {
   enableScreenSense: boolean
   /** 每日主动搭话次数上限（用户回复后会重置计数） */
   maxProactivePerDay: number
+  /** 主动搭话兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10），默认 30，范围 10~600 */
+  proactiveInterestIntervalSec: number
   /** 话题搭话旁白由 LLM 随机生成（关闭 = 固定模板；LLM 失败自动回退模板） */
   proactiveLlmNarration: boolean
   /** 免打扰时段（'HH:MM' 24 小时制；start/end 任一为空 = 不启用；支持跨零点，如 23:00-08:00） */
@@ -552,7 +569,7 @@ export interface ModelAnimationSettings {
   enableBlink: boolean
   /** 眨眼模式 */
   blinkMode: BlinkMode
-  /** 空闲动作组名（空字符串 = 不指定） */
+  /** 空闲动作组名（空字符串 = 不应用动作，模型静止只保留物理/眨眼） */
   idleAnimation: string
   /** 渲染缩放（影响清晰度，0.5~2） */
   renderScale: number
@@ -633,6 +650,36 @@ export interface StreamUserPayload {
   meta?: ChatMessageMeta | null
 }
 
+/**
+ * AI 流式"开头括号旁白前置"事件负载（ai:stream-narration，仅语音跟读模式广播）：
+ * 回答最前面的连续括号旁白在流式阶段即时上屏，不等语音；台词仍段随语音。
+ */
+export interface StreamNarrationPayload {
+  /** 重试轮重置：渲染端清空已前置旁白，等待重新增量接收 */
+  reset?: boolean
+  /** 增量旁白文本（已闭合括号组原文，逐段追加） */
+  delta?: string
+}
+
+/**
+ * Live2D 模型资产扫描结果（model:scan-assets）：
+ * 自动识别模型文件夹下的 *.exp3.json / *.motion3.json 并合并写回 model3.json。
+ */
+export interface ModelScanResult {
+  /** 本次新并入 model3.json 的表情数 */
+  addedExpressions: number
+  /** 本次新发现（此前 model3.json 未登记）的动作数 */
+  addedMotions: number
+  /** 动作组结构是否被重组（组名一律改为文件名后的结构变化，即使无新文件也可能为 true） */
+  reorganized: boolean
+  /** 合并后表情总数 */
+  totalExpressions: number
+  /** 合并后动作总数 */
+  totalMotions: number
+  /** 合并后动作组名列表（排序） */
+  groups: string[]
+}
+
 /** 主动搭话调度状态（proactive:get-state / proactive:state 广播负载） */
 export interface ProactiveState {
   /** 当前兴趣值（0-100；>50 后按概率触发搭话，用户回复清零） */
@@ -655,6 +702,340 @@ export interface WindowState {
   height: number
 }
 
+// ---------------- 剧情演出系统 ----------------
+
+/** 剧本事件上的动作（choices 选项 / input 事件触发） */
+export interface StoryAction {
+  type: 'set_var' | 'add_line'
+  /** set_var：变量名；add_line：写入会话历史的文本 */
+  name?: string
+  /** set_var 赋值操作：= / += / -=（缺省 =） */
+  op?: '=' | '+=' | '-='
+  /** set_var 值（数字/字符串/布尔）；add_line 无此字段 */
+  value?: number | string | boolean
+  /** add_line：写入会话历史的内容（作为 user 消息，参与 AI 上下文） */
+  content?: string
+}
+
+/**
+ * 剧本事件条件子句：{var, op?, value?}。
+ * op 缺省 = 裸变量真值判定（变量存在且非 false / 非 0 / 非空串）；
+ * 比较运算做宽松对齐：数值优先按数字比较，否则按字符串/布尔相等。
+ */
+export interface StoryConditionClause {
+  /** 变量名 */
+  var: string
+  /** 比较操作（二期扩展：数值/字符串比较；缺省 = 真值判定） */
+  op?: '==' | '!=' | '>=' | '<=' | '>' | '<'
+  /** 比较目标值 */
+  value?: number | string | boolean
+}
+
+/** 组合条件：clauses 按 mode 求值（all = 全部满足/缺省，any = 任一满足） */
+export interface StoryConditionGroup {
+  mode?: 'all' | 'any'
+  clauses: StoryConditionClause[]
+}
+
+/** 剧本事件条件（子句或组合；字符串形如 "metBefore"、"closeness >= 3"、"closeness >= 3 && metBefore"） */
+export type StoryCondition = StoryConditionClause | StoryConditionGroup
+
+/** chapter_end 分支项：when 条件满足时跳转到 nextChapter（按序求值，首个满足者生效） */
+export interface StoryChapterBranch {
+  when: StoryCondition
+  nextChapter: string
+}
+
+/** AI 判定分支选项（chapter_end.aiJudge）：章末由 LLM 依据整局 run 对话表现选择其一 */
+export interface StoryAiJudgeOption {
+  /** 选项标识（LLM 输出匹配键 + 判定结果变量值） */
+  id: string
+  /** 选项人类可读描述（一并交给 LLM 帮助权衡） */
+  label: string
+  /** 命中后跳转的章节 */
+  nextChapter: string
+}
+
+/** AI 判定结局配置（判定失败/输出无法匹配时回退 nextChapter 缺省行为） */
+export interface StoryAiJudge {
+  /** 判定提示词（告诉 LLM 从哪些结局维度权衡） */
+  prompt: string
+  /** 判定结果写入的变量名（缺省 ending；供后续章节条件引用） */
+  varName?: string
+  options: StoryAiJudgeOption[]
+}
+
+/** 剧本事件（一期 12 种，源自 LingChat schema 裁剪；所有事件可携带 condition 条件） */
+export type StoryEvent = ({
+    type: 'background'; image: string; duration?: number
+  } | {
+    type: 'music'; file?: string; loop?: boolean; stop?: boolean
+  } | {
+    type: 'modify_character'; emotion: StandardEmotion
+  } | {
+    type: 'narration'; text: string
+  } | {
+    type: 'player'; text: string
+  } | {
+    type: 'dialogue'; character?: string; text: string; emotion?: StandardEmotion
+  } | {
+    type: 'ai_dialogue'; prompt: string
+  } | {
+    type: 'free_dialogue'; maxRounds?: number; endHint?: string
+  } | {
+    type: 'choices'; options: Array<{ text: string; actions?: StoryAction[] }>; allowFree?: boolean
+  } | {
+    type: 'input'; actions?: StoryAction[]
+  } | {
+    type: 'set_var'; name: string; op?: '=' | '+=' | '-='; value: number | string | boolean
+  } | {
+    type: 'chapter_end'; nextChapter?: string; branches?: StoryChapterBranch[]; aiJudge?: StoryAiJudge
+  }) & { /** 演出条件（不满足则跳过该事件；支持比较与 && / || 组合） */
+    condition?: StoryCondition
+  }
+
+/** 剧本元信息（story.yaml） */
+export interface ScriptMeta {
+  id: string
+  title: string
+  summary?: string
+  /** 封面图（剧本目录相对路径，可选） */
+  cover?: string
+  /** 绑定角色卡（一期单角色；cardId 为系统角色卡 id，如 card_xxxxxxxxxxxx） */
+  characters?: Array<{ cardId?: string }>
+  /** 起始章节文件名（chapters/ 下的 yaml 文件名，如 01-intro） */
+  startChapter: string
+  version: number
+}
+
+/** 章节定义（chapters/*.yaml） */
+export interface ScriptChapterDef {
+  name: string
+  events: StoryEvent[]
+  /** 进入条件（7.5）：游标进入本章前求值一次，不满足 → 落 fallbackChapter 或静默跳过整章；缺省视为真 */
+  enterWhen?: StoryCondition
+  /** enterWhen 不满足时的备选章节（chapters/ 下文件名；进入前同样过 enterWhen 检查，visited 防环） */
+  fallbackChapter?: string
+}
+
+/** 已加载的剧本（引擎运行时结构） */
+export interface ScriptBundle {
+  meta: ScriptMeta
+  /** 按剧本声明顺序或文件名排序的章节 */
+  chapters: Array<{ file: string; def: ScriptChapterDef }>
+  /** 剧本资源目录绝对路径（背景/音乐/封面解析用） */
+  dir: string
+}
+
+/** 剧本库列表条目（story:list） */
+export interface ScriptIndexItem {
+  id: string
+  title: string
+  summary: string
+  cover: string | null
+  chapters: number
+  /** story.yaml 建议绑定的角色卡（存在性由渲染端校验） */
+  characterCardId: string | null
+}
+
+/** 剧本导入/导出校验报告 */
+export interface StoryImportReport {
+  ok: boolean
+  errors: Array<{ file: string; message: string }>
+}
+
+/** 剧情 2D 立绘视图调整（大小/水平/垂直；随 run 存档，类似角色模型设置的立绘缩放与位置） */
+export interface StorySpriteView {
+  /** 缩放倍率（1 = 适应高度基准） */
+  scale: number
+  /** 水平偏移（% 窗口宽度，负左正右） */
+  x: number
+  /** 垂直偏移（% 窗口高度，负上正下） */
+  y: number
+}
+
+/** 剧情语音配置（随 run 存档；与角色卡声音模块解耦，仅支持本地 Genie 声库） */
+export interface StoryVoiceConfig {
+  /** 本地声库模型卡 id（tts-model_xxx） */
+  ttsModelId: string
+  /** 语音输出语言：zh 中文 / ja 日语（日语模式自动翻译，复用现有 Genie 逻辑） */
+  language: 'zh' | 'ja'
+}
+
+/** 剧情 run 存档（data/story-runs/{runId}.json）——与聊天系统完全分离，永不进入聊天会话 */
+export interface StoryRun {
+  runId: string
+  scriptId: string
+  /** 剧情用角色卡（人设/示例对话来源） */
+  cardId: string
+  /** 2D 立绘集（必选；剧情与 Live2D 无关） */
+  spriteId: string
+  /** 语音配置；null = 不启用语音 */
+  voice: StoryVoiceConfig | null
+  /** 覆盖背景（可选；本次演出强制使用，优先级高于剧本 background 事件） */
+  backgroundOverride?: string | null
+  /** 2D 立绘视图（大小/位置调整；缺省用默认值） */
+  spriteView?: StorySpriteView
+  createdAt: number
+  updatedAt: number
+  storyState: StoryState
+  /** 演出对话记录（backlog 与 AI 上下文来源） */
+  messages: ChatMessage[]
+}
+
+/** 存档列表条目（story:list-runs） */
+export interface StoryRunIndexItem {
+  runId: string
+  scriptId: string
+  scriptTitle: string
+  cardId: string
+  cardName: string
+  spriteId: string
+  voice: StoryVoiceConfig | null
+  chapterIndex: number
+  chapterCount: number
+  status: 'running' | 'ended'
+  createdAt: number
+  updatedAt: number
+}
+
+/** 剧情运行时状态（run 文件的 storyState 字段） */
+export interface StoryState {
+  scriptId: string
+  chapterIndex: number
+  /** 事件游标：重启/重开窗口后从此处继续（指向未完成的事件） */
+  eventIndex: number
+  vars: Record<string, unknown>
+  status: 'running' | 'ended'
+}
+
+/** 渲染端等待提交的交互（挂起中的 choices/input/free_dialogue） */
+export interface StoryPendingInteraction {
+  kind: 'choices' | 'input' | 'free'
+  /** choices：完整选项定义；input/free：附加说明 */
+  choices?: Array<{ text: string }>
+  allowFree?: boolean
+  maxRounds?: number
+  /** free：剩余轮次 */
+  roundsLeft?: number
+  endHint?: string
+}
+
+/** 剧情状态快照（story:state 广播 / story:get-state / 剧情窗迟到接入的恢复依据） */
+export interface StorySnapshot {
+  runId: string
+  scriptId: string
+  title: string
+  status: 'running' | 'ended'
+  /**
+   * 本次接入的演出方式：
+   * - start：刚从新建 run 开始 → 剧情窗从第一条消息完整播放；
+   * - resume：中途接入/重开窗口 → 只把最后一条消息作为当前句，不重播全文。
+   */
+  mode: 'start' | 'resume'
+  cardId: string
+  spriteId: string
+  /** 语音配置（null = 不启用；剧情窗据此决定是否合成） */
+  voice: StoryVoiceConfig | null
+  /** 立绘视图（大小/位置） */
+  spriteView: StorySpriteView
+  chapterIndex: number
+  chapterName: string
+  eventIndex: number
+  vars: Record<string, unknown>
+  /** 当前背景图（剧本资源相对路径 / user: 前缀引用背景库；null = 无）——窗口重开时恢复演出终态 */
+  background: string | null
+  /** 当前 BGM（null = 无） */
+  music: string | null
+  /** 挂起中的交互（choices/input/free；无则 null） */
+  pending: StoryPendingInteraction | null
+  /** AI 轮次等待期（思考立绘显示依据；首个文本段开始播放时由渲染端自行退出） */
+  thinking: boolean
+}
+
+/** 剧情演出事件广播（story:event） */
+export interface StoryEventPayload {
+  runId: string
+  event: StoryEvent
+  /** 章节名（演出显示用） */
+  chapterName: string
+}
+
+/** 渲染端提交的交互结果（story:respond） */
+export type StoryResponse =
+  | { kind: 'choice'; index: number }
+  | { kind: 'input'; text: string }
+  | { kind: 'free'; text?: string; end?: boolean }
+  | { kind: 'retry' }
+
+/** 剧情 TTS 合成结果（story:tts-synthesize；WAV 32kHz mono int16 → base64） */
+export interface StoryTtsResult {
+  ok: boolean
+  audioBase64?: string
+  error?: string
+}
+
+// ---------------- 可视化编辑器（7.6） ----------------
+
+/** 编辑器读取结果：结构化（表单用）+ 原文（文本微调用）双份 */
+export interface EditorReadResult {
+  ok: boolean
+  error?: string
+  errors?: Array<{ file: string; message: string }>
+  scriptId?: string
+  storyYaml?: string
+  meta?: {
+    id: string
+    title: string
+    summary: string
+    startChapter: string
+    characterCardId: string | null
+    /** 手写剧本默认只读：仅 story.yaml 带 editedVia: form 时允许表单写回 */
+    editedVia: boolean
+  } | null
+  chapters?: Array<{
+    file: string
+    name: string
+    enterWhen: StoryCondition | null
+    fallbackChapter: string | null
+    events: StoryEvent[]
+    yaml: string
+  }>
+}
+
+/** 编辑器保存载荷（form = 结构化；text = 原文微调） */
+export type EditorSavePayload =
+  | {
+      mode: 'form'
+      scriptId: string
+      meta: { title: string; summary: string; startChapter: string; characterCardId: string | null }
+      chapters: Array<{ file: string; name: string; enterWhen?: StoryCondition | null; fallbackChapter?: string | null; events: StoryEvent[] }>
+    }
+  | {
+      mode: 'text'
+      scriptId: string
+      storyYaml: string
+      chapters: Array<{ file: string; yaml: string }>
+    }
+
+/** AI 剧本草稿生成结果（草稿为单文件 YAML：元信息 + chapters 内联，校验通过后导入拆分入库） */
+export interface StoryDraftResult {
+  ok: boolean
+  /** 生成的草稿 YAML 文本（失败时缺省） */
+  draft?: string
+  /** 草稿校验报告（ok=true 且 errors 为空 = 可直接导入） */
+  errors: Array<{ file: string; message: string }>
+  error?: string
+}
+
+/** 剧本导出请求结果 */
+export interface StoryExportResult {
+  ok: boolean
+  path?: string
+  canceled?: boolean
+  error?: string
+}
+
 /**
  * preload.ts 暴露到 window.api 的白名单 API 契约。
  * 渲染进程只能调用这里声明的能力，不做通配符透传。
@@ -665,6 +1046,8 @@ export interface WindowApi {
     sendMessage: (params: { sessionId: string; messages: ChatMessage[] }) => Promise<ChatMessage>
     /** 订阅流式 token 片段，返回取消订阅函数 */
     onStreamChunk: (cb: (chunk: string) => void) => () => void
+    /** 订阅"开头括号旁白前置"流（语音跟读模式下旁白流式即时上屏，不等语音） */
+    onStreamNarration: (cb: (payload: StreamNarrationPayload) => void) => () => void
     onStreamDone: (cb: (payload: StreamDonePayload) => void) => () => void
     onStreamError: (cb: (payload: StreamErrorPayload) => void) => () => void
     /** 订阅主进程广播的用户消息（跟随窗口即时补上用户气泡，无需等 stream-done 全量拉取） */
@@ -743,8 +1126,16 @@ export interface WindowApi {
     motionGroups: (modelId: string) => Promise<string[]>
     /** 读取指定模型的表情列表（从 model3.json 的 FileReferences.Expressions + exp3.json 解析） */
     expressionList: (modelId: string) => Promise<ExpressionMeta[]>
+    /**
+     * 扫描模型文件夹自动识别表情（*.exp3.json）/动作（*.motion3.json）文件，
+     * 合并写回 model3.json（手写条目保留、File 路径去重、写前备份）。
+     * 新增条目时主进程广播 models-changed 触发桌宠重载模型。
+     */
+    scanAssets: (modelId: string) => Promise<ModelScanResult>
     /** 弹原生文件夹选择框并导入 Live2D 模型 */
     importFromFolder: () => Promise<Live2DModelMeta | null>
+    /** 重命名模型（仅展示名，不动磁盘目录与 model3.json） */
+    rename: (modelId: string, name: string) => Promise<void>
     remove: (modelId: string) => Promise<void>
     /** Cubism Core 运行库是否已就绪 */
     coreStatus: () => Promise<{ present: boolean; path: string | null }>
@@ -758,8 +1149,8 @@ export interface WindowApi {
     importFromFolder: () => Promise<CharacterSprite | null>
     /** 删除指定立绘集（同时删除资源目录与索引条目） */
     remove: (spriteId: string) => Promise<void>
-    /** 更新立绘集展示资产：情绪→立绘图映射 / 说话立绘 / 思考立绘 */
-    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'emotionMap' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
+    /** 更新立绘集展示资产：名称 / 情绪→立绘图映射 / 说话立绘 / 思考立绘 */
+    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
     /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }
@@ -931,6 +1322,73 @@ export interface WindowApi {
     getState: () => Promise<ProactiveState>
     /** 订阅调度状态变化（每次成功搭话/用户消息重置后广播） */
     onState: (cb: (state: ProactiveState) => void) => () => void
+  }
+  /** 剧情演出：剧本库/run 存档/演出控制/事件订阅（与聊天系统完全分离） */
+  story: {
+    /** 枚举已导入剧本（元信息 + 封面） */
+    list: () => Promise<ScriptIndexItem[]>
+    /** 打开文件对话框导入 zip 剧本包（含全量校验，返回校验报告） */
+    import: () => Promise<StoryImportReport>
+    /** 导出剧本为 zip 分发包（弹出保存对话框） */
+    export: (scriptId: string) => Promise<StoryExportResult>
+    /** 删除剧本（连同其资源目录） */
+    remove: (scriptId: string) => Promise<{ ok: boolean; error?: string }>
+    /** 存档列表（多周目；含剧本名/进度） */
+    listRuns: () => Promise<StoryRunIndexItem[]>
+    /** 删除 run 存档 */
+    deleteRun: (runId: string) => Promise<{ ok: boolean }>
+    /** 开始/继续演出：mode=start 新建 run 从头演，resume=按 runId 从游标续玩；backgroundOverride=本次演出强制背景 */
+    start: (params: { scriptId: string; cardId: string; spriteId: string; voice: StoryVoiceConfig | null; mode: 'start' | 'resume'; runId?: string; backgroundOverride?: string | null }) => Promise<{ ok: boolean; runId?: string; error?: string }>
+    /** 提交交互结果（选项索引/自由文本/自由对话轮/重试） */
+    respond: (params: { runId: string; response: StoryResponse }) => Promise<{ ok: boolean; error?: string }>
+    /** 暂停演出（保留 run 存档） */
+    stop: (runId: string) => Promise<{ ok: boolean }>
+    /** 读取剧情快照（null = 无进行中的演出） */
+    getState: (runId: string) => Promise<StorySnapshot | null>
+    /** 读取 run 存档全文（backlog 回看与重开重建用） */
+    getRun: (runId: string) => Promise<StoryRun | null>
+    /** 调整立绘视图（大小/位置；随 run 存档并广播快照） */
+    setSpriteView: (runId: string, view: StorySpriteView) => Promise<{ ok: boolean }>
+    /** 剧情 TTS 合成（本地 Genie 声库 + 语言）→ WAV base64 */
+    synthesize: (params: { ttsModelId: string; language: 'zh' | 'ja'; text: string }) => Promise<StoryTtsResult>
+    /** 背景库文件名列表（data/story-backgrounds/；背景事件 user: 前缀引用） */
+    listBackgrounds: () => Promise<string[]>
+    /** 打开文件对话框选择图片并导入背景库（返回新增文件名） */
+    uploadBackgrounds: () => Promise<{ ok: boolean; added?: string[]; error?: string }>
+    /** 删除背景库文件 */
+    removeBackground: (name: string) => Promise<{ ok: boolean; error?: string }>
+    /** AI 辅助写剧本：梗概（+可选参考角色卡）→ 单文件 YAML 剧本草稿（含校验报告，不直接入库） */
+    generateDraft: (params: { premise: string; cardId?: string | null }) => Promise<StoryDraftResult>
+    /** 导入 AI 剧本草稿：schema 全量校验通过后拆分写入剧本库 */
+    importDraft: (draft: string) => Promise<{ ok: boolean; scriptId?: string; errors: Array<{ file: string; message: string }>; error?: string }>
+    /** 打开/聚焦剧情窗（演出不中断，按快照恢复） */
+    openWindow: () => void
+    /** 订阅演出事件流（background/music/narration/player/dialogue/…，带 runId） */
+    onEvent: (cb: (payload: StoryEventPayload) => void) => () => void
+    /** 订阅剧情状态变更（章节切换/结束/挂起交互/thinking 变化） */
+    onState: (cb: (snapshot: StorySnapshot) => void) => () => void
+    /** 订阅 run 消息更新（演出显示驱动源：剧情窗按游标从 run.messages 增量补演） */
+    onMessageSync: (cb: (payload: { runId: string }) => void) => () => void
+    /** 订阅剧情轮次流式预览（7.7 性能第一批）：AI 生成中的可读文本累积全文 */
+    onStreamDelta: (cb: (payload: { runId: string; text: string }) => void) => () => void
+    /** 剧情窗 renderer 就绪通知（主进程补发最新活跃 run 快照） */
+    reportRendererReady: () => void
+    /** 剧本资源 URL（背景/音乐/封面）：pet-res://stories/{scriptId}/{relativePath}；user: 前缀自动指向背景库 */
+    assetUrl: (scriptId: string, relativePath: string) => string
+    /** 立绘资源 URL：pet-res://sprites/{spriteId}/{relativePath} */
+    spriteUrl: (spriteId: string, relativePath: string) => string
+    /** 打开/聚焦可视化编辑器窗口（7.6），并载入指定剧本 */
+    openEditor: (scriptId: string) => Promise<{ ok: boolean; error?: string }>
+    /** 新增骨架剧本并直接进入编辑器 */
+    editorCreate: () => Promise<{ ok: boolean; scriptId?: string; error?: string }>
+    /** 编辑器当前编辑的剧本 id */
+    editorCurrent: () => Promise<string | null>
+    /** 编辑器读取剧本（结构化 + 原文双份；允许带错读取） */
+    editorRead: (scriptId: string) => Promise<EditorReadResult>
+    /** 编辑器保存（form = 表单结构化；text = 原文微调；校验通过才原子写盘） */
+    editorSave: (payload: EditorSavePayload) => Promise<{ ok: boolean; editedVia?: boolean; errors?: Array<{ file: string; message: string }>; error?: string }>
+    /** 订阅编辑器重载（重复打开编辑器切换剧本时通知） */
+    onEditorReload: (cb: () => void) => () => void
   }
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

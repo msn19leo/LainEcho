@@ -2,7 +2,7 @@
  * 消息流（airi 风格竖向对话流）。
  *
  * 设计：
- *   - 用户消息靠右（气泡右对齐）：填充主色调渐变（深色青→深青，浅色蓝→深蓝）+ 主色光晕，文字左对齐。
+ *   - 用户消息靠右（气泡右对齐）：品牌纯色底（深色青 / 浅色淡蓝）+ 主色光晕，文字左对齐。
  *   - AI 消息靠左：毛玻璃卡片 + 主色调边框。
  *   - 流式输出带流光打字机光标（.streaming-cursor，见 index.css）。
  *   - 消息出现使用 popSlideUp 弹性入场（scale 0.96 + y 12，0.4s 弹性曲线），逐条轻微错落。
@@ -37,6 +37,9 @@ export function MessageList() {
   const currentCardName = useCurrentCardName()
   const followReading = useChatReadingStore((s) => s.followReading)
   const readingActive = useChatReadingStore((s) => s.readingActive)
+  // 跟读文本（宠物窗 displayedText 镜像）：非空说明本轮已有前置旁白/跟读内容上屏，
+  // 用于"语音尚未开始（合成中）"的空档期隐藏定型 AI，避免与跟读气泡重复显示
+  const readingText = useChatReadingStore((s) => s.text)
   const listRef = useRef<HTMLDivElement>(null)
   /** 内容区外层（观测其实际高度以在打字机/流式增长时自动滚到底） */
   const contentRef = useRef<HTMLDivElement>(null)
@@ -92,10 +95,11 @@ export function MessageList() {
       <div ref={contentRef} className="space-y-4">
       {messages.map((msg, i) => {
         // 隐藏末条定型 AI 的判定（须确有内容可显示，才由跟读/流式气泡接管，避免误藏上一条已落定回答）：
-        //  - 跟读：仅当语音正在朗读（readingActive）时才隐藏；朗读结束即恢复定型消息，
-        //    不依赖 streamingContent（跟读气泡显示 readingText），避免"朗读结束空档"误隐藏。
+        //  - 跟读：语音正在朗读（readingActive）或已有前置旁白（readingText 非空，语音尚未开始）时隐藏；
+        //    朗读结束即恢复定型消息，不依赖 streamingContent（跟读气泡显示 readingText），
+        //    避免"朗读结束空档"误隐藏。
         //  - 流式（非跟读）：streamingContent 尚有内容（揭示未完）时隐藏。
-        if (!streaming && ((followReading && readingActive) || (!followReading && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
+        if (!streaming && ((followReading && (readingActive || readingText.length > 0)) || (!followReading && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
           console.log('[sync] chat 隐藏末条AI 下标=%d 原因(followReading=%s,readingActive=%s,sc=%d)', i, followReading, readingActive, streamingContent.length)
           return null
         }
@@ -124,8 +128,8 @@ export function MessageList() {
                 className={cn(
                   'selectable whitespace-pre-wrap break-words px-4 py-2.5 text-sm leading-relaxed',
                   isUser
-                    ? // 用户气泡：主色调渐变 + 主色光晕（深色青→深青，浅色蓝→深蓝）
-                      'rounded-[var(--radius-lg)] rounded-br-[var(--radius-md)] bg-primary-gradient text-white shadow-[var(--shadow-glow-primary)]'
+                    ? // 用户气泡：品牌纯色底 + 主色光晕（深色青 / 浅色淡蓝，与主题呼应）
+                      'rounded-[var(--radius-lg)] rounded-br-[var(--radius-md)] bg-primary-gradient text-[var(--on-brand)] shadow-[var(--shadow-glow-primary)]'
                     : // AI 气泡：毛玻璃卡片 + 主色调边框
                       'glass rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] text-text',
                 )}
@@ -143,9 +147,9 @@ export function MessageList() {
         )
       })}
 
-      {/* 流式/跟读气泡显示：跟读仅当语音正在朗读（readingActive）时出现（否则朗读结束后
-          streamingContent 已空会渲染空气泡）；非跟读在 streamingContent 尚有内容时出现 */}
-      {streaming || (!followReading && streamingContent.length > 0) || (followReading && readingActive) ? (
+      {/* 流式/跟读气泡显示：跟读在语音正在朗读（readingActive）或已有前置旁白（readingText 非空，
+          语音尚未开始，旁白先行上屏）时出现；非跟读在 streamingContent 尚有内容时出现 */}
+      {streaming || (!followReading && streamingContent.length > 0) || (followReading && (readingActive || readingText.length > 0)) ? (
         <StreamingBubble
           name={currentCardName || 'AI'}
           listRef={listRef}

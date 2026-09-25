@@ -897,14 +897,14 @@ export function CharacterCardPanel() {
                         ))}
                       </Select>
                     </Field>
-                    <Field label="待机动作覆盖（modelOverride.idleAnimation）" hint="角色级待机动作组覆盖。需先绑定模型。null = 跟随全局；空串 = 随机动作">
+                    <Field label="待机动作覆盖（modelOverride.idleAnimation）" hint="角色级待机动作组覆盖。需先绑定模型。null = 跟随全局；空串 = 不应用动作（模型静止）">
                       <Select
                         value={editor.idleAnimationOverride}
                         onChange={(e) => setEditor({ ...editor, idleAnimationOverride: e.target.value as 'global' | string })}
                         disabled={!editor.modelId}
                       >
                         <option value="global">跟随全局</option>
-                        <option value="">随机动作（不指定动作组）</option>
+                        <option value="">不应用动作</option>
                         {motionGroups.map((g) => (
                           <option key={g} value={g}>
                             {g}

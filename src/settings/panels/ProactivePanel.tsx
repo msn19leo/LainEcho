@@ -156,6 +156,22 @@ export function ProactivePanel() {
           <span>（你回复一条消息后计数会重置、兴趣值清零）</span>
         </div>
         <div className="flex items-center gap-2 text-xs text-text-muted">
+          <span className="shrink-0">兴趣值增长间隔</span>
+          <input
+            type="number"
+            min={10}
+            max={600}
+            step={5}
+            value={settings.proactiveInterestIntervalSec}
+            onChange={(e) => {
+              const v = Number(e.target.value)
+              if (!Number.isNaN(v)) void saveSettings({ proactiveInterestIntervalSec: Math.min(600, Math.max(10, Math.floor(v))) })
+            }}
+            className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-xs text-text"
+          />
+          <span>秒（每 X 秒累积一轮兴趣值 +5~10，越小搭话越频繁；改完下一轮自动生效）</span>
+        </div>
+        <div className="flex items-center gap-2 text-xs text-text-muted">
           <span className="shrink-0">免打扰时段</span>
           <input
             type="time"

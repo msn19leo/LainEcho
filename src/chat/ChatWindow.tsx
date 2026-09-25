@@ -26,6 +26,26 @@ import { SessionSidebar } from './SessionSidebar'
 import { useChatReadingStore } from './readingStore'
 import { toast } from '../components/toast'
 
+/**
+ * 把指定角色卡同步给宠物窗（换模型/覆盖配置 + 内容框头部与名牌的角色名）。
+ * 所有"聊天窗当前卡可能变化"的时机都必须调用：初始化回退、手动切卡、切会话。
+ * 聊天窗重开后 currentCardId 会静默回退到 cards[0]，若不广播，宠物窗仍停在
+ * 上次的卡，就会出现两侧角色名不一致。
+ */
+function syncPetCard(cardId: string | null) {
+  if (!cardId) return
+  const card = useCharacterStore.getState().cards.find((c) => c.id === cardId)
+  api.app.setPetCard({
+    cardId,
+    modelId: card?.modelId ?? null,
+    modelOverride: card?.modelOverride ?? null,
+    renderMode: card?.renderMode ?? null,
+    spriteId: card?.spriteId ?? null,
+    emotionMap: card?.emotionMap ?? null,
+    live2dExpressionMap: card?.live2dExpressionMap ?? null,
+  })
+}
+
 export function ChatWindow() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const cards = useCharacterStore((s) => s.cards)
@@ -102,6 +122,9 @@ export function ChatWindow() {
       await loadSessions()
       const state = useSessionStore.getState()
       if (state.currentSessionId) void loadSession(state.currentSessionId)
+      // 无会话可恢复（窗口重开后的常态）：把回退出的初始卡广播给宠物窗，
+      // 消除"聊天窗回退到 cards[0] 而宠物窗停在上次卡"的两侧不一致
+      else syncPetCard(useCharacterStore.getState().currentCardId)
     })()
     // 宠物窗点开聊天并指定会话时：加载该会话并切换当前卡
     const unsubOpen = api.chat.onOpenSession((sessionId) => {
@@ -140,16 +163,7 @@ export function ChatWindow() {
   // 切换角色卡：同步桌宠模型 + 表情/待机动作覆盖 + 清空当前会话（首条消息时才新建持久化会话）
   const handleCardChange = async (cardId: string) => {
     setCurrentCard(cardId)
-    const card = cards.find((c) => c.id === cardId)
-    api.app.setPetCard({
-      cardId,
-      modelId: card?.modelId ?? null,
-      modelOverride: card?.modelOverride ?? null,
-      renderMode: card?.renderMode ?? null,
-      spriteId: card?.spriteId ?? null,
-      emotionMap: card?.emotionMap ?? null,
-      live2dExpressionMap: card?.live2dExpressionMap ?? null,
-    })
+    syncPetCard(cardId)
     resetCurrentSession()
   }
 

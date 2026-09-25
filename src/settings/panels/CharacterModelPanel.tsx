@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Images,
   Maximize2,
+  Pencil,
   PersonStanding,
   Play,
   Plus,
@@ -23,6 +24,7 @@ import {
   ConfirmModal,
   Empty,
   Field,
+  Input,
   Loading,
   Modal,
   SegmentedControl,
@@ -59,8 +61,17 @@ export function CharacterModelPanel() {
   const [motionGroups, setMotionGroups] = useState<string[]>([])
   /** 可用的表情列表（从选中模型的 exp3.json 读取） */
   const [expressions, setExpressions] = useState<ExpressionMeta[]>([])
+  /** 资产扫描进行中 / 最近一次扫描结果提示 */
+  const [scanning, setScanning] = useState(false)
+  const [scanResult, setScanResult] = useState<string | null>(null)
+  /** 重命名弹窗目标：kind 区分 Live2D 模型 / 2D 立绘集，null = 弹窗关闭 */
+  const [renaming, setRenaming] = useState<{ kind: 'model' | 'sprite'; id: string; name: string } | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
 
   const { settings, loaded, load, save } = useModelSettingsStore()
+
+  /** 当前编辑目标模型：优先全局选中，未选中时用列表第一个 */
+  const currentModelId = settings.selectedModelId ?? models[0]?.id ?? null
 
   /** 加载指定模型的动作组（用于空闲动作下拉框）。不传 modelId 时按选中模型优先，其次列表第一个 */
   const loadMotionGroups = async (modelId?: string | null) => {
@@ -85,6 +96,39 @@ export function CharacterModelPanel() {
     void loadMotionGroups(settings.selectedModelId ?? list[0]?.id)
   }
 
+  /**
+   * 扫描当前模型文件夹：自动识别 *.exp3.json / *.motion3.json 并合并写回 model3.json，
+   * 然后用扫描返回的最新动作组刷新下拉框、重新拉取表情列表。
+   * 主进程在新增条目时会广播 models-changed，桌宠窗自动重载模型使新资产生效。
+   */
+  const handleScanAssets = async () => {
+    if (!currentModelId) {
+      toast('没有可扫描的模型，请先导入并选中 Live2D 模型', 'error')
+      return
+    }
+    setScanning(true)
+    try {
+      const r = await api.model.scanAssets(currentModelId)
+      setMotionGroups(r.groups)
+      void api.model.expressionList(currentModelId).then(setExpressions).catch(() => undefined)
+      if (r.addedExpressions === 0 && r.addedMotions === 0) {
+        setScanResult(
+          r.reorganized
+            ? `动作组已按文件名重组（现共 ${r.totalMotions} 个动作 / ${r.groups.length} 个组）。若空闲动作不播放，请重新选择动作组`
+            : `未发现新文件。当前已有 ${r.totalExpressions} 个表情 / ${r.totalMotions} 个动作（${r.groups.length} 个组）`,
+        )
+      } else {
+        setScanResult(`新增 ${r.addedExpressions} 个表情、${r.addedMotions} 个动作（现共 ${r.totalExpressions} 表情 / ${r.totalMotions} 动作，${r.groups.length} 个组）`)
+        toast('扫描完成，已登记到 model3.json', 'success')
+      }
+    } catch (err) {
+      setScanResult(null)
+      toast(`扫描失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    } finally {
+      setScanning(false)
+    }
+  }
+
   useEffect(() => {
     void refresh()
     void load()
@@ -94,8 +138,9 @@ export function CharacterModelPanel() {
   // 立绘集变化（导入/删除）时刷新
   useEffect(() => api.sprite.onChanged(() => void loadSprites()), [])
 
-  /** 选中模型变化时，重新加载该模型的动作组（保证下拉框与实际展示的模型一致） */
+  /** 选中模型变化时，重新加载该模型的动作组（保证下拉框与实际展示的模型一致），并清除上次扫描结果提示 */
   useEffect(() => {
+    setScanResult(null)
     if (models.length === 0) {
       setMotionGroups([])
       return
@@ -225,6 +270,38 @@ export function CharacterModelPanel() {
     }
   }
 
+  /** 打开重命名弹窗（Live2D 模型卡片 / 2D 立绘集卡片共用） */
+  const openRename = (kind: 'model' | 'sprite', id: string, name: string) => {
+    setRenaming({ kind, id, name })
+    setRenameDraft(name)
+  }
+
+  /**
+   * 提交重命名：模型走 model:rename（仅展示名，不动磁盘目录），
+   * 立绘集走 sprite:update({ name })；成功后分别刷新对应列表。
+   */
+  const handleRename = async () => {
+    if (!renaming) return
+    const name = renameDraft.trim()
+    if (!name) {
+      toast('名称不能为空', 'error')
+      return
+    }
+    try {
+      if (renaming.kind === 'model') {
+        await api.model.rename(renaming.id, name)
+        await refresh()
+      } else {
+        await api.sprite.update(renaming.id, { name })
+        await loadSprites()
+      }
+      toast('已重命名')
+      setRenaming(null)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '重命名失败', 'error')
+    }
+  }
+
   /** 选择当前全局使用的 Live2D 模型（互斥：清除全局立绘选中） */
   const handleSelectModel = async (modelId: string) => {
     if (settings.selectedModelId === modelId) return
@@ -344,6 +421,17 @@ export function CharacterModelPanel() {
                     {m.model3Path} · {formatRelativeTime(m.createdAt)} 导入
                   </div>
                 </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    openRename('model', m.id, m.name)
+                  }}
+                >
+                  <Pencil size={13} strokeWidth={2} />
+                  重命名
+                </Button>
                 <Button
                   variant="danger"
                   size="sm"
@@ -491,14 +579,27 @@ export function CharacterModelPanel() {
                 value={settings.animation.idleAnimation}
                 onChange={(e) => updateAnim('idleAnimation', e.target.value)}
               >
-                <option value="">默认（随机）</option>
+                <option value="">不应用动作</option>
                 {motionGroups.map((g) => (
                   <option key={g} value={g}>{g}</option>
                 ))}
               </Select>
               {motionGroups.length === 0 && (
-                <p className="mt-1 text-xs text-text-muted">未检测到可用动作组</p>
+                <p className="mt-1 text-xs text-text-muted">未检测到可用动作组，请先在 model3.json 声明或点击下方扫描</p>
               )}
+              <div className="mt-3">
+                <Button variant="outline" size="sm" onClick={handleScanAssets} disabled={scanning || !currentModelId}>
+                  {scanning ? '扫描中…' : '扫描模型文件夹表情/动作'}
+                </Button>
+                <p className="mt-1 text-xs text-text-muted">
+                  自动识别模型文件夹下的 *.exp3.json 与 *.motion3.json 并登记到 model3.json；
+                  动作组名将一律按动作文件名重组（与 airi 一致），原 model3.json 会自动备份。
+                  识别后桌宠模型自动重载。
+                </p>
+                {scanResult && (
+                  <p className="mt-1 text-xs text-primary-500">{scanResult}</p>
+                )}
+              </div>
             </div>
           </AccordionItem>
 
@@ -597,6 +698,10 @@ export function CharacterModelPanel() {
                   {s.images.length} 张图 · {formatRelativeTime(s.createdAt)} 导入
                 </div>
               </div>
+              <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openRename('sprite', s.id, s.name) }}>
+                <Pencil size={13} strokeWidth={2} />
+                重命名
+              </Button>
               <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openEmotionMap(s) }}>
                 <Smile size={14} strokeWidth={2} />
                 情绪映射
@@ -709,6 +814,34 @@ export function CharacterModelPanel() {
               </option>
             ))}
           </Select>
+        </Field>
+      </Modal>
+
+      {/* 重命名弹窗（Live2D 模型 / 2D 立绘集共用）：回车提交 */}
+      <Modal
+        open={!!renaming}
+        onClose={() => setRenaming(null)}
+        title={renaming?.kind === 'model' ? '重命名模型' : '重命名立绘集'}
+        width={380}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRenaming(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void handleRename()}>确认</Button>
+          </>
+        }
+      >
+        <Field label="名称" hint="仅更改展示名称，不影响磁盘目录与文件。">
+          <Input
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            placeholder="输入新名称"
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void handleRename()
+            }}
+          />
         </Field>
       </Modal>
     </div>

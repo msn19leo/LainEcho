@@ -198,6 +198,25 @@ function extractJsonBlock(content: string): string {
   return stripped.slice(start, end + 1)
 }
 
+/**
+ * 从思考通道文本（reasoning_content / <think> 内文）中抢救正文：
+ * 思考型模型偶发把最终 dialogue JSON 写进思考里、content 通道为空（或思考耗尽 token 被截断）。
+ * 仅当能完整解析出非空 dialogue 数组时返回解析结果，否则返回 null（由调用方走重试）。
+ */
+export function salvageDialogueFromText(content: string): ReturnType<typeof parseDialogueJson> | null {
+  const block = extractJsonBlock(content)
+  if (!block) return null
+  try {
+    const parsed = JSON.parse(block) as { dialogue?: Array<{ text?: string; emotion?: string }> }
+    const hasText =
+      Array.isArray(parsed?.dialogue) &&
+      parsed.dialogue.some((it) => typeof it?.text === 'string' && it.text.trim() !== '')
+    return hasText ? parseDialogueJson(block) : null
+  } catch {
+    return null
+  }
+}
+
 /** JSON 字符串值转义还原（\\n、\\"、\\uXXXX 等） */
 function decodeJsonString(raw: string): string {
   return raw
@@ -210,6 +229,9 @@ function decodeJsonString(raw: string): string {
  * 每个元素是一个台词节拍 { text, emotion }，按元素顺序拼接成段落文本，
  * 并把每项的 emotion 落到其首句的句子索引上生成 emotionSegments（相邻相同合并）。
  *
+ * 剧情导演指令联动（设计文档 7.3）：模型可在 JSON 顶层额外输出可选 "background" 键
+ * （背景引用），由剧情引擎解析后走现有 background 事件通道；普通聊天不会出现该键。
+ *
  * 当内容不是合法 JSON（模型漏标/降级）时：
  *   - 若仍含旧式 {#emo}/{#emotion} 标签，回退 extractEmotion；
  *   - 否则整段视为单一 neutral。
@@ -219,6 +241,7 @@ function decodeJsonString(raw: string): string {
  *   sentences       按标点/换行切分的句子序列（用于展示/句级元数据）
  *   emotionSegments 句子级情绪切换点（startSentence 0 基）
  *   chunks          合成分段（dialogue 逐项），供语音段级合成与立绘切换
+ *   background      剧情联动的背景引用（顶层可选键；缺省 undefined）
  */
 export function parseDialogueJson(content: string): {
   text: string
@@ -226,13 +249,22 @@ export function parseDialogueJson(content: string): {
   sentences: string[]
   emotionSegments: EmotionSegment[]
   chunks: DialogueChunk[]
+  background?: string
 } {
   const block = extractJsonBlock(content)
   let dialogue: Array<{ text?: string; emotion?: string }> = []
+  let background: string | undefined
   if (block) {
     try {
-      const parsed = JSON.parse(block) as { dialogue?: Array<{ text?: string; emotion?: string }> }
-      if (Array.isArray(parsed?.dialogue)) dialogue = parsed.dialogue
+      const parsed = JSON.parse(block) as { dialogue?: unknown; background?: unknown }
+      if (Array.isArray(parsed?.dialogue)) {
+        // dialogue 数组元素兼容两种形态：{text, emotion} 对象（标准）与纯字符串（模型偶发的简化变体，
+        // 字符串元素视作一段正文、情绪 neutral）——不支持后者时整条解析会退化为"JSON 源码当正文"
+        dialogue = (parsed.dialogue as Array<unknown>).map((it) =>
+          typeof it === 'string' ? { text: it } : (it as { text?: string; emotion?: string }),
+        )
+      }
+      if (typeof parsed?.background === 'string' && parsed.background.trim()) background = parsed.background.trim()
     } catch {
       dialogue = []
     }
@@ -250,6 +282,7 @@ export function parseDialogueJson(content: string): {
         sentences: splitSentences(prose),
         emotionSegments: [{ startSentence: 0, emotion: DEFAULT_EMOTION }],
         chunks: [{ text: prose, emotion: DEFAULT_EMOTION }],
+        background,
       }
     }
     // 回退旧式标签解析（历史消息兼容），否则整段 neutral
@@ -284,7 +317,7 @@ export function parseDialogueJson(content: string): {
   if (emotionSegments.length === 0) emotionSegments.push({ startSentence: 0, emotion: DEFAULT_EMOTION })
   const emotion = normalizeEmotion(items[items.length - 1]?.emotion ?? '')
 
-  return { text, emotion, sentences, emotionSegments, chunks }
+  return { text, emotion, sentences, emotionSegments, chunks, background }
 }
 
 /**
@@ -397,4 +430,50 @@ export function extractStreamingJsonText(partial: string): string {
     return /[{}\[\]]/.test(partial) ? '' : partial
   }
   return joined
+}
+
+/** 开头旁白正则：从文本第一个字符起、连续的（…）/(…) 括号组（组间允许空白/换行），
+ *  遇到第一个台词字符即止。只匹配已闭合的括号组——流式中尚未写完的括号留待下次
+ *  flush 再上屏，保证已前置文本的前缀稳定（Typewriter 只增不减依赖这一点）。 */
+const LEADING_NARRATION_RE = /^(?:\s|(?:（[^（）]*）|\([^()]*\)))+/
+
+/**
+ * 提取回答开头的连续括号旁白（旁白前置上屏用）。
+ * 只认"位于最前面"的括号组：台词出现后的括号（中间动作描写）不属于开头旁白，
+ * 仍随其所在语音段上屏（段随语音，现状不变）。
+ * @param display 流式提取的纯净文本（extractStreamingJsonText 的产物）
+ * @returns 开头连续括号组原文（含组间空白）；无开头旁白返回空串
+ */
+export function extractLeadingNarration(display: string): string {
+  if (!display) return ''
+  const m = LEADING_NARRATION_RE.exec(display)
+  return m ? m[0] : ''
+}
+
+/**
+ * 把前置旁白文本解析为括号组数组（剥掉组间空白/换行）。
+ * 逐组消费用于语音块剥除：一个括号组整体位于单个 dialogue 项内，
+ * 块边界只可能落在组与组之间，逐组匹配即可精确对齐。
+ */
+export function splitNarrationGroups(narration: string): string[] {
+  return narration.match(/（[^（）]*）|\([^()]*\)/g) ?? []
+}
+
+/**
+ * 从语音块文本开头逐组剥掉已前置上屏的括号组（避免跟读气泡里旁白重复显示）。
+ * @param text 语音块文本（dialogue 项原文 join）
+ * @param groups 已前置旁白的括号组数组（splitNarrationGroups 产物）
+ * @param consumed 已消费组数游标（跨块推进，调用方持有同一对象）
+ * @returns 剥除后的块文本；纯前置旁白块剥后为空（调用方据此跳过合成投放）
+ */
+export function consumeLeadingNarration(text: string, groups: string[], consumed: { count: number }): string {
+  let t = text
+  while (consumed.count < groups.length) {
+    const stripped = t.replace(/^\s+/, '')
+    const group = groups[consumed.count]
+    if (!group || !stripped.startsWith(group)) break
+    t = stripped.slice(group.length)
+    consumed.count++
+  }
+  return t
 }

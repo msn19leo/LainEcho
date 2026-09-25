@@ -91,6 +91,8 @@ export function registerWindowIpc(): void {
 
   ipcMain.on('app:open-chat', (_e, sessionId?: string) => windowManager.showChat(sessionId))
   ipcMain.on('app:open-settings', () => windowManager.showSettings())
+  /** 打开/聚焦剧情演出窗（演出不中断，按快照恢复） */
+  ipcMain.on('app:open-story-window', () => windowManager.showStory())
 
   ipcMain.on('app:set-pet-card', (_e, payload: PetCardPayload) => {
     windowManager.setPetCard(payload)
@@ -118,10 +120,11 @@ export function registerWindowIpc(): void {
     windowManager.notifyReadingActive(active === true)
   })
 
-  /** 宠物窗/聊天窗 renderer 就绪 → 补发最近一次语音模式 + 进行中的会话 id（避免广播早于订阅而丢失） */
+  /** 宠物窗/聊天窗 renderer 就绪 → 补发最近一次语音模式 + 进行中的会话 id + 角色卡形象配置（避免广播早于订阅而丢失） */
   ipcMain.on('pet:renderer-ready', () => {
     windowManager.resendVoiceMode('pet')
     windowManager.resendActiveSession('pet')
+    windowManager.resendPetCard()
   })
   ipcMain.on('chat:renderer-ready', () => {
     windowManager.resendVoiceMode('chat')

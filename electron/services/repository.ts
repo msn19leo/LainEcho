@@ -319,6 +319,7 @@ export async function removeMemory(id: string): Promise<void> {
  * @param userName 你的称呼（%player% 占位符替换值）
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；缺省不注入）
  * @param proactiveHint 是否注入主动搭话常驻说明（enableProactive 开启时为 true）
+ * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入）
  */
 export function buildSystemPrompt(
   card: CharacterCard | null,
@@ -326,8 +327,9 @@ export function buildSystemPrompt(
   userName = '用户',
   profileDigest?: string | null,
   proactiveHint?: boolean,
+  storyDirective?: string | null,
 ): string {
-  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint)
+  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint, storyDirective)
   return composeSystemPrompt(sections, { userName }).text
 }
 
@@ -480,6 +482,17 @@ export async function removeModel(modelId: string): Promise<void> {
   )
 }
 
+/** 更新模型元数据（当前仅展示名重命名；不动磁盘目录与 model3.json） */
+export async function updateModel(
+  modelId: string,
+  patch: Partial<Pick<Live2DModelMeta, 'name'>>,
+): Promise<void> {
+  assertValidResourceId(modelId, 'model')
+  await mutateJson(paths.modelsIndexFile, DEFAULT_MODELS, (list) =>
+    list.map((m) => (m.id === modelId ? { ...m, ...patch } : m)),
+  )
+}
+
 // ---------------- 2D 立绘 ----------------
 
 const DEFAULT_SPRITES: CharacterSprite[] = []
@@ -503,7 +516,7 @@ export async function removeSprite(spriteId: string): Promise<void> {
 /** 更新立绘集的展示资产：情绪→立绘图映射 / 说话立绘 / 思考立绘 */
 export async function updateSprite(
   spriteId: string,
-  patch: Partial<Pick<CharacterSprite, 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
+  patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
 ): Promise<void> {
   assertValidResourceId(spriteId, 'sprite')
   await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) =>
@@ -531,6 +544,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableScreenSense: false,
   // 每日主动搭话上限（用户回复后重置计数）
   maxProactivePerDay: 3,
+  // 主动搭话兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10）
+  proactiveInterestIntervalSec: 30,
   // 话题搭话旁白由 LLM 随机生成（每次搭话多一次小调用；失败回退固定模板）
   proactiveLlmNarration: true,
   // 免打扰时段（空串 = 不启用；支持跨零点）
@@ -574,6 +589,10 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.enableProactive !== undefined) next.enableProactive = patch.enableProactive
     if (patch.enableScreenSense !== undefined) next.enableScreenSense = patch.enableScreenSense
     if (patch.maxProactivePerDay !== undefined) next.maxProactivePerDay = Math.max(0, Math.floor(patch.maxProactivePerDay))
+    if (patch.proactiveInterestIntervalSec !== undefined) {
+      // 夹取 10~600 秒：下限防定时器疯转，上限兜底极端输入
+      next.proactiveInterestIntervalSec = Math.min(600, Math.max(10, Math.floor(patch.proactiveInterestIntervalSec)))
+    }
     if (patch.proactiveLlmNarration !== undefined) next.proactiveLlmNarration = patch.proactiveLlmNarration
     if (patch.quietHours !== undefined) next.quietHours = patch.quietHours
     if (patch.visionBaseURL !== undefined) next.visionBaseURL = patch.visionBaseURL

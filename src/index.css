@@ -58,12 +58,12 @@
   --warning: #fbbf24;
   --danger: #f87171;
 
-  /* —— 渐变与光效（品牌辨识度关键） ——
-   * airi 风格：所有渐变叠加主色/粉光晕。 */
-  --gradient-brand: linear-gradient(135deg, #00d4ff 0%, #ff6b8a 100%);
-  --gradient-primary: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
-  --gradient-accent: linear-gradient(135deg, #ffb6c1 0%, #ff6b8a 100%);
-  --on-brand: #06141a; /* 青→粉渐变上的文字色（深青黑） */
+  /* —— 品牌色（tinted 轻量风格：主色低透明度底 + 主色文字，与 IconTile/导航选中项同色调） ——
+   * 原为主导饱和色渐变（青→粉），后单色化，再按用户要求与其它 UI 的柔和色调统一。 */
+  --gradient-brand: linear-gradient(135deg, rgba(0, 184, 230, 0.32) 0%, rgba(0, 184, 230, 0.32) 100%);
+  --gradient-primary: linear-gradient(135deg, rgba(0, 184, 230, 0.32) 0%, rgba(0, 184, 230, 0.32) 100%);
+  --gradient-accent: linear-gradient(135deg, rgba(0, 184, 230, 0.32) 0%, rgba(0, 184, 230, 0.32) 100%);
+  --on-brand: #00d4ff; /* 主色文字：tinted 底上用主色，与模块图标色一致 */
 
   /* 毛玻璃规格：blur(20px) + 主色调半透明背景 + 主色调 0.15 边框 */
   --glass-bg: rgba(10, 10, 10, 0.8);
@@ -128,11 +128,12 @@
   --warning: #d97706;
   --danger: #dc2626;
 
-  /* —— 渐变与光效 —— */
-  --gradient-brand: linear-gradient(135deg, #4a9eff 0%, #ff8a9e 100%);
-  --gradient-primary: linear-gradient(135deg, #4a9eff 0%, #2b7bd4 100%);
-  --gradient-accent: linear-gradient(135deg, #ffb6c1 0%, #ff8a9e 100%);
-  --on-brand: #ffffff; /* 蓝→粉渐变上的文字色（白） */
+  /* —— 品牌色（tinted 轻量风格：主色低透明度底 + 主色文字，与 IconTile/导航选中项同色调） ——
+   * 文字用深一档的蓝（#2b6cb8）保证在柔和淡蓝底上的可读性（#4a9eff 同色对比不足）。 */
+  --gradient-brand: linear-gradient(135deg, rgba(74, 158, 255, 0.32) 0%, rgba(74, 158, 255, 0.32) 100%);
+  --gradient-primary: linear-gradient(135deg, rgba(74, 158, 255, 0.32) 0%, rgba(74, 158, 255, 0.32) 100%);
+  --gradient-accent: linear-gradient(135deg, rgba(74, 158, 255, 0.32) 0%, rgba(74, 158, 255, 0.32) 100%);
+  --on-brand: #2b6cb8; /* 深一档的蓝字：柔和淡蓝底上清晰可读 */
 
   /* 毛玻璃规格 */
   --glass-bg: rgba(255, 255, 255, 0.7);
@@ -256,6 +257,26 @@ html {
 /* 文本选择仅限聊天正文等需要的地方 */
 .selectable {
   user-select: text;
+}
+
+/* 输入光标全局兜底：caret 默认跟随 currentColor，但继承链被打断（个别控件缺文字色类、
+ * color-scheme 下原生控件 UA 适配等）时会落到深色、在深色背景上不可见。
+ * 显式钉住为主题文字色，光标永远可见。 */
+input,
+textarea {
+  caret-color: var(--color-text);
+}
+
+/* 原生 <select> 下拉弹层跟随应用主题：Windows Chromium 的弹层可能跟随系统原生主题
+ * 而非页面 color-scheme（暗色页面弹层仍白底、选项看不清），显式给 option 上色修正 */
+select option,
+select optgroup {
+  background-color: var(--bg-panel);
+  color: var(--text-primary);
+}
+select option:checked {
+  background-color: color-mix(in oklab, var(--primary-500) 30%, var(--bg-panel));
+  color: var(--text-primary);
 }
 
 /* 拖动窗口的无边框区域（自定义标题栏） */

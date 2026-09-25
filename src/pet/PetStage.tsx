@@ -84,6 +84,18 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const displayStateRef = useRef<'idle' | 'speaking' | 'thinking'>('idle')
   /** 上一帧说话状态（检测翻转以触发说话立绘切换） */
   const lastSpeakingRef = useRef(false)
+  /** 立绘解析代数：每次 applySprite 递增，过期解析/重试结果作废 */
+  const spriteGenRef = useRef(0)
+  /** 立绘连续失败次数（成功清零；≤3 时自动重试，防失败风暴） */
+  const spriteFailStreakRef = useRef(0)
+  /** 立绘图片最近一次重试时间（按 URL 记录，30 秒内不重复重试） */
+  const spriteImgRetryAtRef = useRef<Record<string, number>>({})
+  /** 立绘模式失败提示（错误横幅在立绘模式不渲染，单独走此提示避免静默空白） */
+  const [spriteNotice, setSpriteNotice] = useState<string | null>(null)
+  /** Live2D 兜底加载是否已通过守卫尝试过（防"全局无选中 + 无卡绑定"守卫死区） */
+  const live2dAttemptRef = useRef(false)
+  /** 模型设置是否已就绪（首次 get() 返回后置 true；就绪前不做兜底加载） */
+  const settingsLoadedRef = useRef(false)
 
   /** 解析当前立绘模式实际使用的立绘集 id：角色卡绑定优先，否则全局当前立绘集 */
   function getEffectiveSpriteId(): string | null {
@@ -229,26 +241,31 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   /**
    * 立绘模式：解析当前应显示的立绘图并设置 to sprite state。
    * 规则：emotionMap[emotion] 优先，缺映射或缺文件时回退 neutral，再退回立绘集第一张。
+   * 失败不再静默：打 warn 日志 + 显示 spriteNotice，短暂等待后自动重试一次（连续失败有上限）。
+   * @param gen 本次解析的代数（applySprite 递增；过期代数的所有状态写入被丢弃）
    * @param spriteId 绑定的立绘集 id
    * @param emotionMap 角色卡的情绪 → 文件名映射（可为 null）
    * @param emotion 当前情绪（默认 neutral）
    */
   async function resolveSprite(
+    gen: number,
     spriteId: string | null,
     emotionMap: Partial<Record<StandardEmotion, string>> | null | undefined,
     emotion: StandardEmotion = DEFAULT_EMOTION,
     variant: 'idle' | 'speaking' | 'thinking' = 'idle',
   ) {
     if (!spriteId) {
+      if (gen !== spriteGenRef.current) return
       setSprite(null)
+      setSpriteNotice('当前形象为 2D 立绘，但没有绑定立绘集，请在设置 → 角色模型中选择')
       return
     }
     try {
       const list = await api.sprite.list()
+      if (gen !== spriteGenRef.current) return
       const spr = list.find((s) => s.id === spriteId)
       if (!spr || spr.images.length === 0) {
-        setSprite(null)
-        return
+        throw new Error(`立绘集不存在或没有图片（id=${spriteId}）`)
       }
       const has = (f: string | null | undefined) => !!f && spr.images.some((i) => i.filePath === f)
       // 变体立绘优先：思考 > 说话(仅平静情绪时) > 情绪映射图
@@ -264,19 +281,35 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         const want = pickEmotionAsset(sourceMap, emotion)
         file = (want && spr.images.some((i) => i.filePath === want)) ? want : (spr.images[0]!.filePath)
       }
+      if (gen !== spriteGenRef.current) return
+      spriteFailStreakRef.current = 0
+      setSpriteNotice(null)
       setSprite({ url: api.pet.spriteUrl(spriteId, file), name: spr.name })
-    } catch {
+    } catch (err) {
+      if (gen !== spriteGenRef.current) return
+      const msg = err instanceof Error ? err.message : String(err)
+      spriteFailStreakRef.current++
+      console.warn(`[pet] 立绘解析失败(连续第${spriteFailStreakRef.current}次):`, msg)
       setSprite(null)
+      setSpriteNotice(`2D 立绘加载失败：${msg}，将自动重试`)
+      // 文件被占用/杀软扫描/瞬时 IPC 失败常可自愈：短暂等待后按同代数重试一次
+      if (spriteFailStreakRef.current <= 3) {
+        setTimeout(() => {
+          if (gen !== spriteGenRef.current) return
+          void resolveSprite(gen, spriteId, emotionMap, emotion, variant)
+        }, 800)
+      }
     }
   }
 
   /** 立绘模式统一重新解析当前立绘（依据当前情绪 + 说话/思考状态） */
   function applySprite() {
     if (modeRef.current !== 'sprite') return
-    const hasCardSprite = !!spriteIdRef.current
+    spriteGenRef.current++
     void resolveSprite(
+      spriteGenRef.current,
       getEffectiveSpriteId(),
-      hasCardSprite ? emotionMapRef.current : null,
+      spriteIdRef.current ? emotionMapRef.current : null,
       currentEmotionRef.current,
       displayStateRef.current,
     )
@@ -307,6 +340,28 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   }
 
   /**
+   * 把"当前生效的空闲动作组"重定向到库的内置空闲槽（motionManager.groups.idle）。
+   *
+   * pixi-live2d-display 在动作队列空时会自动 startRandomMotion(groups.idle) 无限续播，
+   * 默认固定指向 model3.json 的 "Idle" 组（cubism2 为 "idle"）。
+   * - 选了有效组 → 重定向，库的自动续播播用户选的组，10s 定时器仅作兜底；
+   * - 空串（不应用动作）或组名不存在 → 指向不可能存在的组（NO_IDLE_GROUP），
+   *   库的 startRandomMotion 对未声明组直接返回 false，自动空闲被彻底禁用。
+   */
+  function applyIdleGroupToModel(): void {
+    const model = modelRef.current as unknown as {
+      internalModel?: {
+        motionManager?: { groups?: { idle: string }; definitions?: Record<string, unknown>; __defaultIdle?: string }
+      }
+    } | null
+    const mgr = model?.internalModel?.motionManager
+    if (!mgr?.groups) return
+    const preferred = getEffectiveIdleAnimation()
+    const available = mgr.definitions ? Object.keys(mgr.definitions) : []
+    mgr.groups.idle = preferred && available.includes(preferred) ? preferred : NO_IDLE_GROUP
+  }
+
+  /**
    * 根据当前设置（expressionEnabled + 生效表情名）和已加载的表情列表，
    * 更新 currentExpressionParamsRef。每帧由 ticker 读取并应用到 coreModel。
    * 参考 airi 的 expression-controller.ts：不使用 SDK 的 Expression Manager，直接管理参数。
@@ -333,10 +388,21 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     const app = appRef.current
     const cls = live2dClassRef.current
     if (!app || !cls || cancelledRef.current) return
+    live2dAttemptRef.current = true // 通过守卫后才算"已尝试兜底加载"
     const gen = ++loadGenRef.current
     setLoading(true)
 
-    const models = await api.model.list()
+    let models: Live2DModelMeta[]
+    try {
+      models = await api.model.list()
+    } catch (err) {
+      if (gen !== loadGenRef.current || cancelledRef.current) return
+      console.error('[pet] 模型列表读取失败:', err instanceof Error ? err.message : err)
+      setLoading(false)
+      onStatus('error', '模型列表读取失败')
+      setBanner('模型列表读取失败，请重启应用后重试')
+      return
+    }
     if (gen !== loadGenRef.current || cancelledRef.current) return // 已被更新的加载请求取代
     console.log('[pet] 模型列表数量:', models.length, '当前展示:', currentModelIdRef.current ?? null, '角色卡绑定:', currentCardModelIdRef.current ?? null, '全局选中:', settingsRef.current.selectedModelId ?? null)
     if (models.length === 0) {
@@ -425,6 +491,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         expressionListRef.current = []
         currentExpressionParamsRef.current = []
       }
+      // 模型加载完成：把生效的空闲动作组重定向到库的内置空闲槽，
+      // 让库的自动续播（动作队列空时 startRandomMotion(groups.idle)）播用户选的组
+      applyIdleGroupToModel()
       // 诊断：等几帧后分析画布上实际渲染出的非透明内容
       setTimeout(() => analyzeRender(app), 500)
     } catch (err) {
@@ -535,6 +604,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         const mouthOpen = lipSyncRef.current.getMouthOpen()
         coreModel.setParameterValueById?.('ParamMouthOpen', mouthOpen)
         coreModel.setParameterValueById?.('ParamMouthOpenY', mouthOpen)
+        // 嘴形联动：随开合给 ParamMouthForm 线性形变（闭嘴 0 / 张满 0.4），
+        // 嘴"张开+咧开"比纯上下开合更自然；各主流模型都有该参数（cdi 已验证）
+        coreModel.setParameterValueById?.('ParamMouthForm', mouthOpen * 0.4)
       }
     }
 
@@ -668,6 +740,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       cardModeRef.current = renderMode ?? null
       currentCardModelIdRef.current = modelId ?? null
       updateCurrentExpression()
+      // 角色卡覆盖的空闲动作组变化时（模型未换场景）同步重定向库内置空闲槽
+      applyIdleGroupToModel()
       // 统一按当前有效模式与资源刷新桌面形象
       applyRenderState()
     })
@@ -694,10 +768,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       } else {
         // Live2D：清空残留立绘状态，只渲染动画模型
         setSprite(null)
+        setSpriteNotice(null)
         const mid = getEffectiveModelId()
-        // 模式发生切换（例如从立绘切回 Live2D）或模型 id 变化时，重新加载模型，
-        // 避免守卫误判"模型未变"而漏加载导致形象消失
-        if (modeChanged || mid !== currentModelIdRef.current) {
+        // 模式发生切换（例如从立绘切回 Live2D）、模型 id 变化，或"全局无选中 + 无卡绑定"
+        // 从未尝试过加载时（守卫 null===null 死区），都重新加载模型；
+        // 设置未就绪时跳过兜底（applySettings 送达后会再次走到这里）
+        const neverAttempted = !modelRef.current && !live2dAttemptRef.current && settingsLoadedRef.current
+        if (modeChanged || mid !== currentModelIdRef.current || neverAttempted) {
           void loadModel(mid ?? undefined)
         }
       }
@@ -705,6 +782,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     /** 应用模型设置（更新 ticker、拟合，并按全局形象刷新桌面） */
     const applySettings = (settings: ModelSettings) => {
+      settingsLoadedRef.current = true
       const prevIdle = settingsRef.current.animation.idleAnimation
       settingsRef.current = settings
       // 全局当前立绘集变化时记录，供立绘回退用
@@ -717,9 +795,21 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       fitModel()
       // 表情设置变化时更新当前表情参数
       updateCurrentExpression()
-      // 空闲动作组变化时立即播放一次，第一时间看到效果（无需等待 10s 定时器）
+      // 空闲动作组变化时：立即生效，无需等待 10s 定时器
       if (prevIdle !== settings.animation.idleAnimation) {
-        playRandomIdle(modelRef.current, settings.animation.idleAnimation || undefined)
+        applyIdleGroupToModel()
+        const motionMgr = (modelRef.current as unknown as {
+          internalModel?: { motionManager?: { stopAllMotions?: () => void } }
+        } | null)?.internalModel?.motionManager
+        if (!settings.animation.idleAnimation) {
+          // 切到"不应用动作"：停掉当前在播动作（含循环空闲）。库的自动空闲已被
+          // applyIdleGroupToModel 禁用（groups.idle 指向不存在的哨兵组），模型回归静止
+          motionMgr?.stopAllMotions?.()
+          // 复位全部参数：动作硬停后参数停留在最后一帧（手部/手臂等定格），显式复位恢复标准姿势
+          resetModelParameters(modelRef.current)
+        } else {
+          void playRandomIdle(modelRef.current, settings.animation.idleAnimation, true)
+        }
       }
       // 全局当前形象变化（model/sprite 切换）时统一刷新桌面形象
       applyRenderState()
@@ -761,6 +851,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (modeRef.current === 'sprite') applyRenderState()
     })
 
+    // 窗口从隐藏恢复显示时：立绘模式重新解析一次（自愈偶发失败；Live2D 靠 ticker 持续渲染无需处理）
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return
+      if (modeRef.current === 'sprite') applySprite()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
     // 启动时加载已保存的模型设置
     void api.modelSettings.get().then((settings) => {
       applySettings(settings)
@@ -768,6 +865,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     return () => {
       cancelledRef.current = true
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       idleTimer && clearInterval(idleTimer)
       unsubModel()
       unsubModels()
@@ -814,6 +912,19 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
             style={{
               transform: `translate(${settingsRef.current.spriteView.x}px, ${settingsRef.current.spriteView.y}px) scale(${settingsRef.current.spriteView.scale})`,
             }}
+            onError={() => {
+              if (!sprite) return
+              const url = sprite.url
+              const last = spriteImgRetryAtRef.current[url] ?? 0
+              if (Date.now() - last < 30_000) {
+                console.warn('[pet] 立绘图片加载失败（30 秒内已重试过，等待自动重试）:', url)
+                setSpriteNotice('2D 立绘图片暂时无法加载，将自动重试')
+                return
+              }
+              spriteImgRetryAtRef.current[url] = Date.now()
+              console.warn('[pet] 立绘图片加载失败，重新解析一次:', url)
+              applySprite()
+            }}
           />
         </motion.div>
       )}
@@ -829,6 +940,30 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
             <IconTile icon={AlertTriangle} size="sm" gradient="accent" />
             <div className="min-w-0">
               <p className="text-xs leading-relaxed text-text">{banner}</p>
+              <button
+                onClick={() => api.app.openSettings()}
+                className="mt-2 inline-flex items-center gap-1 rounded-[var(--radius-sm)] bg-brand-gradient px-3 py-1.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110"
+              >
+                <Settings size={12} strokeWidth={2} />
+                打开设置
+              </button>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* 立绘模式失败提示：与 Live2D 横幅同款样式；立绘路径的失败原本完全静默（无日志/无横幅/无重试） */}
+      {spriteNotice && mode === 'sprite' && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.2 }}
+          className="app-no-drag absolute inset-x-0 bottom-0 flex justify-center p-3"
+        >
+          <div className="flex w-[300px] items-start gap-3 rounded-[var(--radius-lg)] border border-[var(--border-strong)] bg-[var(--bg-panel)]/90 px-4 py-3 text-left shadow-[var(--shadow-card-hover)] backdrop-blur-xl">
+            <IconTile icon={AlertTriangle} size="sm" gradient="accent" />
+            <div className="min-w-0">
+              <p className="text-xs leading-relaxed text-text">{spriteNotice}</p>
               <button
                 onClick={() => api.app.openSettings()}
                 className="mt-2 inline-flex items-center gap-1 rounded-[var(--radius-sm)] bg-brand-gradient px-3 py-1.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110"
@@ -930,6 +1065,39 @@ function zoomModel(model: Live2DModel | null, factor: number): number {
 // pixi-live2d-display 的动作优先级：None=0 / Idle=1 / Normal=2 / Force=3
 const PRIORITY_IDLE = 1
 const PRIORITY_FORCE = 3
+/** "不应用动作"哨兵组名：指向一个不可能存在的组，使库的自动空闲续播（startRandomMotion）静默失效 */
+const NO_IDLE_GROUP = '__idle_disabled__'
+
+/**
+ * 把模型全部参数复位为默认值（恢复标准姿势）。
+ *
+ * 动作硬停（stopAllMotions / FORCE 切换）后，已被动作写入的参数会停留在最后一帧的值
+ * （手部/手臂/身体等定格），Cubism 没有自动归位机制，必须显式复位；
+ * 眨眼/呼吸/表情/口型等每帧写入的参数系统不受一次性复位影响，物理随后自然稳定。
+ * cubism4 coreModel 提供按索引的默认值 API；其他核心无此 API 时静默跳过。
+ */
+function resetModelParameters(model: Live2DModel | null): void {
+  if (!model) return
+  try {
+    const core = (model as unknown as {
+      internalModel?: {
+        coreModel?: {
+          getParameterCount?: () => number
+          getParameterDefaultValue?: (index: number) => number
+          setParameterValueByIndex?: (index: number, value: number) => void
+        }
+      }
+    }).internalModel?.coreModel
+    if (!core?.getParameterCount || !core.getParameterDefaultValue || !core.setParameterValueByIndex) return
+    const count = core.getParameterCount()
+    for (let i = 0; i < count; i++) {
+      const fallback = core.getParameterDefaultValue(i)
+      core.setParameterValueByIndex(i, typeof fallback === 'number' ? fallback : 0)
+    }
+  } catch {
+    // 参数复位失败不阻塞（cubism2 等核心无此 API）
+  }
+}
 
 function playTap(model: Live2DModel | null, idleAnimation?: string) {
   if (!model) return
@@ -937,36 +1105,59 @@ function playTap(model: Live2DModel | null, idleAnimation?: string) {
     const groups = getMotionGroups(model)
     const tapGroup = ['TapBody', 'TapHead', 'Tap'].find((g) => groups.includes(g))
     if (tapGroup) {
-      model.motion(tapGroup, 0, PRIORITY_FORCE)
+      // index 传 undefined → 库内部 startRandomMotion（组内随机），不再固定第 0 个
+      void model.motion(tapGroup, undefined, PRIORITY_FORCE)
       return
     }
-    playRandomIdle(model, idleAnimation)
+    void playRandomIdle(model, idleAnimation)
   } catch {
     // 忽略动作播放失败
   }
 }
 
-function playRandomIdle(model: Live2DModel | null, preferredGroup?: string) {
+/**
+ * 播放空闲动作。
+ *
+ * 优先级死锁修复：空闲动作通常 Loop=true 永不结束，队列永远非空，库的
+ * MotionState.currentPriority 恒为 1——此后一切 PRIORITY_IDLE(1) 请求都会被
+ * MotionState.reserve 静默拒绝（拒绝日志为 verbose 级默认不可见）。因此：
+ *  - interrupt=true（切换空闲动作组时）：用 PRIORITY_FORCE(3) 强制打断在播动作立即接管；
+ *  - interrupt=false（10s 定时器兜底）：仅在当前无动作在播（isFinished）时才补播，不打断循环；
+ *  - index 传 undefined → 库内部 startRandomMotion 组内随机，不再固定第 0 个；
+ *  - motion() 返回 false（被拒/动作文件加载失败）时输出警告，补齐可观测性。
+ *
+ * 语义（与设置面板一致）：
+ *  - preferredGroup 为空 = 不应用动作，直接不播；
+ *  - 组名不存在 = 配置错误，警告后不播（不再回退随机播放）。
+ *
+ * @param preferredGroup 指定的空闲动作组；空串 = 不应用动作
+ * @param interrupt 是否强制打断当前在播动作（切换动作组时置 true）
+ */
+async function playRandomIdle(model: Live2DModel | null, preferredGroup?: string, interrupt = false): Promise<void> {
   if (!model) return
+  const target = preferredGroup?.trim()
+  if (!target) return // 不应用动作：不播任何空闲动作
   try {
-    // 如果指定了空闲动作组，优先播放该组
-    if (preferredGroup) {
-      const groups = getMotionGroups(model)
-      if (groups.includes(preferredGroup)) {
-        model.motion(preferredGroup, 0, PRIORITY_IDLE)
-        return
-      }
+    const groups = getMotionGroups(model)
+    if (!groups.includes(target)) {
       // 选中的动作组名与模型实际加载的动作组不匹配（常见于下拉框取自别的模型）时给出提示
-      console.warn('[pet] 空闲动作组不存在于当前展示模型:', preferredGroup, '实际可用:', groups)
-    }
-    // 否则从非 Tap 开头的动作组中随机选择
-    const groups = getMotionGroups(model).filter((g) => !g.toLowerCase().startsWith('tap'))
-    if (groups.length === 0) {
-      console.warn('[pet] 当前模型没有可播放的空闲动作组（model3.json 未声明 Motions 或动作文件缺失）')
+      console.warn('[pet] 空闲动作组不存在于当前展示模型:', target, '实际可用:', groups)
       return
     }
-    const pick = groups[Math.floor(Math.random() * groups.length)] as string
-    model.motion(pick, 0, PRIORITY_IDLE)
+    // 非打断模式：动作仍在播（如循环空闲动作）时跳过，避免把循环动作掐断重来
+    const mgr = (model as unknown as {
+      internalModel?: { motionManager?: { isFinished?: () => boolean; stopAllMotions?: () => void } }
+    }).internalModel?.motionManager
+    if (!interrupt && typeof mgr?.isFinished === 'function' && !mgr.isFinished()) return
+    if (interrupt) mgr?.stopAllMotions?.()
+    // 启动前复位全部参数：动作硬停/FORCE 切换后残留的最后帧值会被清除，
+    // 新动作未驱动的参数回到标准姿势而不是定格（手部定格问题的根源）
+    resetModelParameters(model)
+    const started = await model.motion(target, undefined, interrupt ? PRIORITY_FORCE : PRIORITY_IDLE)
+    if (!started) {
+      // 常见于：该组唯一的动作正在播放（startRandomMotion 会排除 isActive 的动作），属预期
+      console.log('[pet] 空闲动作未重复启动（该组动作可能正在播放中）:', target)
+    }
   } catch (err) {
     console.warn('[pet] 播放空闲动作失败:', err instanceof Error ? err.message : err)
   }

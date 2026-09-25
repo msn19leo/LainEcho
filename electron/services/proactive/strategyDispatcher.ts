@@ -44,19 +44,22 @@ export function selectIntentKind(settings: AppSettings): ProactiveIntentKind {
 /**
  * 投放时生成旁白（闸门通过后才调用，避免无谓的 LLM 消耗）。
  * @param kind 意图类型；screen 感知失败时自动降级为 TOPIC 旁白
+ * @param charName 目标会话的角色名（旁白以第三人称角色名作主语，消除"你=角色"的
+ *        人称锚定——曾致模型回忆互动时把角色自己的动作错归属给用户）
  * @returns 括号包裹的舞台指示旁白（永不 throw）
  */
-export async function buildNarration(kind: ProactiveIntentKind, settings: AppSettings): Promise<string> {
+export async function buildNarration(kind: ProactiveIntentKind, settings: AppSettings, charName: string): Promise<string> {
   const userName = settings.userName || '用户'
+  const name = charName.trim() || '角色'
   if (kind === 'screen') {
     const analysis = await analyzeScreen()
     if (analysis) {
-      return `（你瞥了一眼${userName}的电脑桌面：${analysis}。你忍不住想聊两句。）`
+      return `（${name}瞥了一眼${userName}的电脑桌面：${analysis}，忍不住想聊两句。）`
     }
     // 屏幕感知不可用 → 降级 TOPIC 旁白（保证"双开关 = 一定搭话"的体验）
     console.log('[proactive] 屏幕感知不可用，降级为 TOPIC 旁白')
   }
-  return topicNarration(settings)
+  return topicNarration(settings, name)
 }
 
 /** 当前时段的人话描述（LLM 旁白生成素材，让旁白带时间感） */
@@ -74,9 +77,10 @@ function periodLabel(): string {
 /**
  * 生成 TOPIC 旁白：proactiveLlmNarration 开启时由 LLM 按当前时间段即兴生成多样旁白，
  * 关闭或生成失败时回退固定模板。走主 LLM 配置（非流式、temperature 0.9、小调用）。
+ * 旁白一律以第三人称角色名作主语（与消费侧【系统旁白】前缀、动作归属规则配套）。
  */
-async function topicNarration(settings: AppSettings): Promise<string> {
-  const fallback = topicNarrationTemplate(settings.userName || '用户')
+async function topicNarration(settings: AppSettings, charName: string): Promise<string> {
+  const fallback = topicNarrationTemplate(charName, settings.userName || '用户')
   if (!settings.proactiveLlmNarration) return fallback
   try {
     const apiKey = await readApiKey()
@@ -87,7 +91,7 @@ async function topicNarration(settings: AppSettings): Promise<string> {
     const system =
       '你是旁白撰稿助手。一位 AI 桌宠角色即将主动搭话，请为它写一句"舞台指示"旁白。要求：\n' +
       '- 一句话，20~40 字，用圆括号（）完整包裹\n' +
-      '- 用"你"指代角色本人，用「对方」指代用户\n' +
+      `- 以角色名「${charName}」作主语指代角色本人（不要用"你"指代角色），用「对方」指代用户\n` +
       '- 结合当前时间段给角色一个自然的小动机（时间段的心绪、随手的小事、莫名的想念等）\n' +
       '- 禁止编造具体的共同回忆或事件，禁止出现系统/旁白等元字眼\n' +
       '- 只输出旁白本身，不要任何解释'
@@ -129,7 +133,7 @@ async function topicNarration(settings: AppSettings): Promise<string> {
   }
 }
 
-/** 固定模板旁白（LLM 关闭/失败时的兜底） */
-function topicNarrationTemplate(userName: string): string {
-  return `（你有点想${userName}了，想主动说点什么。）`
+/** 固定模板旁白（LLM 关闭/失败时的兜底）：第三人称角色名作主语，与 LLM 生成口径一致 */
+function topicNarrationTemplate(charName: string, userName: string): string {
+  return `（${charName}有点想${userName}了，想主动说点什么。）`
 }

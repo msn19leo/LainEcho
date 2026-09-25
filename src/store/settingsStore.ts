@@ -22,6 +22,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   enableProactive: false,
   enableScreenSense: false,
   maxProactivePerDay: 3,
+  // 兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10）
+  proactiveInterestIntervalSec: 30,
   proactiveLlmNarration: true,
   quietHours: { start: '', end: '' },
   visionBaseURL: '',
@@ -70,6 +72,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           enableProactive: data.enableProactive,
           enableScreenSense: data.enableScreenSense,
           maxProactivePerDay: data.maxProactivePerDay,
+          proactiveInterestIntervalSec: data.proactiveInterestIntervalSec,
           proactiveLlmNarration: data.proactiveLlmNarration,
           quietHours: data.quietHours,
           visionBaseURL: data.visionBaseURL,

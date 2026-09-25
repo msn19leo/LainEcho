@@ -38,6 +38,8 @@ const MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg',
   '.ogg': 'audio/ogg',
   '.wav': 'audio/wav',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
 }
 
 function mimeFor(filePath: string): string {
@@ -81,6 +83,12 @@ export function registerPetProtocolHandler(): void {
       } else if (host === 'sprites') {
         // 2D 立绘资源：pet-res://sprites/{spriteId}/{filePath}
         root = paths.spritesDir
+      } else if (host === 'stories') {
+        // 剧本资源（背景/音乐/封面）：pet-res://stories/{scriptId}/{filePath}
+        root = paths.storiesDir
+      } else if (host === 'story-backgrounds') {
+        // 剧情背景库（用户上传）：pet-res://story-backgrounds/{文件名}
+        root = paths.storyBackgroundsDir
       } else {
         return new Response('Unknown host', { status: 404 })
       }

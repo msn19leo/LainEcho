@@ -109,8 +109,9 @@ export function Switch({ checked, onChange, label, disabled = false }: SwitchPro
       >
         <span
           className={cn(
-            'absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all',
-            checked ? 'left-[18px]' : 'left-0.5',
+            'absolute top-0.5 h-4 w-4 rounded-full shadow transition-all',
+            // 选中态 knob 用主色（tinted 底上白圆点对比不足）；未选中保持白色
+            checked ? 'left-[18px] bg-[var(--primary-400)]' : 'left-0.5 bg-white',
           )}
         />
       </span>

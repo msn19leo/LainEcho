@@ -77,9 +77,18 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false;
   }
 }
 
+/** 剥离思考型模型混入正文的 <think> 块（含未闭合到结尾的情况），与 chatTurn 同款处理 */
+function stripThink(s: string): string {
+  return s.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/i, '').trim()
+}
+
 /**
  * 修复 LLM 常见的 JSON 瑕疵（逐字符扫描，维护 inString 状态避免误伤）：
  * - 字符串值内的字面换行（多行文本被直接写成真实换行）→ 转义为 \n
+ * - 字符串值内未转义的英文双引号（如中文值里写 "鲸类亚人"）→ 转义为 \"
+ *   判定启发式：字符串内遇到 " 时，向后看下一个非空白字符——若为 , } ] : 或文本结束，
+ *   视为字符串正常收尾；否则视为内嵌引号，转义保留（GLM 系列在中文值里嵌英文引号极常见，
+ *   曾致 JSON 报 "Expected ',' or '}' after property value"）。
  * - 对象/数组末项后的尾逗号 → 删除
  */
 function repairJsonText(text: string): string {
@@ -87,6 +96,12 @@ function repairJsonText(text: string): string {
   let inString = false
   let i = 0
   const n = text.length
+  /** 向后找下一个非空白字符（跳过空格/换行/制表符） */
+  const nextNonWs = (from: number): string | null => {
+    let j = from
+    while (j < n && /\s/.test(text[j]!)) j++
+    return j < n ? text[j]! : null
+  }
   while (i < n) {
     const ch = text[i]!
     if (inString) {
@@ -98,8 +113,14 @@ function repairJsonText(text: string): string {
           i++
         }
       } else if (ch === '"') {
-        inString = false
-        out += ch
+        // 内嵌引号启发式：下一个非空白字符不是结构分隔符 → 是值内的引号，转义而非收尾
+        const next = nextNonWs(i + 1)
+        if (next === null || next === ',' || next === '}' || next === ']' || next === ':') {
+          inString = false
+          out += ch
+        } else {
+          out += '\\"'
+        }
       } else if (ch === '\n' || ch === '\r') {
         // 字符串内的真实换行 → 转义为 \n（CRLF 只记一个）
         out += '\\n'
@@ -253,6 +274,11 @@ export async function generatePersona(input: PersonaGenerateInput): Promise<Char
   if (!source) throw new Error('角色来源描述不能为空')
   const userMessage = `角色名：${input.name.trim() || '（未指定）'}\n\n角色来源描述：\n${source}`
 
+  // 思考型模型（glm-4.5-air / mimo 等）的 reasoning 计入 max_tokens 预算：实测 glm-4.5-air
+  // 生成人设时思考可写 1.2 万字（≈8k+ token），8192 预算也被全部吃光、content 为 0 字。
+  // 人设是结构化生成任务，思考毫无必要 → 显式关闭思考（GLM 协议 thinking:disabled）；
+  // 若网关不认识该参数忽略了它，预算 16384 也足以让思考写完 + JSON 正文完整输出。
+  let reasoningText = ''
   const content = await sendChatCompletion(
     [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -265,16 +291,39 @@ export async function generatePersona(input: PersonaGenerateInput): Promise<Char
       // 生成人设是结构化 JSON：用固定低温提高格式稳定性，并强制较大 maxTokens 防止输出被截断
       temperature: 0.7,
       maxTokens: settings.maxTokens,
-      maxTokensOverride: 4096,
+      maxTokensOverride: 16384,
       stream: false,
+      disableThinking: true,
+      onReasoning: (chunk) => {
+        reasoningText += chunk
+      },
     },
   )
 
-  let parsed: unknown
-  try {
-    parsed = parseJsonTolerant(content)
-  } catch (err) {
-    throw new Error(`AI 返回无法解析的人设 JSON：${err instanceof Error ? err.message : String(err)}`)
+  // 解析顺序：正文（剥 <think>）优先 → 思考通道抢救。思考型模型可能把最终 JSON 写进
+  // reasoning（content 为空或只剩思考文本），reasoning 里常有完整的 JSON 草稿可提取。
+  const candidates = [stripThink(content), stripThink(reasoningText)]
+  let parsed: unknown = null
+  let lastErr: unknown = null
+  for (const candidate of candidates) {
+    if (!candidate.trim()) continue
+    try {
+      parsed = parseJsonTolerant(candidate)
+      break
+    } catch (err) {
+      lastErr = err
+    }
+  }
+  if (parsed === null) {
+    // 带上两通道长度与原文片段，便于区分"预算被思考耗尽"（content 0 字）与"输出被截断"等场景
+    const detail = lastErr instanceof Error ? lastErr.message : String(lastErr)
+    console.warn(
+      '[persona] 人设 JSON 解析失败：content %d 字 / reasoning %d 字，content 片段=%j',
+      content.length,
+      reasoningText.length,
+      (stripThink(content) || reasoningText).slice(0, 120),
+    )
+    throw new Error(`AI 返回无法解析的人设 JSON：${detail}（content ${content.length} 字 / 思考 ${reasoningText.length} 字，可能是思考耗尽输出预算或输出被截断，请重试）`)
   }
   return normalizeGeneratedPersona(parsed)
 }

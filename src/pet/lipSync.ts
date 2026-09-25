@@ -3,11 +3,15 @@
  *
  * 分析方法：RMS 时域振幅（比频域平均值更灵敏地反映语音开合）
  * - getByteTimeDomainData 读取波形数据
- * - 计算 RMS（均方根）振幅，直接对应音量大小 → 嘴巴开合度
+ * - 计算 RMS（均方根）振幅 → 嘴巴开合度
+ *
+ * 自适应归一化（核心）：语音归一化 RMS 典型只有 0.03~0.25（TTS 输出电平通常更低），
+ * 固定增益会因音源不同而失效——跟踪播放期内 RMS 峰值（新峰值立即采纳、无新峰值时
+ * 每 tick 慢速衰减以适应音量渐变），用 rms/peak 归一化到 0~1，嘴型始终满幅利用
+ * 整个开合区间；再经幂曲线（指数 <1）放大中小音量。
  *
  * 平滑策略：
- * - 使用指数平滑系数 0.6（旧值）+ 0.4（新值），兼顾灵敏度和稳定性
- * - 应用 2.5 倍增益让嘴型变化更明显（RMS 值通常较小）
+ * - EMA 新值权重 0.65（峰值更跟手；归一化已消除大部分抖动来源）
  *
  * 性能优化：AudioContext / Analyser 只创建一次并全程复用，逐条播放只新建 BufferSource，
  * 避免每条音频都重建 AudioContext + resume，降低句间断隙与抖动（段级连续播放更顺）。
@@ -27,8 +31,22 @@ export class LipSyncController {
   private timeData: Uint8Array | null = null
   /** 平滑后的开合值（0~1），避免抖动 */
   private smoothedOpen = 0
+  /** 播放期内 RMS 峰值（自适应归一化基准）：跨段保留、播放中慢速衰减以适应音量渐变 */
+  private rmsPeak = 0
   /** 当前播放状态（用于 ticker 判断是否需要应用口型参数） */
   private playing = false
+
+  // ---- 口型映射调参常量 ----
+  /** EMA 平滑：新值权重（0.65 峰值更跟手；归一化已消除大部分抖动来源） */
+  private static readonly SMOOTH_NEW = 0.65
+  /** RMS 峰值慢速衰减系数（每 tick；60fps 下约每秒 -6%，适应音量渐变） */
+  private static readonly PEAK_DECAY = 0.999
+  /** 峰值地板：peak 低于此值视为静音（防除零与底噪放大） */
+  private static readonly PEAK_FLOOR = 0.001
+  /** 静音阈值（归一化后）：句中停顿闭嘴 */
+  private static readonly SILENCE_THRESHOLD = 0.02
+  /** 幂曲线指数（<1 放大中小音量，让嘴在连续语音中保持明显张开） */
+  private static readonly MOUTH_EXP = 0.7
 
   /**
    * 惰性创建并复用 AudioContext + Analyser（只建一次）。
@@ -135,8 +153,11 @@ export class LipSyncController {
 
   /**
    * 获取当前嘴巴开合值（0~1），由 ticker 每帧调用。
-   * 使用 RMS 时域振幅分析：直接计算波形均方根，对应语音音量 → 嘴巴开合度。
-   * 不在播放时返回 0，让嘴型回到默认状态。
+   *
+   * 自适应归一化：跟踪播放期内 RMS 峰值（新峰值立即采纳、无新峰值时慢速衰减），
+   * 用 rms/peak 归一化到 0~1——不管 TTS 输出电平高低，嘴型始终满幅利用整个开合区间；
+   * 再经幂曲线（指数 0.7）放大中小音量。播放中每 tick 峰值慢速衰减，
+   * 音量渐弱时嘴型灵敏度自动回升。
    */
   getMouthOpen(): number {
     if (!this.playing || !this.analyser || !this.timeData) return 0
@@ -152,12 +173,20 @@ export class LipSyncController {
     }
     const rms = Math.sqrt(sumSquares / this.timeData.length)
 
-    // 指数平滑：兼顾灵敏度和稳定性
-    this.smoothedOpen = this.smoothedOpen * 0.6 + rms * 0.4
+    // 自适应峰值跟踪：新峰值立即采纳；否则慢速衰减（60fps 下约每秒 -6%）
+    if (rms > this.rmsPeak) {
+      this.rmsPeak = rms
+    } else {
+      this.rmsPeak *= LipSyncController.PEAK_DECAY
+    }
+    const normalized = this.rmsPeak > LipSyncController.PEAK_FLOOR ? rms / this.rmsPeak : 0
 
-    // 2.5 倍增益让嘴型开合更明显（RMS 值通常较小，需要放大）
-    // 设 0.005 阈值过滤静音段的微小噪声
-    return this.smoothedOpen > 0.005 ? Math.min(1, this.smoothedOpen * 2.5) : 0
+    // 指数平滑：更新值占主导（0.65），峰值更跟手
+    this.smoothedOpen = this.smoothedOpen * (1 - LipSyncController.SMOOTH_NEW) + normalized * LipSyncController.SMOOTH_NEW
+
+    // 幂曲线（指数 0.7）放大中小音量；低于静音阈值归零（句中停顿闭嘴）
+    if (this.smoothedOpen <= LipSyncController.SILENCE_THRESHOLD) return 0
+    return Math.min(1, Math.pow(this.smoothedOpen, LipSyncController.MOUTH_EXP))
   }
 
   /** 当前是否正在播放音频 */

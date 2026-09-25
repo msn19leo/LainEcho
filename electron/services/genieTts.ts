@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Genie-TTS(https://github.com/High-Logic/Genie-TTS) 本地声库语音服务客户端。
  *
  * GENIE 是 GPT-SoVITS 的轻量 CPU 推理引擎（~200MB 运行时 / 模型），声库自带性格。
@@ -17,7 +17,7 @@
 import { spawn, type ChildProcess } from 'child_process'
 import { net } from 'electron'
 import path from 'path'
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, promises as fs } from 'fs'
 import { paths, readJson, writeJson } from './storage'
 import type { TTSGenieConfig } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
@@ -68,6 +68,24 @@ function toGenieLang(lang: string): string {
 /** 当前已加载的角色（避免重复加载） */
 let loadedCharacter = ''
 
+/** 合成串行化：并发合成（剧情窗 + 设置页试听）会让 load_character / /tts 交错，
+ *  服务端推理状态被污染后会连锁失败（semantic_tokens None → 空音频）。 */
+let synthChain: Promise<unknown> = Promise.resolve()
+
+/** 兼容旧导入结构：onnxModelDir 误选角色根目录时，若其下存在 tts_models 子目录则自动下钻。
+ *  （旧版导入曾把角色根目录存为模型目录，服务端会在根目录找 .onnx 报"文件不存在"） */
+function normalizeOnnxModelDir(dir: string): string {
+  try {
+    if (dir && path.basename(dir) !== 'tts_models') {
+      const sub = path.join(dir, 'tts_models')
+      if (existsSync(sub)) return sub
+    }
+  } catch {
+    /* ignore */
+  }
+  return dir
+}
+
 /** 探测 GenieTTS 服务是否在线 */
 async function probe(url: string): Promise<boolean> {
   try {
@@ -86,6 +104,8 @@ export async function checkGenie(baseUrl: string): Promise<{ ok: boolean; error?
 
 /** 正在运行的服务进程句柄 */
 let serverProcess: ChildProcess | null = null
+/** 自动拉起互斥：多段合成并发触发时只启动一次（避免双实例 bind 10048 端口冲突） */
+let startPromise: Promise<void> | null = null
 
 /** 清理已拉起进程 */
 export function stopGenieServer(): void {
@@ -302,8 +322,20 @@ function wrapToWav(chunks: Uint8Array[], sampleRate = 32000): ArrayBuffer | null
  * 规避策略：把可能触发空韵母的孤立符号替换为"有韵母/不会单独成空 token"的安全形式，
  * 使单次 /tts 请求即可成功，避免退回多段合成（多段会叠加参考音频，导致参考音重复）。
  */
-function sanitizeGenieText(text: string): string {
+function sanitizeGenieText(text: string): string | null {
   // 保留能产生停顿的中文停顿标点，只剔除会触发 G2P 越界崩溃的字符。
+  //
+  // 0) 整组剔除圆括号内容（心理/动作/场景描写，按演出规范不朗读）——
+  //    旧逻辑只删括号字符保留内文，会把（她把靠窗的位置往里让了让）这类动作也读出来。
+  //    跑两遍覆盖一层嵌套；剔空后若整句为空则无有效台词（调用方会得到空音频并报错）。
+  let t = text
+  t = t.replace(/（[^（）]*）/g, '').replace(/\([^()]*\)/g, '')
+  t = t.replace(/（[^（）]*）/g, '').replace(/\([^()]*\)/g, '')
+  t = t.trim()
+  if (!t) {
+    console.log('[genie] 剔除括号内容后无有效台词，跳过合成（原文：%s）', text.slice(0, 40))
+    return null
+  }
   //
   // 崩溃机理：Genie 的 _merge_continuous_three_tones_2 对 jieba 分词的每个 token 做
   // lazy_pinyin FINALS_TONE3，再合并连续三声时访问 sub_finals_list[i-1][-1][-1]。
@@ -316,7 +348,6 @@ function sanitizeGenieText(text: string): string {
   // 停顿时长，同时规避崩溃。
   //
   // 保留：中文汉字、数字、字母 + 停顿标点 ，。！？…、；：
-  let t = text
   // 1) 连续省略号/连续点压缩为单个省略号（避免 pattern_consecutive 合并异常，也避免过长停顿）
   t = t.replace(/…+/g, '…').replace(/\.{2,}/g, '…')
   // 2) 删除会触发空韵母崩溃的字符：括号、方括号、引号、书名号、破折号及各类特殊符号。
@@ -340,7 +371,8 @@ async function genieFetchWav(base: string, name: string, text: string, splitSent
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ character_name: name, text, split_sentence: splitSentence }),
-    signal: AbortSignal.timeout(120000),
+    // 长句在核显/排队时推理可能超过 2 分钟，放宽到 3 分钟（超时后上层会重载角色重试一次）
+    signal: AbortSignal.timeout(180000),
   })
   if (!resp.ok) return null
   const chunks: Uint8Array[] = []
@@ -352,6 +384,92 @@ async function genieFetchWav(base: string, name: string, text: string, splitSent
     if (value) chunks.push(value)
   }
   return wrapToWav(chunks)
+}
+
+/**
+ * 把参考音频规范化为单声道 16-bit PCM WAV（Genie prompt_encoder 只接受 rank=2 的 ref_audio，
+ * 立体声/高比特位会被 ONNX 拒绝：Invalid rank for input: ref_audio Got: 3 Expected: 2）。
+ * 支持 PCM 8/16/24/32bit 与 32-bit float、任意声道数；已是单声道 PCM16 的原路径返回；
+ * 无法解析（如 mp3）返回 null，由调用方回退到角色内置参考音频。降混结果缓存为 <原名>.mono.wav。
+ */
+async function ensureMonoWav(p: string): Promise<string | null> {
+  try {
+    const buf = await fs.readFile(p)
+    if (buf.subarray(0, 4).toString('ascii') !== 'RIFF') return null
+    const audioFormat = buf.readUInt16LE(20)
+    const channels = buf.readUInt16LE(22)
+    const bitsPerSample = buf.readUInt16LE(34)
+    const isPcm = audioFormat === 1 && [8, 16, 24, 32].includes(bitsPerSample)
+    const isFloat = audioFormat === 3 && bitsPerSample === 32
+    if (!isPcm && !isFloat) {
+      console.warn('[genie] 参考音频格式不受支持（format=%d bits=%d）：%s', audioFormat, bitsPerSample, p)
+      return null
+    }
+    if (channels === 1 && bitsPerSample === 16) return p // 已是目标格式
+
+    // 定位 data 块
+    let off = 12
+    let dataOffset = -1
+    let dataLen = 0
+    while (off + 8 <= buf.length) {
+      const id = buf.subarray(off, off + 4).toString('ascii')
+      const size = buf.readUInt32LE(off + 4)
+      if (id === 'data') {
+        dataOffset = off + 8
+        dataLen = Math.min(size, buf.length - dataOffset)
+        break
+      }
+      off += 8 + size + (size % 2)
+    }
+    if (dataOffset < 0 || dataLen === 0) return null
+
+    const bytesPerSample = bitsPerSample / 8
+    const frameBytes = bytesPerSample * channels
+    const frames = Math.floor(dataLen / frameBytes)
+    const mono = Buffer.alloc(frames * 2)
+    const readSample = (offset: number): number => {
+      if (isFloat) return Math.round(buf.readFloatLE(offset))
+      switch (bitsPerSample) {
+        case 8: return (buf.readUInt8(offset) - 128) << 8
+        case 16: return buf.readInt16LE(offset)
+        case 24: {
+          const v = buf.readUIntLE(offset, 3)
+          return v & 0x800000 ? v - 0x1000000 : v
+        }
+        default: return Math.round(buf.readInt32LE(offset) / 65536) // 32bit int → 16bit
+      }
+    }
+    for (let i = 0; i < frames; i++) {
+      let sum = 0
+      for (let c = 0; c < channels; c++) sum += readSample(dataOffset + i * frameBytes + c * bytesPerSample)
+      mono.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(sum / channels))), i * 2)
+    }
+
+    const sampleRate = buf.readUInt32LE(24)
+    const out = Buffer.alloc(44 + mono.length)
+    out.write('RIFF', 0)
+    out.writeUInt32LE(36 + mono.length, 4)
+    out.write('WAVE', 8)
+    out.write('fmt ', 12)
+    out.writeUInt32LE(16, 16)
+    out.writeUInt16LE(1, 20)
+    out.writeUInt16LE(1, 22)
+    out.writeUInt32LE(sampleRate, 24)
+    out.writeUInt32LE(sampleRate * 2, 28)
+    out.writeUInt16LE(2, 32)
+    out.writeUInt16LE(16, 34)
+    out.write('data', 36)
+    out.writeUInt32LE(mono.length, 40)
+    mono.copy(out, 44)
+
+    const target = `${p}.mono.wav`
+    await fs.writeFile(target, out)
+    console.log('[genie] 参考音频已规范化为单声道 16bit（原 format=%d bits=%d ch=%d）：%s', audioFormat, bitsPerSample, channels, target)
+    return target
+  } catch (err) {
+    console.warn('[genie] 参考音频规范化失败：', err instanceof Error ? err.message : err)
+    return null
+  }
 }
 
 /**
@@ -409,14 +527,43 @@ export async function synthesizeGenie(params: {
   text: string
   lang: string
 }): Promise<ArrayBuffer> {
-  const { config, characterName, onnxModelDir, refAudioPath, refAudioText, text, lang } = params
+  // 串行化：排队执行，前一个失败不影响后一个
+  const next = synthChain.then(
+    () => synthesizeGenieInner(params),
+    () => synthesizeGenieInner(params),
+  )
+  synthChain = next.catch(() => undefined)
+  return next
+}
+
+async function synthesizeGenieInner(params: {
+  config: TTSGenieConfig
+  characterName: string
+  onnxModelDir: string
+  refAudioPath?: string
+  refAudioText?: string
+  text: string
+  lang: string
+}): Promise<ArrayBuffer> {
+  const { config, characterName, refAudioPath, refAudioText, text, lang } = params
+  const onnxModelDir = normalizeOnnxModelDir(params.onnxModelDir)
   const base = normUrl(config.baseUrl)
 
   if (!(await probe(base))) {
-    // 服务未就绪且配置了环境路径 → 自动拉起一次
+    // 服务未就绪且配置了环境路径 → 自动拉起一次（互斥：并发合成共用同一次启动）
     if (config.workPath && !serverProcess) {
-      await startGenieServer(config.workPath, config.baseUrl, config.dataDir)
-      await new Promise((r) => setTimeout(r, 4000))
+      if (!startPromise) {
+        startPromise = startGenieServer(config.workPath, config.baseUrl, config.dataDir).then(() => undefined)
+        void startPromise.finally(() => {
+          startPromise = null
+        })
+      }
+      await startPromise
+      // 轮询等待就绪：模型导入可能比固定 sleep 慢，最多等 20s
+      for (let i = 0; i < 20; i++) {
+        if (await probe(base)) break
+        await new Promise((r) => setTimeout(r, 1000))
+      }
     }
     if (!(await probe(base))) {
       throw new Error('GenieTTS 服务未运行。请在设置中先【启动服务】并等待就绪，或确认地址/端口正确。')
@@ -425,12 +572,40 @@ export async function synthesizeGenie(params: {
 
   const name = characterName.trim()
   if (!name) throw new Error('未配置角色名，无法合成')
-  // Genie /tts 强制要求已设置参考音频，否则返回 404。未显式配置时，自动用角色目录
-  // 内置参考音频（prompt_wav.json 的 Normal 项），保证日语声库开箱即用。
-  const autoRef = !refAudioPath ? await resolveDefaultReferenceAudio(onnxModelDir) : null
-  const effRefPath = refAudioPath || (autoRef?.path ?? '')
-  const effRefText = refAudioText || (autoRef?.text ?? '')
-  await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
+  // Genie /tts 强制要求已设置参考音频，否则返回 404。
+  // 参考音频必须为单声道 16-bit PCM（prompt_encoder 只接受 rank=2）。
+  // 候选顺序：模型卡参考音频 → 角色内置 prompt_wav（prompt_wav.json Normal 项，格式通常标准）；
+  // 卡内参考无法规范化为单声道（如 mp3/怪格式）时自动回退内置项。
+  const autoRef = await resolveDefaultReferenceAudio(onnxModelDir)
+  let effRefPath = ''
+  let effRefText = ''
+  if (refAudioPath) {
+    const normalized = await ensureMonoWav(refAudioPath)
+    if (normalized) {
+      effRefPath = normalized
+      effRefText = refAudioText || (autoRef?.text ?? '')
+    } else {
+      console.warn('[genie] 模型卡参考音频无法规范化，回退角色内置参考音频：%s', autoRef?.path ?? '(无)')
+    }
+  }
+  if (!effRefPath && autoRef?.path) {
+    const normalized = await ensureMonoWav(autoRef.path)
+    if (normalized) {
+      effRefPath = normalized
+      effRefText = autoRef.text ?? ''
+    }
+  }
+  if (!effRefPath) {
+    // 模型卡参考音频无法解析（非 WAV）且角色目录无内置 prompt_wav（GUI 导入的模型常见）。
+    // Genie /tts 无参考音频会 404，与其报含糊的"空音频"，不如直接指引用户换 WAV。
+    throw new Error('参考音频无法解析（仅支持 WAV 格式）。请在「语音合成 → TTS 模型卡」中重新导入 .wav 格式的参考音频（建议单声道）')
+  }
+  try {
+    await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
+  } catch (err) {
+    loadedCharacter = '' // 加载失败：下次强制重载
+    throw err
+  }
 
   // 日语模式：将中文文本翻译为日语后再合成（AI 生成中文，TTS 输出日语语音）
   let synthText = text
@@ -444,10 +619,43 @@ export async function synthesizeGenie(params: {
     console.log('[genie] 日语模式：文本已含日文，跳过翻译')
   }
 
-  // 文本预处理规避 G2P 越界崩溃，再单次合成（保证参考音频只播一遍、不重复）
+  // 文本预处理（整组剔除（）心理/动作内容）规避 G2P 越界崩溃，再单次合成（保证参考音频只播一遍、不重复）
   const safeText = sanitizeGenieText(synthText)
-  const wav = await genieFetchWav(base, name, safeText, lang !== 'ja')
+  if (!safeText) {
+    // 整段都在括号里（纯心理/动作/场景，无可朗读台词）
+    throw new Error('该段内容均为心理/动作描写（括号内），没有可朗读的台词')
+  }
+  // 合成（失败自动重试一次）：服务端推理偶发失败（semantic_tokens None 崩溃 / 请求超时），
+  // 重载角色可复位服务端状态，重试能显著提升成功率；重试仍失败才向上报错。
+  let wav: ArrayBuffer | null = null
+  let lastErr: unknown = null
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (attempt > 1) {
+      // 重试前强制重载角色（复位服务端推理状态），稍等片刻给 worker 恢复时间
+      loadedCharacter = ''
+      try {
+        await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
+      } catch (err) {
+        loadedCharacter = ''
+        throw err
+      }
+    }
+    try {
+      wav = await genieFetchWav(base, name, safeText, lang !== 'ja')
+    } catch (err) {
+      lastErr = err
+      wav = null
+      console.warn('[genie] 合成请求异常（第 %d 次）：%s', attempt, err instanceof Error ? err.message : String(err))
+    }
+    if (wav) break
+    loadedCharacter = '' // 服务端推理状态可能已被污染，强制下次重载角色
+    if (attempt === 1) {
+      console.warn('[genie] 合成%s，重载角色后自动重试一次', lastErr ? '请求异常' : '为空音频')
+      await new Promise((r) => setTimeout(r, 800))
+    }
+  }
   if (!wav) {
+    if (lastErr) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
     throw new Error(`GenieTTS 生成为空音频（文本经安全化后仍无法合成，可疑片段：${safeText.slice(0, 30)}` + (safeText.length > 30 ? '…' : '') + '）')
   }
   return wav

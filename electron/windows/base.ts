@@ -4,7 +4,7 @@
 import type { BrowserWindow } from 'electron'
 import path from 'path'
 
-export type WindowPage = 'pet.html' | 'chat.html' | 'settings.html'
+export type WindowPage = 'pet.html' | 'chat.html' | 'settings.html' | 'story.html' | 'editor.html'
 
 /** vite-plugin-electron 在 dev 模式下注入到主进程的环境变量 */
 const DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'] as string | undefined

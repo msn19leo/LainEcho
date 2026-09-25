@@ -69,9 +69,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // 通知宠物窗跟随切换会话（内容框同步）
       api.app.notifyCurrentSession(id)
       // 切换会话时同步角色卡：根据会话绑定的 characterCardId 切换当前角色卡，
-      // 并通知桌宠窗口同步模型 + 表情/待机动作覆盖
-      const charStore = useCharacterStore.getState()
-      if (detail.characterCardId && detail.characterCardId !== charStore.currentCardId) {
+      // 并通知桌宠窗口同步模型 + 表情/待机动作覆盖。
+      // 必须无条件广播，不能以聊天窗自身 currentCardId 判同跳过——聊天窗重开后
+      // currentCardId 会静默回退到 cards[0]，宠物窗独立存活可能停在其他卡，
+      // "同卡" 守卫一旦跳过就会造成两侧角色名不一致（宠物窗头部/名牌显示旧卡）
+      if (detail.characterCardId) {
+        const charStore = useCharacterStore.getState()
         charStore.setCurrentCard(detail.characterCardId)
         const card = charStore.cards.find((c) => c.id === detail.characterCardId)
         api.app.setPetCard({
@@ -182,9 +185,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
  * 返回取消订阅函数。
  */
 export function bindPersistentSessionSync(): () => void {
+  // 剧情 run 不是聊天会话：聊天/宠物窗对 storyrun_* 的事件一律忽略（防误认领导致 session:get 报错）
+  const isStoryRunId = (id?: string | null) => !!id && id.startsWith('storyrun_')
   const unsubUser = api.ai.onStreamUser((payload) => {
     const st = useSessionStore.getState()
-    if (!payload?.sessionId) return
+    if (!payload?.sessionId || isStoryRunId(payload.sessionId)) return
     // 若当前已持有其它会话，则忽略属于别的新会话的流式事件（避免串台）
     if (st.currentSessionId && st.currentSessionId !== payload.sessionId) {
       console.log('[bind] streamUser IGNORE sid=' + payload?.sessionId, 'cur=' + st.currentSessionId)
@@ -213,7 +218,7 @@ export function bindPersistentSessionSync(): () => void {
   const unsubActive = api.ai.onActiveSession((sessionId) => {
     // 仅认领：本地尚未持有会话、且主进程确实有进行中的流时，才拉取该会话补上漏掉的轮次。
     // 本地已有会话（无论是否等于该 id）一律忽略，绝不顶掉用户正看的会话。
-    if (!sessionId) return
+    if (!sessionId || isStoryRunId(sessionId)) return
     const st = useSessionStore.getState()
     if (st.currentSessionId) return
     void useSessionStore.getState().loadSession(sessionId)
@@ -227,7 +232,7 @@ export function bindPersistentSessionSync(): () => void {
   })
   const unsubDone = api.ai.onStreamDone((payload) => {
     const st = useSessionStore.getState()
-    if (!payload?.sessionId || payload.sessionId !== st.currentSessionId) return
+    if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
     void (async () => {
       useSessionStore.setState({ streaming: false })
       try {
@@ -244,7 +249,7 @@ export function bindPersistentSessionSync(): () => void {
   })
   const unsubError = api.ai.onStreamError((payload) => {
     const st = useSessionStore.getState()
-    if (!payload?.sessionId || payload.sessionId !== st.currentSessionId) return
+    if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
     useSessionStore.setState((s) => {
       const partial = s.streamingContent
       const appended = partial

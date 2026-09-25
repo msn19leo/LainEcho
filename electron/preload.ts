@@ -6,7 +6,7 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
+import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamNarrationPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
@@ -15,6 +15,11 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, chunk: string) => cb(chunk)
       ipcRenderer.on('ai:stream-chunk', listener)
       return () => ipcRenderer.removeListener('ai:stream-chunk', listener)
+    },
+    onStreamNarration: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: StreamNarrationPayload) => cb(payload)
+      ipcRenderer.on('ai:stream-narration', listener)
+      return () => ipcRenderer.removeListener('ai:stream-narration', listener)
     },
     onStreamDone: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, payload: StreamDonePayload) => cb(payload)
@@ -104,7 +109,9 @@ const api: WindowApi = {
     list: () => ipcRenderer.invoke('model:list'),
     motionGroups: (modelId) => ipcRenderer.invoke('model:motion-groups', modelId),
     expressionList: (modelId) => ipcRenderer.invoke('model:expression-list', modelId),
+    scanAssets: (modelId) => ipcRenderer.invoke('model:scan-assets', modelId),
     importFromFolder: () => ipcRenderer.invoke('model:import-from-folder'),
+    rename: (modelId, name) => ipcRenderer.invoke('model:rename', modelId, name),
     remove: (modelId) => ipcRenderer.invoke('model:remove', modelId),
     coreStatus: () => ipcRenderer.invoke('model:core-status'),
     importCore: () => ipcRenderer.invoke('model:import-core'),
@@ -312,6 +319,73 @@ const api: WindowApi = {
       ipcRenderer.on('proactive:state', listener)
       return () => ipcRenderer.removeListener('proactive:state', listener)
     },
+  },
+  /** 剧情演出：剧本库/run 存档/演出控制/事件订阅（与聊天系统完全分离） */
+  story: {
+    list: () => ipcRenderer.invoke('story:list'),
+    import: () => ipcRenderer.invoke('story:import'),
+    export: (scriptId) => ipcRenderer.invoke('story:export', scriptId),
+    remove: (scriptId) => ipcRenderer.invoke('story:remove', scriptId),
+    listRuns: () => ipcRenderer.invoke('story:list-runs'),
+    deleteRun: (runId) => ipcRenderer.invoke('story:delete-run', runId),
+    start: (params) => ipcRenderer.invoke('story:start', params),
+    listBackgrounds: () => ipcRenderer.invoke('story:list-backgrounds'),
+    uploadBackgrounds: () => ipcRenderer.invoke('story:upload-backgrounds'),
+    removeBackground: (name) => ipcRenderer.invoke('story:remove-background', name),
+    generateDraft: (params) => ipcRenderer.invoke('story:generate-draft', params),
+    importDraft: (draft) => ipcRenderer.invoke('story:import-draft', draft),
+    respond: (params) => ipcRenderer.invoke('story:respond', params),
+    stop: (runId) => ipcRenderer.invoke('story:stop', runId),
+    getState: (runId) => ipcRenderer.invoke('story:get-state', runId),
+    getRun: (runId) => ipcRenderer.invoke('story:get-run', runId),
+    setSpriteView: (runId, view) => ipcRenderer.invoke('story:set-sprite-view', { runId, view }),
+    synthesize: (params) => ipcRenderer.invoke('story:tts-synthesize', params),
+    openWindow: () => ipcRenderer.send('app:open-story-window'),
+    /** 打开/聚焦可视化编辑器窗口（7.6），并载入指定剧本 */
+    openEditor: (scriptId) => ipcRenderer.invoke('story:open-editor', scriptId),
+    /** 新增骨架剧本并直接进入编辑器 */
+    editorCreate: () => ipcRenderer.invoke('story:editor-create') as Promise<{ ok: boolean; scriptId?: string; error?: string }>,
+    /** 编辑器当前编辑的剧本 id（窗口创建时由主进程记住） */
+    editorCurrent: () => ipcRenderer.invoke('story:editor-current') as Promise<string | null>,
+    /** 编辑器读取剧本（结构化 + 原文双份；允许带错读取） */
+    editorRead: (scriptId) => ipcRenderer.invoke('story:editor-read', scriptId),
+    /** 编辑器保存（form = 表单结构化；text = 原文微调；校验通过才原子写盘） */
+    editorSave: (payload) => ipcRenderer.invoke('story:editor-save', payload),
+    /** 订阅编辑器重载（重复打开编辑器切换剧本时通知） */
+    onEditorReload: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('editor:reload', listener)
+      return () => ipcRenderer.removeListener('editor:reload', listener)
+    },
+    onEvent: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: import('../src/types').StoryEventPayload) => cb(payload)
+      ipcRenderer.on('story:event', listener)
+      return () => ipcRenderer.removeListener('story:event', listener)
+    },
+    onState: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, snapshot: import('../src/types').StorySnapshot) => cb(snapshot)
+      ipcRenderer.on('story:state', listener)
+      return () => ipcRenderer.removeListener('story:state', listener)
+    },
+    onMessageSync: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { runId: string }) => cb(payload)
+      ipcRenderer.on('story:message', listener)
+      return () => ipcRenderer.removeListener('story:message', listener)
+    },
+    /** 订阅剧情轮次流式预览（7.7）：AI 生成中的可读文本累积全文（runId 匹配的剧情窗消费） */
+    onStreamDelta: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { runId: string; text: string }) => cb(payload)
+      ipcRenderer.on('story:stream-delta', listener)
+      return () => ipcRenderer.removeListener('story:stream-delta', listener)
+    },
+    reportRendererReady: () => ipcRenderer.send('story:renderer-ready'),
+    assetUrl: (scriptId, relativePath) => {
+      // user: 前缀引用背景库（data/story-backgrounds/），其余为剧本目录内素材
+      const p = relativePath.split('\\').join('/')
+      if (p.startsWith('user:')) return `pet-res://story-backgrounds/${p.slice('user:'.length)}`
+      return `pet-res://stories/${scriptId}/${p}`
+    },
+    spriteUrl: (spriteId, relativePath) => `pet-res://sprites/${spriteId}/${relativePath.split('\\').join('/')}`,
   },
   /** 自动更新：check 触发检查，download/skip/install 控制流程，其余为事件订阅 */
   updater: {

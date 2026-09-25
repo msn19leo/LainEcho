@@ -78,9 +78,18 @@ export default function PetApp() {
     // 宠物窗自己的 renderer 有独立的 characterStore：先加载角色卡列表，
     // 保证内容框名牌/头部能显示当前角色名（否则恒为 AI 兜底）
     void useCharacterStore.getState().load()
+    // 角色卡列表跨窗口同步：设置窗增删改卡后刷新本地列表。
+    // 不订阅的话 cards 只在挂载时加载一次——改名后显示旧名、新建卡查不到显示 'AI' 兜底
+    const unsubCards = api.characterCard.onChanged(() => {
+      void useCharacterStore.getState().load()
+    })
     // 通知主进程 renderer 就绪：补发最近一次语音模式，避免广播早于订阅而丢失
     api.pet.reportRendererReady()
-    return bindPersistentSessionSync()
+    const unbind = bindPersistentSessionSync()
+    return () => {
+      unsubCards()
+      unbind()
+    }
   }, [])
 
   // 全局设置实时同步：加载持久化设置并订阅主进程广播（文字速度等设置窗改动后立即对宠物窗生效）
@@ -324,8 +333,8 @@ export default function PetApp() {
       // 关闭跟读时语音在整段文本生成后播放，不改文本展示（保持流式打字机，active 不置真）
       if (isFollow) {
         usePetReadingStore.getState().setMode('follow')
-        // 新一轮朗读开始：先清空上一轮跟读残留文本，避免上一轮全文在新一轮被瞬间渲染
-        usePetReadingStore.getState().clearText()
+        // 新一轮清理已由 onVoiceMode（流式开始）负责：此处不再 clearText——
+        // 开头旁白前置流（ai:stream-narration）先于首个 speak 到达，此处清空会丢已上屏的旁白
         usePetReadingStore.getState().setActive(true)
       }
       const list = chunks && chunks.length > 0 ? chunks : [{ text: text.trim(), emotion: DEFAULT_EMOTION }]
@@ -348,6 +357,20 @@ export default function PetApp() {
     })
     return unsub
   }, [])
+
+  // 订阅"开头括号旁白前置"流：回答最前面的连续括号旁白在 LLM 流式阶段即时上屏（不依赖语音），
+  // 台词部分仍由 playLoop 段随语音追加（主进程已从语音块剥除已前置旁白，不会重复）。
+  // reset：空回复重试轮从头流式，清空已前置旁白重新接收。
+  useEffect(() => api.ai.onStreamNarration((payload) => {
+    const st = usePetReadingStore.getState()
+    if (payload?.reset) {
+      st.clearText()
+      return
+    }
+    if (payload?.delta && st.mode === 'follow') {
+      st.appendText(payload.delta)
+    }
+  }), [])
 
   // 流式开始时订阅本轮语音模式：有语音时用段落跟读打字，无语音时走流式打字机整段流式输出。
   // 注意：这里只切 mode 并清空文本，不让 active 直接为真——active 反映"语音真正开始朗读"，

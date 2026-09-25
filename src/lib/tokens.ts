@@ -62,11 +62,11 @@ export const color = {
   },
 } as const
 
-/** 渐变（随主题切换） */
+/** 品牌色（随主题切换；原为渐变，现单色化——变量名保留以兼容既有消费点） */
 export const gradient = {
-  brand: 'var(--gradient-brand)', // 青→粉 / 蓝→粉
-  primary: 'var(--gradient-primary)', // 纯主色渐变
-  accent: 'var(--gradient-accent)', // 纯粉色渐变
+  brand: 'var(--gradient-brand)', // 深色青 / 浅色淡蓝（纯色）
+  primary: 'var(--gradient-primary)', // 同上（纯色）
+  accent: 'var(--gradient-accent)', // 同上（纯色）
 } as const
 
 /** 毛玻璃规格：blur(20px) + 主色调半透明背景 + 主色 0.15 边框 */

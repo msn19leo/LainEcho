@@ -6,6 +6,7 @@ import { ensureDataDirs } from './services/storage'
 import { pruneEmptySessions } from './services/repository'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
 import { startProactiveScheduler } from './services/proactive/scheduler'
+import { ensureSampleStories } from './services/storyEngine/samples'
 import { registerPetSchemesPrivileged, registerPetProtocolHandler } from './services/petProtocol'
 import { registerAllIpc } from './ipc'
 import { windowManager } from './windows/windowManager'
@@ -31,6 +32,9 @@ if (!gotLock) {
 
     // 记忆向量启动补偿：为缺失/模型过期的已确认记忆后台补嵌（未配置嵌入时静默跳过）
     void compensateMissingVectors()
+
+    // 示例剧本：首次启动写入 data/stories/（已存在不覆盖）
+    await ensureSampleStories().catch((err) => console.error('[story] 示例剧本写入失败', err))
 
     // 主动搭话调度器：每 30s 一轮，enableProactive 关闭时循环空转（开销可忽略）
     startProactiveScheduler()

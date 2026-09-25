@@ -87,7 +87,7 @@ export function registerSpritesIpc(): void {
   ipcMain.handle('sprite:update', async (
     _e,
     spriteId: string,
-    patch: Partial<Pick<CharacterSprite, 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
+    patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
   ) => {
     await updateSprite(spriteId, patch)
     windowManager.notifySpritesChanged()

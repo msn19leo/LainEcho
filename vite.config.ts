@@ -4,14 +4,18 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import electron from 'vite-plugin-electron/simple'
 
-// 三个独立窗口对应三个 HTML 入口：
+// 五个独立窗口对应五个 HTML 入口：
 //   pet.html      桌宠窗口（Live2D）
 //   chat.html     聊天窗口
 //   settings.html 设置窗口
+//   story.html    剧情演出窗口
+//   editor.html   剧本可视化编辑器（7.6）
 const rendererPages = {
   pet: resolve(__dirname, 'pet.html'),
   chat: resolve(__dirname, 'chat.html'),
   settings: resolve(__dirname, 'settings.html'),
+  story: resolve(__dirname, 'story.html'),
+  editor: resolve(__dirname, 'editor.html'),
 }
 
 export default defineConfig({

@@ -1,18 +1,20 @@
 /**
- * 窗口管理器：持有三个窗口引用，提供懒创建 / 显隐 / 跨窗口事件广播。
- * 三个窗口共享主进程同一套数据读写逻辑。
+ * 窗口管理器：持有桌宠/聊天/设置/剧情四个窗口引用，提供懒创建 / 显隐 / 跨窗口事件广播。
+ * 各窗口共享主进程同一套数据读写逻辑。
  */
 import { app, BrowserWindow, Menu, Tray, nativeImage } from 'electron'
 import path from 'path'
 import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWindow'
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
+import { createStoryWindow } from './storyWindow'
 import type { ModelSettings, PetCardPayload, StandardEmotion, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
   chat: BrowserWindow | null = null
   settings: BrowserWindow | null = null
+  story: BrowserWindow | null = null
   private tray: Tray | null = null
   private allowQuit = false
   /** 桌宠 renderer 是否已 ready（did-finish-load）。就绪前触发的语音缓存，避免首个回答丢声 */
@@ -24,6 +26,8 @@ class WindowManager {
   /** 当前正在进行 AI 流式回复的会话 id（无则 null）。用于窗口重载/新建后就绪时补发，
    *  让重开/热更的窗口能"认领"进行中的会话，避免漏掉该轮的 stream-user/done 而看起来"生成失败" */
   private activeStreamingSession: string | null = null
+  /** 最近一次推送给桌宠的角色卡形象配置。桌宠 renderer 就绪后补发（推送早于订阅时 IPC 消息会丢） */
+  private lastPetCard: PetCardPayload | null = null
   private pendingPetSpeaks: Array<{
     text: string
     voiceId: string | null
@@ -90,6 +94,11 @@ class WindowManager {
     return this.pet
   }
 
+  /** 剧情窗引用（IPC 弹对话框时作为父窗口用；可能为 null） */
+  getStoryWindow(): BrowserWindow | null {
+    return this.story
+  }
+
   showPet(): void {
     if (!this.pet || this.pet.isDestroyed()) {
       this.pet = createPetWindow()
@@ -113,8 +122,10 @@ class WindowManager {
     }
   }
 
-  /** 角色卡切换后同步桌宠的 Live2D 模型 + 覆盖配置 + 立绘/渲染模式 */
+  /** 角色卡切换后同步桌宠的 Live2D 模型 + 覆盖配置 + 立绘/渲染模式。
+   *  同时缓存 payload：桌宠 renderer 尚未挂载订阅时该消息会被丢弃，就绪后由 resendPetCard 补发 */
   setPetCard(payload: PetCardPayload): void {
+    this.lastPetCard = payload
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:set-card', payload)
     }
@@ -230,6 +241,21 @@ class WindowManager {
     win.webContents.send('ai:active-session', this.activeStreamingSession)
   }
 
+  /** 桌宠 renderer 就绪后补发最近一次角色卡形象配置（防推送早于订阅而丢失导致形象空白） */
+  resendPetCard(): void {
+    if (!this.lastPetCard) return
+    if (!this.pet || this.pet.isDestroyed()) return
+    this.pet.webContents.send('pet:set-card', this.lastPetCard)
+  }
+
+  /** 剧情轮次流式预览（7.7 性能第一批）：AI 生成中的可读文本（累积全文）实时推给剧情窗；
+   *  生成完成后由 story:message 增量同步接管正式分段播放，预览仅用于消除"干等" */
+  pushStoryStream(runId: string, text: string): void {
+    if (this.story && !this.story.isDestroyed()) {
+      this.story.webContents.send('story:stream-delta', { runId, text })
+    }
+  }
+
   /** 聊天窗切会话/新建会话后，把当前会话 id 转发给宠物窗，让内容框跟随同步 */
   notifyCurrentSession(sessionId: string | null): void {
     if (this.pet && !this.pet.isDestroyed()) {
@@ -308,6 +334,25 @@ class WindowManager {
     }
     if (!this.settings.isVisible()) this.settings.show()
     this.settings.focus()
+  }
+
+  // ---------------- 剧情 ----------------
+
+  /** 打开/聚焦剧情窗（演出在主进程进行，窗口关闭不中断；重开按快照恢复） */
+  showStory(): void {
+    if (!this.story || this.story.isDestroyed()) {
+      this.story = createStoryWindow()
+      return
+    }
+    if (!this.story.isVisible()) this.story.show()
+    this.story.focus()
+  }
+
+  /** 向剧情窗发送事件（快照补发等；窗口未开则静默忽略） */
+  sendToStory(channel: string, payload?: unknown): void {
+    if (this.story && !this.story.isDestroyed()) {
+      this.story.webContents.send(channel, payload)
+    }
   }
 
   // ---------------- 更新 ----------------
