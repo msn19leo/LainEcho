@@ -10,9 +10,9 @@
  *  - user 消息可携带 meta 标记（proactive/story）落盘并随 stream-user 广播；
  *  - proactive 轮次跳过记忆抽取，且历史中的 proactive 旁白消息一律不参与抽取。
  */
-import type { AppSettings, ChatMessage, ChatMessageMeta, StandardEmotion } from '../../src/types'
+import type { AppSettings, ChatMessage, ChatMessageMeta } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
-import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, extractLeadingNarration, splitNarrationGroups, consumeLeadingNarration } from './emotion'
+import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, extractLeadingNarration, splitNarrationGroups, consumeLeadingNarration, stripParenGroups, emotionAdherence } from './emotion'
 import { buildModelContext, SUMMARY_MAX_TOKENS, toModelMessage, type ModelMessage } from './context'
 import { estimateMessagesTokens } from './token'
 import { getTTSConfig } from '../ipc/tts.ipc'
@@ -22,10 +22,14 @@ import {
   appendSessionMessages,
   buildSystemPrompt,
   getCharacterCard,
+  getModelPalette,
+  getModelSettings,
+  getSpritePalette,
   getSession,
   getSettings,
   updateSessionSummary,
 } from './repository'
+import type { EmotionPaletteRef } from '../../src/types'
 import { retrieveMemories } from './memory/retriever'
 import { windowManager } from '../windows/windowManager'
 
@@ -96,11 +100,6 @@ export function createSummarizer(settings: AppSettings, apiKey: string, signal?:
   }
 }
 
-/** 格式化本地时间为 YYYY-MM-DD HH:MM:SS（用户消息本地时间注入用） */
-function formatLocalTime(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
 /** 主进程合并 chunk 的 flush 间隔（毫秒）：多个 delta 合并为一次 IPC 推送，减少消息数 */
 const CHUNK_FLUSH_MS = 16
 /** 单个"情绪块"最多合并的 dialogue 项数：超过即提前结算，保持在"边生成边读"的实时性，避免单块越长越延迟出声 */
@@ -119,6 +118,11 @@ export interface ChatTurnParams {
    * 作为 StorySection 注入 system prompt 末尾，约束演出节奏与叙事边界。
    */
   storyDirective?: string
+  /**
+   * 情绪词表来源立绘集 id（可选覆盖）：剧情轮传 run.spriteId（演出词表），
+   * 普通聊天缺省用角色卡绑定的 spriteId。决定 emotion 输出值域与解析链。
+   */
+  spriteId?: string | null
   /**
    * 剧情 run 存储覆盖（剧情演出专用；与聊天会话完全分离）：
    * - history/append：消息读写改走 run 文件（跳过会话索引/摘要/A2）；
@@ -140,7 +144,7 @@ export interface ChatTurnParams {
  * @returns 落盘的 assistant 消息；出错时向渲染端广播 stream-error 后 rethrow
  */
 export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> {
-  const { sessionId, content, meta, storyDirective, store } = params
+  const { sessionId, content, meta, storyDirective, store, spriteId: spriteIdOverride } = params
   if (!content.trim()) throw new Error('消息内容为空')
 
   const userMsg: ChatMessage = { role: 'user', content, timestamp: Date.now(), meta }
@@ -165,6 +169,10 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
   // 避免把 JSON（花括号/键名）暴露给聊天窗，也减少 IPC 往返。lastDisplayLen 用于只发新增片段。
   let lastDisplayLen = 0
   let chunkTimer: NodeJS.Timeout | null = null
+  // ---- 「回答仅含台词」括号剥除（普通聊天专用；剧情 store 与主动搭话 meta.proactive 豁免）----
+  // settings 在下方 try 块内加载后赋值；闭包首次调用发生在 onChunk/flush 时，届时必已赋值
+  let stripParen = false
+  const maybeStrip = (t: string): string => (stripParen ? stripParenGroups(t) : t)
   // ---- 开头括号旁白前置状态（跟读模式下旁白流式即时上屏，不等语音；台词仍段随语音）----
   /** 已确认的回答开头连续括号组全文（display 前缀，流式中只会增长） */
   let leadingNarration = ''
@@ -191,7 +199,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
    *  剥除前必须先同步一次，否则刚闭合的括号组未入状态会导致语音块剥不干净、跟读气泡里旁白重复。 */
   const syncLeadingNarration = () => {
     if (store) return
-    const narration = extractLeadingNarration(extractStreamingJsonText(partial))
+    const narration = extractLeadingNarration(maybeStrip(extractStreamingJsonText(partial)))
     if (narration !== leadingNarration) {
       leadingNarration = narration
       narrationGroups = splitNarrationGroups(narration)
@@ -200,7 +208,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
 
   const flushChunks = () => {
     chunkTimer = null
-    const display = extractStreamingJsonText(partial)
+    const display = maybeStrip(extractStreamingJsonText(partial))
     const delta = display.length > lastDisplayLen ? display.slice(lastDisplayLen) : ''
     lastDisplayLen = Math.max(lastDisplayLen, display.length)
     if (delta) {
@@ -231,6 +239,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
   currentAbort = abort
   try {
     const settings = await getSettings()
+    stripParen = settings.stripParenNarration && !store && !meta?.proactive
     const ttsCfg = await getTTSConfig()
     // 整段合音：开启时主进程关闭"边生成边读"，流式结束后整段一次合成（音调连贯）；关闭时保持逐句实时朗读
     const mergeSpeech = ttsCfg.mergeSpeech === true
@@ -257,9 +266,38 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       profileDigest = retrieval.profileDigest
       history = session.messages
     }
+    // 情绪词表分轨（演出词表双轨对等）：演出形象二选一，词表跟着形象走——
+    // sprite 模式 → 立绘集词表（剧情轮恒 sprite：run.spriteId > 角色卡绑定 > 全局选中）；
+    // live2d 模式 → Live2D 模型词表（角色卡绑定模型 > 全局选中模型）。
+    // 模式判定与渲染端同口径：角色卡显式 renderMode > 全局形象（selectedSpriteId 非空 = sprite）。
+    // 两轨词表为空都落内置最小词表（仅"平静"），永不返回 null。
+    const modelSettings = await getModelSettings()
+    const paletteMode: 'live2d' | 'sprite' = store
+      ? 'sprite'
+      : (card?.renderMode ?? (modelSettings.selectedSpriteId ? 'sprite' : 'live2d'))
+    let emotionPalette: EmotionPaletteRef
+    if (paletteMode === 'live2d') {
+      const modelId = card?.modelId ?? modelSettings.selectedModelId ?? null
+      emotionPalette = await getModelPalette(modelId)
+      console.log(
+        '[chat] 情绪词表 mode=live2d model=%s（%d 词，默认「%s」）',
+        modelId ?? '无',
+        emotionPalette.entries.length,
+        emotionPalette.defaultEmotion,
+      )
+    } else {
+      const emotionSpriteId = spriteIdOverride ?? card?.spriteId ?? modelSettings.selectedSpriteId ?? null
+      emotionPalette = await getSpritePalette(emotionSpriteId)
+      console.log(
+        '[chat] 情绪词表 mode=sprite sprite=%s（%d 词，默认「%s」）',
+        emotionSpriteId ?? '无',
+        emotionPalette.entries.length,
+        emotionPalette.defaultEmotion,
+      )
+    }
     const systemMessage: ChatMessage = {
       role: 'system',
-      content: buildSystemPrompt(card, retrievalItems, settings.userName, profileDigest, settings.enableProactive, storyDirective),
+      content: buildSystemPrompt(card, retrievalItems, settings.userName, profileDigest, settings.enableProactive, storyDirective, stripParen, emotionPalette),
     }
     if (!store) {
       console.log('[memory] 注入条数=%d 画像=%s', retrievalItems.length, profileDigest ? 'yes' : 'no')
@@ -268,13 +306,8 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     // A1+A2 上下文组装：历史（剧情 = run.messages）+ 本轮 user 消息 → 净化 → 预算装填/自动摘要
     // proactive 旁白消息在此附加系统旁白标记（历史中的旁白同样处理，见 toModelMessageWithNarration）
     const modelMessages = [...history, userMsg].map(toModelMessageWithNarration)
-    // 本地时间注入：仅给发送给模型的当前用户消息加前缀（不污染落盘历史），让角色感知发送时刻
-    if (modelMessages.length > 0) {
-      const lastMsg = modelMessages[modelMessages.length - 1]!
-      if (lastMsg.role === 'user') {
-        lastMsg.content = `[本地时间 ${formatLocalTime(new Date())}]\n${lastMsg.content}`
-      }
-    }
+    // 当前时间已由 system prompt 的【当前真实时间】Section 权威声明（见 repository.buildSystemPrompt），
+    // user 消息前缀链已移除——避免双时间源竞争与 24h→12h 制换算幻觉
     const summarize = createSummarizer(settings, apiKey, abort.signal)
     const ctx = await buildModelContext({
       systemMessage,
@@ -321,7 +354,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     // 流式一开始即广播本轮语音模式，让宠物窗提前用跟读展示方式（剧情轮次跳过）
     if (!store) windowManager.notifyVoiceMode({ voiceEnabled: voiceActive })
     let speechCursor = 0
-    let pendingBlock: { texts: string[]; emotion: StandardEmotion } | null = null
+    let pendingBlock: { texts: string[]; emotion: string } | null = null
     /** 是否已通过流式触发过至少一次语音（用于非流式/分块失败的兜底判定） */
     let speechEmitted = false
     // 结算当前情绪块并触发桌宠语音（语音启用时才发声）
@@ -331,10 +364,11 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       if (!b || b.texts.length === 0 || !card || !voiceActive) return
       // 剥除前先同步一次开头旁白（块满触发的结算可能发生在两次 flushChunks 之间）
       syncLeadingNarration()
-      // 剥掉已前置上屏的开头括号组，避免语音段上屏时旁白重复；纯前置旁白块剥后为空 → 跳过投放
+      // 剥掉已前置上屏的开头括号组，避免语音段上屏时旁白重复；再剥一次全部括号组——
+      // 纯括号块（旁白/动作描写，含模型漏右括号的残组）剥空即跳过投放，绝不朗读
       const text = consumeLeadingNarration(b.texts.join('\n'), narrationGroups, narrationCursor)
-      if (!text.trim()) {
-        speechEmitted = true // 该块已由旁白前置通道接管，视为已触发，避免兜底重复投放
+      if (!stripParenGroups(text).trim()) {
+        speechEmitted = true // 该块为纯旁白（或已被旁白前置通道接管），视为已触发，避免兜底重复投放
         return
       }
       speechEmitted = true
@@ -346,15 +380,18 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     }
     // 流式 onChunk 中实时结算：新 dialogue 项并入当前块，情绪变化或块足够大即结算旧块，保持"边生成边读"
     const pumpSpeech = () => {
-      const { items, cursor } = extractDialogueChunkDelta(partial, speechCursor)
+      const { items, cursor } = extractDialogueChunkDelta(partial, speechCursor, emotionPalette)
       speechCursor = cursor
       for (const it of items) {
-        if (!pendingBlock) { pendingBlock = { texts: [it.text], emotion: it.emotion }; continue }
+        // 台词模式：先剥括号再入块；纯括号项剥空即跳过（不出语音、不进块）
+        const text = maybeStrip(it.text).trim()
+        if (!text) continue
+        if (!pendingBlock) { pendingBlock = { texts: [text], emotion: it.emotion }; continue }
         if (it.emotion !== pendingBlock.emotion || pendingBlock.texts.length >= BLOCK_MAX_ITEMS) {
           flushPendingBlock()
-          pendingBlock = { texts: [it.text], emotion: it.emotion }
+          pendingBlock = { texts: [text], emotion: it.emotion }
         } else {
-          pendingBlock.texts.push(it.text)
+          pendingBlock.texts.push(text)
         }
       }
     }
@@ -399,11 +436,11 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
           reasoningText += chunk
         },
       })
-      parsed = parseDialogueJson(stripThink(rawOutput))
+      parsed = parseDialogueJson(maybeStrip(stripThink(rawOutput)), emotionPalette)
       if (!parsed.text.trim() && reasoningText.trim()) {
         // content 通道为空但思考通道有内容：模型可能把最终 JSON 写进思考里了。
         // 能完整解析出正文就直接用，免去一次完整重试（首回复延迟减半）。
-        const salvaged = salvageDialogueFromText(reasoningText)
+        const salvaged = salvageDialogueFromText(reasoningText, emotionPalette)
         if (salvaged) {
           console.log('[chat] content 为空，已从思考通道提取到回复（免重试）')
           parsed = salvaged
@@ -437,15 +474,17 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     flushChunks()
     // 结算最后一个未闭合的情绪块
     flushPendingBlock()
-    // 未触发"边生成边读"时兜底：整段文本生成完毕后触发语音
+    // 未触发"边生成边读"时兜底：整段文本生成完毕后触发语音。
+    // 输入与重试循环内的主解析保持同构（同样剥思考包裹），否则带思考包裹的输出会在这里
+    // 解析失败 → extractEmotion 兜底把原始 JSON/思考文本当正文送进 TTS（2026-10-02 线上案例）
     if (!speechEmitted && voiceActive && card) {
-      const parsed = parseDialogueJson(rawOutput)
+      const parsed = parseDialogueJson(maybeStrip(stripThink(rawOutput)), emotionPalette)
       const langOverride = card.ttsOverride?.language ?? null
       const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
       if (mergeSpeech) {
-        // 兜底投放同样剥掉已前置上屏的开头旁白，剥空（整条回复全是前置旁白）则不发声
+        // 兜底投放同样剥掉已前置上屏的开头旁白 + 纯括号块不朗读（剥空即整段无台词，跳过）
         const mergedText = consumeLeadingNarration(parsed.text, narrationGroups, narrationCursor)
-        if (mergedText.trim()) {
+        if (stripParenGroups(mergedText).trim() && mergedText.trim()) {
           windowManager.speak(mergedText, voiceId, langOverride, {
             chunks: [{ text: mergedText, emotion: parsed.emotion }],
             follow: true,
@@ -456,7 +495,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       } else {
         for (const c of parsed.chunks) {
           const chunkText = consumeLeadingNarration(c.text, narrationGroups, narrationCursor)
-          if (!chunkText.trim()) continue // 纯前置旁白块：旁白已上屏，无需合成
+          if (!stripParenGroups(chunkText).trim()) continue // 纯括号块：旁白/描写不朗读
           windowManager.speak(chunkText, voiceId, langOverride, { chunks: [{ text: chunkText, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride })
         }
       }
@@ -465,6 +504,18 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     // 持久化：user 消息 + assistant 完整回复（剧情轮次写 run 文件，普通聊天写会话）
     const now = Date.now()
     console.log('[thinking] parseDone needExitThinking=%s voiceActive=%s speechEmitted=%s', needExitThinking, voiceActive, speechEmitted)
+    // 情绪依从统计（词表微调 P2a 观测）：模型输出的原始 emotion 命中词表/别名接住的比例，
+    // 无效值回落默认词单独计数——回落率持续偏高说明词表需要精简或释义不清（纯日志，零行为影响）
+    const rawEmotions = parsed!.rawEmotions
+    if (rawEmotions.length > 0) {
+      const miss = rawEmotions.filter((r) => emotionAdherence(r, emotionPalette) === 'miss').length
+      console.log(
+        '[chat] 情绪依从：%d/%d 命中词表%s',
+        rawEmotions.length - miss,
+        rawEmotions.length,
+        miss > 0 ? `（回落默认词 ${miss} 次）` : '',
+      )
+    }
     if (!store && needExitThinking && !voiceActive) {
       needExitThinking = false
       console.log('[thinking] no-voice fallback: exit thinking')
@@ -508,7 +559,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     try {
       const failedUser: ChatMessage = { ...userMsg, error: message }
       const extra: ChatMessage[] = [failedUser]
-      if (partial) extra.push({ role: 'assistant', content: extractStreamingJsonText(partial), timestamp: Date.now() })
+      if (partial) extra.push({ role: 'assistant', content: maybeStrip(extractStreamingJsonText(partial)), timestamp: Date.now() })
       if (store) await store.append(extra)
       else await appendSessionMessages(sessionId, extra)
     } catch {

@@ -6,11 +6,18 @@
  * 任何差异（文本漂移、段落顺序变化、空段处理差异）都会使脚本以非零码退出。
  */
 import type { CharacterCard, CharacterPersona, MemoryItem } from '../src/types'
-import { buildSystemParts, PROACTIVE_HINT_PROMPT } from '../electron/services/prompt/sections'
+import { buildSystemParts, PROACTIVE_HINT_PROMPT, DIALOGUE_ONLY_PROMPT } from '../electron/services/prompt/sections'
 import { composeSystemPrompt } from '../electron/services/prompt/composer'
 
 // ---------- 参考实现（重构前 buildSystemPrompt 的逐字节拷贝，禁止修改） ----------
 
+/**
+ * 参考实现 emotion 段（内置最小词表变体，2026-10-03 P2a 词表微调后同步）：
+ * 词表方案重构后 emotion 段永远按词表生成；未打标立绘集/未绑定 = 内置最小词表（仅"平静"）。
+ * P2a 变更：硬性规定新增「对象数组形态禁止纯字符串」「括号成对闭合」两条契约；
+ * 旁白规范条目补「同项混合形态（括号后台词，emotion 取台词情绪）」；示例第 3 项改为混合形态。
+ * 文本必须与 sections.buildEmotionPrompt(builtinPalette()) 逐字节一致。
+ */
 const REF_EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背）】
 你的【整条回复都必须且只能是】一个 JSON 对象，除此之外【一个字都不能多输出】——
 不要任何解释、序号、问候、开场白、后记，也不要 markdown 代码块包裹，直接输出 JSON 本体。
@@ -24,19 +31,24 @@ const REF_EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背�
 硬性规定：
 - 只有一个顶层键 "dialogue"，它是数组，通常 2~6 项，每项是一个情绪/语义节奏。
 - 每一项必须同时有 "text" 与 "emotion" 两个字段，缺一不可。"emotion" 不得缺省。
-- "emotion" 只能取下列 6 个之一：
-  neutral(平静) / happy(开心) / sad(难过) / angry(生气) / surprised(惊讶) / shy(害羞)
-  匹配不到时：担心/紧张→sad，亲近/撒娇→happy。
-- 心理活动、动作、环境、第三人称旁白等"不发声"的内容，必须写进 "text" 的（）内；台词与旁白可各占一项。
+- "emotion" 只能从本角色的情绪表中选取（共 1 个）：
+  平静(从容放松)
+  匹配不到时：使用 平静(从容放松)。
+- 心理活动、动作、环境、第三人称旁白等"不发声"的内容，必须写进 "text" 的（）内；台词与旁白可各占一项，也可以在同一项里先括号后台词（emotion 取台词的情绪）。
 - 情绪转折就另起一项写对应 emotion；同情绪连续的多项会被系统自动合并，不会重复切换。
 - 即使你想输出问候、解释或额外旁白，也都只能放进 "text"，绝不允许出现在 JSON 之外。
+- JSON 结构字符必须用半角符号：引号 " 、冒号 : 、逗号 , 、花括号 { }、方括号 [ ]。
+  严禁用全角符号（：”“ ，｛｝【】）替代，也严禁给 "text"/"emotion" 的值漏写引号；
+  台词文本内容内部不受此限制。
+- "dialogue" 数组的每一项必须是 {"text":"…","emotion":"…"} 对象，禁止把元素写成纯字符串，禁止输出数组以外的内容。
+- "text" 内如使用圆括号（）包裹旁白/动作描写，左右括号必须成对完整闭合，不得漏写右括号。
 
 示例（你唯一允许的输出形态，前后无任何多余字符）：
 {"dialogue":[
-  {"text":"……你终于来了。","emotion":"shy"},
-  {"text":"（心跳漏了一拍，站在原地）","emotion":"neutral"},
-  {"text":"我等了好久，还以为你不来了……","emotion":"sad"},
-  {"text":"不过、现在看到你，就都好了。","emotion":"happy"}
+  {"text":"……你终于来了。","emotion":"平静"},
+  {"text":"（心跳漏了一拍，站在原地）","emotion":"平静"},
+  {"text":"（快步走到门口，却又停住脚步）这次、这次你要去哪里？","emotion":"平静"},
+  {"text":"不过、现在看到你，就都好了。","emotion":"平静"}
 ]}`
 
 const REF_PARAGRAPH_PROMPT = `【节拍/分段规范（作用于上方 JSON 的 "text" 字段内部）】
@@ -71,10 +83,17 @@ const REF_NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON 的 
   虽然嘴上在找借口，但手指却悄悄收紧了   错误（会被误读）
 - 括号内容仅供阅读与演出，绝不朗读；你的"台词"应简短、口语，是真正能用嘴唇说出来的话。
 - 【动作归属】（括号）动作的归属以消息归属为准：你发出的消息里的动作是你做的，对方消息里的动作是对方做的。回忆此前互动时不要因人称"你"而改变归属——例如你写过"戳了戳对方的手心"，事后回忆仍是你戳了对方，绝不是对方戳了你。
+- 【动作一致性】括号内的动作必须发生在"此刻"：先确认你们现在在哪里、正在做什么（走路/坐着/站着），动作只能使用场景中真实存在的物件，不得与当前状态矛盾。错误示范（✗ 禁止照抄）：你们正在海边散步，却写"（偷偷把小指勾进他的手指里，尾巴卷住椅子腿）"——走路时没有椅子；正确写法如"（走在海堤上，风吹得尾巴乱了，耳朵压得低低的）"。动作要贴合"你们此刻正在做的事"，不要套用与当前情境无关的固定动作模板。
 - 每项 "text" 的 "emotion" 字段即该节拍的立绘/表情；情绪转折时另起一项并写对应 emotion。`
 
 function refNormalizeMemoryPerspective(text: string): string {
   return text.split('用户').join('对方').split('角色').join('你')
+}
+
+/** 角色名 → 「你」（与新实现 applyCardNameToYou 镜像：第三人称档案体的注入侧回转） */
+function refApplyCardNameToYou(text: string, cardName: string | undefined): string {
+  const name = cardName?.trim()
+  return name ? text.split(name).join('你') : text
 }
 
 type Persona = CharacterCard['persona']
@@ -164,7 +183,9 @@ function referenceBuildSystemPrompt(
 
   const byCategory = (cat: MemoryItem['category']) => memories.filter((m) => m.category === cat)
   const pushMemories = (title: string, note: string, cat: MemoryItem['category']) => {
-    const lines = byCategory(cat).map((m, i) => `${i + 1}. ${refNormalizeMemoryPerspective(m.content)}`)
+    const lines = byCategory(cat).map(
+      (m, i) => `${i + 1}. ${refNormalizeMemoryPerspective(refApplyCardNameToYou(m.content, card?.name))}`,
+    )
     if (lines.length > 0) parts.push(`## ${title}：${note}\n${lines.join('\n')}`)
   }
   pushMemories('对方的信息', '以下信息均属于对话对象（对方），不属于你', 'user_info')
@@ -234,11 +255,8 @@ const fullCard: CharacterCard = {
   voiceMode: 'none',
   genieOverride: null,
   ttsOverride: null,
-  modelOverride: null,
   renderMode: null,
   spriteId: null,
-  emotionMap: null,
-  live2dExpressionMap: null,
   avatar: null,
   createdAt: 0,
   updatedAt: 0,
@@ -253,6 +271,11 @@ const fixtures: Fixture[] = [
     mem('m4', 'user_info', '角色养的猫叫小雪'),
   ] },
   { name: '%player% 占位符替换', card: fullCard, memories: [], userName: '小海' },
+  { name: '第三人称档案体记忆（角色名→你、用户→对方）', card: fullCard, memories: [
+    mem('m8', 'promises', '测试角色答应陪用户去看流星雨'),
+    mem('m9', 'user_info', '用户喜欢夜跑'),
+    mem('m10', 'long_term', '测试角色和用户一起完成了第一次演出'),
+  ] },
   { name: '空串/空白记忆与空白人设字段过滤', card: { ...fullCard, persona: { anchor: '  ', inner: { desire: '', fear: '', conflict: '', selfView: '' } } as Persona, messageExample: '   ' }, memories: [
     mem('m5', 'user_info', '   '),
     mem('m6', 'long_term', '有效记忆内容'),
@@ -263,6 +286,71 @@ const fixtures: Fixture[] = [
 
 function main(): number {
   let failed = 0
+  // 台词模式（stripParenNarration）为新增能力：验证旁白规范段被替换为禁括号版本，其余正文与金样一致
+  {
+    const reference = referenceBuildSystemPrompt(fullCard, [], '用户')
+    const parts = buildSystemParts(fullCard, [], null, false, null, true)
+    const narration = parts.find((s) => s.id === 'format.narration')
+    if (!narration || narration.text !== DIALOGUE_ONLY_PROMPT) {
+      console.error('[FAIL] 台词模式段落注入（新能力）: format.narration 段未替换为 DIALOGUE_ONLY_PROMPT')
+      failed++
+    } else {
+      const actual = composeSystemPrompt(parts, { userName: '用户' }).text
+      const expected = reference.replace(REF_NARRATION_PROMPT, DIALOGUE_ONLY_PROMPT)
+      if (actual !== expected) {
+        console.error('[FAIL] 台词模式段落注入（新能力）: 除旁白规范段外的正文与金样不一致')
+        failed++
+      } else {
+        console.log('[PASS] 台词模式段落注入（新能力，非金样比对，仅验证替换与拼接）')
+    }
+  }
+  // 情绪词表注入（新能力，非金样比对）：词表启用时 emotion 段按角色词表生成，其余正文与金样逐字节一致
+  {
+    const palette = {
+      entries: [
+        { name: '傲娇', gloss: '嘴硬心软' },
+        { name: '得意', gloss: '炫耀的口吻' },
+        { name: '平静', gloss: '从容放松' },
+      ],
+      defaultEmotion: '平静',
+    }
+    const parts = buildSystemParts(fullCard, [], null, false, null, false, palette)
+    const emotion = parts.find((s) => s.id === 'emotion')
+    if (!emotion) {
+      console.error('[FAIL] 情绪词表注入（新能力）: emotion 段缺失')
+      failed++
+    } else {
+      const checks: Array<[boolean, string]> = [
+        [emotion.text.includes('傲娇(嘴硬心软)'), '缺词表值域行'],
+        [emotion.text.includes('使用 平静(从容放松)'), '缺默认情绪兜底行'],
+        [!emotion.text.includes('只能取下列 6 个之一'), '仍含旧 6 枚举值域块'],
+        [!emotion.text.includes('"emotion":"shy"'), '示例情绪未替换为词表词'],
+        [emotion.text.includes('"emotion":"傲娇"'), '示例情绪未用词表词'],
+        // P2a 契约强化（2026-10-03）：针对纯字符串数组变体与漏右括号两次线上事故的 prompt 端防线
+        [emotion.text.includes('禁止把元素写成纯字符串'), '缺对象数组形态契约'],
+        [emotion.text.includes('不得漏写右括号'), '缺括号成对闭合契约'],
+        [emotion.text.includes('（快步走到门口，却又停住脚步）这次、这次你要去哪里？'), '示例缺混合形态（括号后台词）'],
+      ]
+      let localFailed = 0
+      for (const [ok, msg] of checks) {
+        if (!ok) {
+          console.error('[FAIL] 情绪词表注入（新能力）: ' + msg)
+          localFailed++
+        }
+      }
+      // 结构等价：把词表 emotion 段换回参考实现后，全文与金样逐字节一致
+      const actual = composeSystemPrompt(parts, { userName: '用户' }).text
+      const normalized = actual.replace(emotion.text, REF_EMOTION_PROMPT)
+      const reference = referenceBuildSystemPrompt(fullCard, [], '用户')
+      if (normalized !== reference) {
+        console.error('[FAIL] 情绪词表注入（新能力）: 除 emotion 段外正文与金样不一致')
+        localFailed++
+      }
+      if (localFailed === 0) console.log('[PASS] 情绪词表注入（新能力，非金样比对，仅验证替换与拼接）')
+      failed += localFailed
+    }
+  }
+  }
   for (const fx of fixtures) {
     const reference = referenceBuildSystemPrompt(fx.card, fx.memories, fx.userName ?? '用户')
     const actual = newBuildSystemPrompt(fx.card, fx.memories, fx.userName ?? '用户', fx.profileDigest, fx.proactiveHint)

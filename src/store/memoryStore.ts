@@ -13,7 +13,7 @@ interface MemoryState {
   loadPending: () => Promise<void>
   /** 手动新增（confirmed=true），输入内容/分类/归属角色（null=全局背景） */
   add: (input: { content: string; category: MemoryCategory; characterCardId: string | null }) => Promise<boolean>
-  update: (id: string, patch: { content?: string; category?: MemoryCategory }) => Promise<boolean>
+  update: (id: string, patch: { content?: string; category?: MemoryCategory; enabled?: boolean }) => Promise<boolean>
   /** 确认待确认候选 → 移入已确认 */
   confirm: (id: string) => Promise<boolean>
   remove: (id: string) => Promise<boolean>

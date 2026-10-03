@@ -128,6 +128,8 @@ export function registerWindowIpc(): void {
   })
   ipcMain.on('chat:renderer-ready', () => {
     windowManager.resendVoiceMode('chat')
+    // 朗读状态必须在 voiceMode 之后补发：onVoiceMode 处理器会清空朗读文本
+    windowManager.resendReadingState('chat')
     windowManager.resendActiveSession('chat')
   })
 

@@ -9,24 +9,26 @@ import type {
   CharacterCard,
   CharacterCardInput,
   CharacterPersona,
-  CharacterSprite,
   ChatMessage,
+  EmotionPaletteRef,
   Live2DModelMeta,
   MemoryCategory,
   MemoryItem,
+  ModelPalette,
   ModelSettings,
   SessionDetail,
   SessionIndexItem,
   TTSModelCard,
   TTSModelCardInput,
 } from '../../src/types'
-import { CHARACTER_CARD_VERSION } from '../../src/types'
+import { CHARACTER_CARD_VERSION, BUILTIN_DEFAULT_EMOTION, BUILTIN_DEFAULT_GLOSS, builtinPalette, paletteFromSprite } from '../../src/types'
+import type { CharacterSprite, SpritePaletteEntry } from '../../src/types'
 import { paths, readJson, writeJson, mutateJson, deleteFile, fileExists } from './storage'
 import { buildSystemParts } from './prompt/sections'
 import { composeSystemPrompt } from './prompt/composer'
 
 // 提示词段落符号已平移至 services/prompt/（纯函数模块），此处保留旧引用路径的导出
-export { EMOTION_PROMPT, PARAGRAPH_PROMPT, NARRATION_PROMPT, buildPersonaSections, normalizeMemoryPerspective } from './prompt/sections'
+export { PARAGRAPH_PROMPT, NARRATION_PROMPT, buildPersonaSections, normalizeMemoryPerspective } from './prompt/sections'
 
 export function genId(prefix: string): string {
   return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`
@@ -123,12 +125,9 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     voiceMode: raw.voiceMode ?? (raw.voiceId ? 'mimo' : 'none'),
     genieOverride: raw.genieOverride ?? null,
     ttsOverride: raw.ttsOverride ?? null,
-    modelOverride: raw.modelOverride ?? null,
     // 形象呈现（2D 立绘）；旧卡缺省 → Live2D 模式、未绑立绘
     renderMode: raw.renderMode ?? null,
     spriteId: raw.spriteId ?? null,
-    emotionMap: raw.emotionMap ?? null,
-    live2dExpressionMap: raw.live2dExpressionMap ?? null,
     avatar: raw.avatar ?? null,
     createdAt: raw.createdAt ?? now,
     updatedAt: raw.updatedAt ?? now,
@@ -158,11 +157,8 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     voiceMode: input.voiceMode ?? (input.voiceId ? 'mimo' : 'none'),
     genieOverride: input.genieOverride ?? null,
     ttsOverride: input.ttsOverride ?? null,
-    modelOverride: input.modelOverride ?? null,
     renderMode: input.renderMode ?? null,
     spriteId: input.spriteId || null,
-    emotionMap: input.emotionMap ?? null,
-    live2dExpressionMap: input.live2dExpressionMap ?? null,
     avatar: input.avatar ?? null,
     createdAt: now,
     updatedAt: now,
@@ -192,7 +188,8 @@ export async function removeCharacterCard(id: string): Promise<void> {
 
 const DEFAULT_MEMORIES: MemoryItem[] = []
 
-/** 归一化记忆条目：补齐 category/characterCardId/confirmed/sourceSessionId 缺省值（兼容旧数据） */
+/** 归一化记忆条目：补齐 category/characterCardId/confirmed/sourceSessionId 缺省值（兼容旧数据）。
+ *  注意保留可选字段 origin（剧情沉淀标记）与 enabled（注入开关）——显式字段清单重建对象时漏掉即静默丢失 */
 function normalizeMemory(raw?: Partial<MemoryItem> | null): MemoryItem {
   return {
     id: raw?.id ?? genId('mem'),
@@ -202,6 +199,8 @@ function normalizeMemory(raw?: Partial<MemoryItem> | null): MemoryItem {
     characterCardId: raw?.characterCardId ?? null,
     confirmed: raw?.confirmed ?? true,
     sourceSessionId: raw?.sourceSessionId ?? null,
+    ...(raw?.origin ? { origin: raw.origin } : {}),
+    ...(raw?.enabled === undefined ? {} : { enabled: raw.enabled }),
   }
 }
 
@@ -213,10 +212,13 @@ export async function listMemories(): Promise<MemoryItem[]> {
 /**
  * 列出指定角色的已确认记忆（含全局背景 characterCardId=null，兼容旧数据），
  * 用于 system prompt 注入；按创建时间倒序后截取前 limit 条。
+ * enabled=false 的条目暂停注入（用户开关），但不删除。
  */
 export async function listConfirmedMemories(cardId: string, limit?: number): Promise<MemoryItem[]> {
   const items = await listMemories()
-  const owned = items.filter((m) => m.confirmed && (m.characterCardId === cardId || m.characterCardId === null))
+  const owned = items.filter(
+    (m) => m.confirmed && m.enabled !== false && (m.characterCardId === cardId || m.characterCardId === null),
+  )
   return limit && limit > 0 ? owned.slice(0, limit) : owned
 }
 
@@ -252,6 +254,8 @@ export async function addPendingMemory(input: {
   category: MemoryCategory
   characterCardId: string | null
   sourceSessionId?: string | null
+  /** 记忆来源标记：'story' = 剧情经历沉淀（缺省 = 对话沉淀/手动添加） */
+  origin?: 'story'
 }): Promise<MemoryItem> {
   const text = input.content.trim()
   if (!text) throw new Error('记忆内容不能为空')
@@ -263,13 +267,14 @@ export async function addPendingMemory(input: {
     characterCardId: input.characterCardId,
     confirmed: false,
     sourceSessionId: input.sourceSessionId ?? null,
+    ...(input.origin ? { origin: input.origin } : {}),
   }
   await mutateJson(paths.memoryFile, DEFAULT_MEMORIES, (items) => [item, ...items])
   return item
 }
 
-/** 更新记忆内容或分类（部分更新） */
-export async function updateMemory(id: string, patch: { content?: string; category?: MemoryCategory }): Promise<void> {
+/** 更新记忆内容、分类或注入开关（部分更新；enabled=false = 暂停注入，条目保留） */
+export async function updateMemory(id: string, patch: { content?: string; category?: MemoryCategory; enabled?: boolean }): Promise<void> {
   const nextPatch = { ...patch }
   if (nextPatch.content !== undefined) {
     const text = nextPatch.content.trim()
@@ -284,6 +289,7 @@ export async function updateMemory(id: string, patch: { content?: string; catego
       const update: Partial<MemoryItem> = {}
       if (nextPatch.content !== undefined) update.content = nextPatch.content
       if (nextPatch.category !== undefined) update.category = nextPatch.category
+      if (nextPatch.enabled !== undefined) update.enabled = nextPatch.enabled
       return { ...m, ...update }
     })
     if (!found) throw new Error('记忆条目不存在')
@@ -310,9 +316,29 @@ export async function removeMemory(id: string): Promise<void> {
 }
 
 /**
- * 分段组装 system prompt（PromptComposer 薄包装）。
- * 段落构造与文本内容全部在 services/prompt/ 中维护（纯函数，可金样测试）；
- * 此处只负责桥接数据层（卡片/记忆）与组装器，并为旧引用保留导出。
+ * 当前时间 Section（时间感知方案 A）：
+ * LLM 无内置时钟，任何"现在几点"都来自 prompt。此前时间只藏在 user 消息前缀里（隐含线索），
+ * 模型需要自己定位线索并做 24h→12h 制换算，曾出现 16:04 被说成"下午两点零四分"的换算幻觉。
+ * 升级为 system prompt 权威声明：含日期/星期/时刻，并直接给出 12 小时制表述免模型换算；
+ * buildSystemPrompt 每轮调用 → 时间自然刷新。金样测试不受影响（金样直接测
+ * buildSystemParts/composeSystemPrompt，本函数仅在 repository 组装层拼接）。
+ */
+function currentTimeSection(now = new Date()): string {
+  const week = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'][now.getDay()]
+  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const h = now.getHours()
+  const hour12 = h % 12 === 0 ? 12 : h % 12
+  const period = h < 6 ? '凌晨' : h < 12 ? '上午' : h < 13 ? '中午' : h < 18 ? '下午' : '晚上'
+  const minute = now.getMinutes() === 0 ? '整' : `${String(now.getMinutes()).padStart(2, '0')}分`
+  return [
+    `【当前真实时间】${date} ${week} ${hhmm}（${period}${hour12}点${minute}）。`,
+    '对话中提到"现在""今天""刚才"等时刻一律以此为准；历史消息中的时间是过去的时刻，不代表现在。',
+  ].join('\n')
+}
+
+/**
+ * 分段组装 system prompt（PromptComposer 薄包装，末尾前置当前时间 Section）。
  *
  * @param card 角色卡（取人设字段）
  * @param memories 参与注入的记忆列表（来源由检索器决定：向量检索 or 最近 N 条）
@@ -320,6 +346,8 @@ export async function removeMemory(id: string): Promise<void> {
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；缺省不注入）
  * @param proactiveHint 是否注入主动搭话常驻说明（enableProactive 开启时为 true）
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入）
+ * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：旁白规范段替换为禁括号版本
+ * @param emotionPalette 角色绑定的情绪词表（null = 未启用词表，输出格式段维持旧 6 枚举金样原文）
  */
 export function buildSystemPrompt(
   card: CharacterCard | null,
@@ -328,9 +356,13 @@ export function buildSystemPrompt(
   profileDigest?: string | null,
   proactiveHint?: boolean,
   storyDirective?: string | null,
+  stripParenNarration?: boolean,
+  emotionPalette?: EmotionPaletteRef | null,
 ): string {
-  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint, storyDirective)
-  return composeSystemPrompt(sections, { userName }).text
+  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint, storyDirective, stripParenNarration, emotionPalette)
+  const composed = composeSystemPrompt(sections, { userName }).text
+  // 时间 Section 置于最前：模型先建立"现在"的锚点，再读画像/人设/记忆
+  return `${currentTimeSection()}\n\n${composed}`
 }
 
 // ---------------- 会话 ----------------
@@ -513,15 +545,167 @@ export async function removeSprite(spriteId: string): Promise<void> {
   await deleteFile(paths.spriteDir(spriteId))
 }
 
-/** 更新立绘集的展示资产：情绪→立绘图映射 / 说话立绘 / 思考立绘 */
+/** 更新立绘集的展示资产：情绪词表 / 经典情绪映射 / 说话立绘 / 思考立绘 / 名称 */
 export async function updateSprite(
   spriteId: string,
-  patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
+  patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>,
 ): Promise<void> {
   assertValidResourceId(spriteId, 'sprite')
   await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) =>
     list.map((s) => (s.id === spriteId ? { ...s, ...patch } : s)),
   )
+}
+
+/**
+ * 读取立绘集的情绪词表视图（系统内唯一取词表入口，永不返回 null）：
+ * 立绘集不存在 / 未打标 → 内置最小词表（仅"平静"）。
+ */
+export async function getSpritePalette(spriteId: string | null | undefined): Promise<EmotionPaletteRef> {
+  if (spriteId) {
+    try {
+      const spr = (await listSprites()).find((s) => s.id === spriteId)
+      if (spr) return paletteFromSprite(spr)
+    } catch {
+      // 读取失败按未打标处理
+    }
+  }
+  return builtinPalette()
+}
+
+// ---------------- Live2D 模型演出词表（data/model-palettes.json，与立绘集词表双轨对等） ----------------
+
+/** 模型词表存储形态：modelId → { entries }（纯「词→表情」映射，无默认情绪） */
+type ModelPaletteStore = Record<string, ModelPalette>
+
+/**
+ * 读取 Live2D 模型演出词表视图（live2d 模式取词表入口，永不返回 null）：
+ * 模型不存在 / 未配置词表 → 内置最小词表（仅"平静"，无表情联动，回落静态表情）。
+ * 模型词表无默认情绪概念：归一化兜底词固定取「平静」（在表内）或第一个词条，
+ * 与 prompt 契约一致；未命中词条的情绪在渲染端不联动表情（查表落空 → 回落静态表情）。
+ */
+export async function getModelPalette(modelId: string | null | undefined): Promise<EmotionPaletteRef> {
+  if (modelId) {
+    try {
+      const store = await readJson<ModelPaletteStore>(paths.modelPalettesFile, {})
+      const palette = store[modelId]
+      if (palette && Array.isArray(palette.entries) && palette.entries.length > 0) {
+        // 兜底词：平静（在表内）> 第一个词条（与 paletteFromSprite 的缺省口径一致）
+        const names = new Set(palette.entries.map((e) => e.name))
+        const def = names.has(BUILTIN_DEFAULT_EMOTION) ? BUILTIN_DEFAULT_EMOTION : palette.entries[0]!.name
+        return { entries: palette.entries.map((e) => ({ name: e.name, gloss: e.gloss })), defaultEmotion: def }
+      }
+    } catch {
+      // 读取失败按未配置处理
+    }
+  }
+  return builtinPalette()
+}
+
+/** 读取模型词表原始数据（编辑器用，含 expression；未配置返回 null） */
+export async function readModelPalette(modelId: string): Promise<ModelPalette | null> {
+  const store = await readJson<ModelPaletteStore>(paths.modelPalettesFile, {})
+  return store[modelId] ?? null
+}
+
+/** 保存 Live2D 模型演出词表（全量写回；词表空 = 删除该模型的词表配置，运行时落内置最小词表） */
+export async function updateModelPalette(modelId: string, palette: ModelPalette): Promise<void> {
+  await mutateJson<ModelPaletteStore>(paths.modelPalettesFile, {}, (store) => {
+    const next: ModelPaletteStore = { ...store }
+    if (Array.isArray(palette.entries) && palette.entries.length > 0) {
+      next[modelId] = {
+        entries: palette.entries
+          .filter((e) => e.name.trim())
+          .map((e) => ({
+            name: e.name.trim(),
+            gloss: e.gloss?.trim?.() ?? '',
+            ...(e.expression?.trim() ? { expression: e.expression.trim() } : {}),
+          })),
+      }
+    } else {
+      delete next[modelId]
+    }
+    return next
+  })
+}
+
+/** 删除模型时清理其词表配置（models 删除链路调用） */
+export async function deleteModelPalette(modelId: string): Promise<void> {
+  await mutateJson<ModelPaletteStore>(paths.modelPalettesFile, {}, (store) => {
+    if (!(modelId in store)) return store
+    const next: ModelPaletteStore = { ...store }
+    delete next[modelId]
+    return next
+  })
+}
+
+/**
+ * 旧 6 枚举 → 词表词的迁移映射（含释义）。neutral 缺失时词表默认取第一个词条。
+ */
+const LEGACY_EMOTION_MIGRATION: Record<string, { name: string; gloss: string }> = {
+  neutral: { name: BUILTIN_DEFAULT_EMOTION, gloss: BUILTIN_DEFAULT_GLOSS },
+  happy: { name: '开心', gloss: '愉悦雀跃' },
+  sad: { name: '难过', gloss: '低落委屈' },
+  angry: { name: '生气', gloss: '愤怒恼火' },
+  surprised: { name: '惊讶', gloss: '吃惊意外' },
+  shy: { name: '害羞', gloss: '脸红羞涩' },
+}
+
+/**
+ * 一次性迁移（启动调用）：立绘集旧 emotionMap（6 枚举→图）→ emotions 词表条目，
+ * 并从数据中剥离 emotionMap 字段。已迁移/无旧映射的集不动（词表为空 = 内置最小词表）。
+ * @returns 发生迁移的立绘集数量（仅日志用）
+ */
+export async function migrateSpriteEmotionMaps(): Promise<number> {
+  const list = await readJson<Partial<CharacterSprite>[]>(paths.spritesIndexFile, [])
+  let migrated = 0
+  let changed = false
+  const next = list.map((raw) => {
+    if (!raw || typeof raw !== 'object' || !('emotionMap' in raw)) return raw
+    changed = true
+    const spr = raw as Record<string, unknown>
+    const legacyMap = spr['emotionMap'] as Record<string, string> | null | undefined
+    delete spr['emotionMap']
+    const hasPalette = Array.isArray(raw.emotions) && raw.emotions.length > 0
+    if (hasPalette || !legacyMap || typeof legacyMap !== 'object') return spr as unknown as CharacterSprite
+    // emotionMap → 词表条目（按旧 6 枚举固定顺序，跳过未配置项）
+    const entries: SpritePaletteEntry[] = []
+    for (const key of ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy']) {
+      const image = legacyMap[key]
+      if (!image) continue
+      const { name, gloss } = LEGACY_EMOTION_MIGRATION[key] ?? { name: key, gloss: '' }
+      entries.push({ name, gloss, image })
+    }
+    if (entries.length === 0) return spr as unknown as CharacterSprite
+    spr['emotions'] = entries
+    spr['defaultEmotion'] =
+      legacyMap['neutral'] && entries.some((e) => e.name === BUILTIN_DEFAULT_EMOTION)
+        ? BUILTIN_DEFAULT_EMOTION
+        : entries[0]!.name
+    migrated++
+    console.log('[migrate] 立绘集 emotionMap → 词表：%s（%d 词条）', raw.name ?? raw.id, entries.length)
+    return spr as unknown as CharacterSprite
+  })
+  if (changed) await writeJson(paths.spritesIndexFile, next)
+  return migrated
+}
+
+/**
+ * 计算词表内容指纹（djb2 十六进制）：词/释义与顺序任一变化都会改变指纹。
+ * 用于剧本 story.yaml 的 vocabHash 比对（打开剧本时检测"词表已变"）。
+ * 指纹仅覆盖 name+gloss——vocabHash 的语义是「事件引用的情绪词是否仍有效」，
+ * 演出物（立绘图/表情绑定）变化不影响词的有效性，不参与指纹。
+ */
+export function paletteHash(palette: EmotionPaletteRef): string | null {
+  if (!palette || palette.entries.length === 0) return null
+  let hash = 5381
+  const feed = (s: string) => {
+    for (let i = 0; i < s.length; i++) hash = ((hash * 33) ^ s.charCodeAt(i)) & 0xffffffff
+  }
+  feed(palette.defaultEmotion)
+  for (const e of palette.entries) {
+    feed(`|${e.name}|${e.gloss}`)
+  }
+  return (hash >>> 0).toString(16)
 }
 
 // ---------------- 设置 ----------------
@@ -540,6 +724,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableMemoryExtraction: true,
   // 主动搭话：默认关闭（调度循环每 30s 一轮；需用户显式开启）
   enableProactive: false,
+  // 回答仅含台词：普通聊天不生成也不显示（）内的心理/动作/环境描写（默认关闭 = 保留现状）
+  stripParenNarration: false,
   // 屏幕感知：默认关闭（与主动搭话级联；开启后搭话前先感知屏幕内容）
   enableScreenSense: false,
   // 每日主动搭话上限（用户回复后重置计数）
@@ -586,6 +772,7 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.contextWindowTokens !== undefined) next.contextWindowTokens = patch.contextWindowTokens
     if (patch.enableAutoCompact !== undefined) next.enableAutoCompact = patch.enableAutoCompact
     if (patch.enableMemoryExtraction !== undefined) next.enableMemoryExtraction = patch.enableMemoryExtraction
+    if (patch.stripParenNarration !== undefined) next.stripParenNarration = patch.stripParenNarration
     if (patch.enableProactive !== undefined) next.enableProactive = patch.enableProactive
     if (patch.enableScreenSense !== undefined) next.enableScreenSense = patch.enableScreenSense
     if (patch.maxProactivePerDay !== undefined) next.maxProactivePerDay = Math.max(0, Math.floor(patch.maxProactivePerDay))

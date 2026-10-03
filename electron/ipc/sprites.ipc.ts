@@ -12,6 +12,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import type { CharacterSprite, CharacterSpriteImage } from '../../src/types'
 import { addSprite, genId, listSprites, removeSprite, updateSprite } from '../services/repository'
+import { annotateSpriteSet } from '../services/spriteAnnotation'
 import { paths } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
@@ -69,7 +70,8 @@ export function registerSpritesIpc(): void {
       id: spriteId,
       name: path.basename(srcDir) || spriteId,
       images: copiedImages,
-      emotionMap: null,
+      emotions: [],
+      defaultEmotion: '',
       speakingImage: null,
       thinkingImage: null,
       createdAt: Date.now(),
@@ -87,9 +89,14 @@ export function registerSpritesIpc(): void {
   ipcMain.handle('sprite:update', async (
     _e,
     spriteId: string,
-    patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>,
+    patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>,
   ) => {
     await updateSprite(spriteId, patch)
     windowManager.notifySpritesChanged()
+  })
+
+  /** 视觉打标：逐张生成情绪词建议（产物不落库，渲染端回填词表编辑器确认后经 sprite:update 保存） */
+  ipcMain.handle('sprite:annotate', async (_e, spriteId: string) => {
+    return annotateSpriteSet(spriteId)
   })
 }

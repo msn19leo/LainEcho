@@ -80,11 +80,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         api.app.setPetCard({
           cardId: detail.characterCardId,
           modelId: card?.modelId ?? null,
-          modelOverride: card?.modelOverride ?? null,
           renderMode: card?.renderMode ?? null,
           spriteId: card?.spriteId ?? null,
-          emotionMap: card?.emotionMap ?? null,
-          live2dExpressionMap: card?.live2dExpressionMap ?? null,
         })
       }
     } catch (err) {

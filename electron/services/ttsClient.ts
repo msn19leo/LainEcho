@@ -23,6 +23,10 @@ import type { TTSConfig } from '../../src/types'
 
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions'
 
+/** 合成请求超时（毫秒）：请求挂起时主动中断，避免桌宠端合成锁被长期占用导致语音流水线停摆。
+ *  取 60s：整段合音模式下长文本合成耗时较长，30s 可能误伤。 */
+const SYNTHESIS_TIMEOUT_MS = 60_000
+
 /** MiMo API 请求体（chat completions 变种） */
 interface MiMoRequestBody {
   model: string
@@ -98,34 +102,50 @@ export async function synthesizeWithMiMo(params: {
     stream: false,
   }
 
-  const response = await fetch(MIMO_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  })
+  // 超时保护：fetch 与响应体读取共用一个 AbortController，
+  // 超时后中断请求，防止无限等待占死上层合成锁
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), SYNTHESIS_TIMEOUT_MS)
 
-  if (!response.ok) {
-    // 解析错误消息，便于上层显示给用户
-    let errText = ''
-    try {
-      const errJson = (await response.json()) as MiMoResponseBody
-      errText = errJson.error?.message ?? ''
-    } catch {
-      errText = await response.text().catch(() => '')
+  try {
+    const response = await fetch(MIMO_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      // 解析错误消息，便于上层显示给用户
+      let errText = ''
+      try {
+        const errJson = (await response.json()) as MiMoResponseBody
+        errText = errJson.error?.message ?? ''
+      } catch {
+        errText = await response.text().catch(() => '')
+      }
+      throw new Error(`MiMo TTS 请求失败 (${response.status}): ${errText || response.statusText}`)
     }
-    throw new Error(`MiMo TTS 请求失败 (${response.status}): ${errText || response.statusText}`)
-  }
 
-  const json = (await response.json()) as MiMoResponseBody
-  const audioBase64 = json.choices?.[0]?.message?.audio?.data
-  if (!audioBase64) {
-    throw new Error('MiMo 返回数据缺少音频字段（choices[0].message.audio.data）')
-  }
+    const json = (await response.json()) as MiMoResponseBody
+    const audioBase64 = json.choices?.[0]?.message?.audio?.data
+    if (!audioBase64) {
+      throw new Error('MiMo 返回数据缺少音频字段（choices[0].message.audio.data）')
+    }
 
-  return base64ToArrayBuffer(audioBase64)
+    return base64ToArrayBuffer(audioBase64)
+  } catch (err) {
+    // 把 AbortError 转成可读的业务错误消息
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`MiMo TTS 请求超时（${SYNTHESIS_TIMEOUT_MS / 1000} 秒），已中断，请检查网络后重试`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** Node.js Buffer 转 base64 字符串（不带 data: 前缀） */

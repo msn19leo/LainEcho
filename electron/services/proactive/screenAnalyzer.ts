@@ -24,7 +24,7 @@ const VLM_MAX_TOKENS = 512
 const JPEG_QUALITY = 80
 
 /** 视觉模型配置（独立于主 LLM：visionBaseURL + 独立 Key + visionModel） */
-interface VisionConfig {
+export interface VisionConfig {
   baseURL: string
   apiKey: string
   model: string
@@ -33,8 +33,8 @@ interface VisionConfig {
 /** 转述缓存：上次转述文本 + 当时画面的 dhash + 时间 */
 let cache: { text: string; hash: boolean[]; at: number } | null = null
 
-/** 读取视觉模型配置；任一项缺失返回 null */
-async function resolveVisionConfig(): Promise<VisionConfig | null> {
+/** 读取视觉模型配置；任一项缺失返回 null（导出供立绘打标等其它 VLM 场景复用同一独立配置） */
+export async function resolveVisionConfig(): Promise<VisionConfig | null> {
   const settings = await getSettings()
   const apiKey = await readSecret(paths.visionApiKeyFile).catch(() => null)
   if (!settings.visionBaseURL.trim() || !settings.visionModel.trim() || !apiKey) return null

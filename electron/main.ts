@@ -3,8 +3,9 @@
  */
 import { app } from 'electron'
 import { ensureDataDirs } from './services/storage'
-import { pruneEmptySessions } from './services/repository'
+import { pruneEmptySessions, migrateSpriteEmotionMaps } from './services/repository'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
+import { migrateMemoryPerspectives } from './services/memoryExtraction'
 import { startProactiveScheduler } from './services/proactive/scheduler'
 import { ensureSampleStories } from './services/storyEngine/samples'
 import { registerPetSchemesPrivileged, registerPetProtocolHandler } from './services/petProtocol'
@@ -30,8 +31,12 @@ if (!gotLock) {
     registerAllIpc()
     windowManager.init()
 
-    // 记忆向量启动补偿：为缺失/模型过期的已确认记忆后台补嵌（未配置嵌入时静默跳过）
-    void compensateMissingVectors()
+    // 记忆人称迁移：把存量记忆一次性归一到第三人称档案体（{角色名}/用户），幂等；
+    // 迁移会删除被改写记忆的旧向量，完成后再跑补偿，按新文本重嵌
+    void migrateMemoryPerspectives().then(() => compensateMissingVectors())
+
+    // 立绘情绪迁移（一次性，幂等）：旧 emotionMap（6 枚举→图）→ 情绪词表条目并剥离旧字段
+    void migrateSpriteEmotionMaps().catch((err) => console.error('[migrate] 立绘情绪迁移失败', err))
 
     // 示例剧本：首次启动写入 data/stories/（已存在不覆盖）
     await ensureSampleStories().catch((err) => console.error('[story] 示例剧本写入失败', err))

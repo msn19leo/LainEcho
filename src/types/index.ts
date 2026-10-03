@@ -9,13 +9,15 @@ export type ChatRole = 'system' | 'user' | 'assistant'
 export interface EmotionSegment {
   /** 起始消息内句子索引（0 基，来自 splitSentences） */
   startSentence: number
-  emotion: StandardEmotion
+  /** 情绪词：词表方案的自由词（如"傲娇"），历史数据可能是旧 6 枚举 */
+  emotion: string
 }
 
 /** 语音合成分段：一次回复的一个"对话段"（JSON dialogue 一项），整段一次合成，段内不再按标点切碎 */
 export interface DialogueChunk {
   text: string
-  emotion: StandardEmotion
+  /** 情绪词：词表方案的自由词，历史数据可能是旧 6 枚举 */
+  emotion: string
 }
 
 /** 单条聊天消息（落盘到 sessions/{id}.json 的 messages 数组） */
@@ -54,10 +56,10 @@ export interface ChatMessage {
    */
   error?: string
   /**
-   * AI 回复的结构化情绪标签（仅 assistant 消息；缺省 = 未解析/平静）。
-   * 由主进程从回复末尾的 {@emotion:xxx} 标签解析并归一化到标准情绪。
+   * AI 回复的结构化情绪标签（仅 assistant 消息；缺省 = 未解析/默认情绪）。
+   * 词表方案下为自由情绪词（命中绑定立绘集的词表），历史数据为旧 6 枚举。
    */
-  emotion?: StandardEmotion
+  emotion?: string
   /** 按标点切分的句子序列（语音/朗读句级同步与高亮共用，仅 assistant 消息） */
   sentences?: string[]
   /** 句子级情绪切换点（内嵌 {@emo:xxx} 解析所得，仅 assistant 消息） */
@@ -82,14 +84,6 @@ export type CharacterVoiceMode = 'none' | 'genie' | 'mimo'
 export interface CharacterGenieOverride {
   /** 绑定的 TTS 模型卡 id */
   ttsModelId: string
-}
-
-/** 角色级模型设置覆盖：让同一 Live2D 模型在不同角色下有不同表情/待机动作。null 字段表示跟随全局 */
-export interface CharacterModelOverride {
-  /** null = 跟随全局；空串 = 清除表情 */
-  selectedExpression: string | null
-  /** null = 跟随全局；空串 = 无待机动作 */
-  idleAnimation: string | null
 }
 
 /**
@@ -198,18 +192,12 @@ export interface CharacterCard {
   // --- 形象呈现（2D 立绘 / Live2D 并行切换）---
   /** 形象渲染模式：'live2d'（默认）| 'sprite'（2D 静态立绘） */
   renderMode: RenderMode | null
-  /** 绑定的立绘集 id（null = 未绑定；renderMode='sprite' 时生效） */
+  /** 绑定的立绘集 id（null = 未绑定；renderMode='sprite' 时生效；情绪演出由立绘集词表驱动） */
   spriteId: string | null
-  /** 立绘模式的情绪映射：8 情绪 → 立绘集内图片文件名。缺项回退 neutral */
-  emotionMap: Partial<Record<StandardEmotion, string>> | null
-  /** Live2D 模式的情绪映射（可选）：8 情绪 → 现有 exp3.json 表情名。缺项跟随全局/覆盖表情 */
-  live2dExpressionMap: Partial<Record<StandardEmotion, string>> | null
 
   /** 角色级配置覆盖（null = 跟随全局）--- */
   /** TTS 配置覆盖：解决日文/中文角色共用全局 language 的问题 */
   ttsOverride: CharacterTTSOverride | null
-  /** 模型设置覆盖：让同模型不同角色有不同表情/待机动作 */
-  modelOverride: CharacterModelOverride | null
 
   /** 头像文件名（相对 avatars/，null = 用首字占位） */
   avatar: string | null
@@ -217,22 +205,16 @@ export interface CharacterCard {
   updatedAt: number
 }
 
-/** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式 + 情绪映射 */
+/** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式（情绪演出由立绘集词表驱动，桌宠自行拉取） */
 export interface PetCardPayload {
   /** 角色卡 id（宠物窗用于同步当前角色名的名牌显示） */
   cardId?: string | null
   /** 绑定的 Live2D 模型 id（null = 使用全局当前模型） */
   modelId: string | null
-  /** 模型设置覆盖（表情/待机动作），null = 跟随全局 */
-  modelOverride: CharacterModelOverride | null
   /** 形象渲染模式：null = 跟随默认（live2d） */
   renderMode: RenderMode | null
   /** 绑定的立绘集 id（renderMode='sprite' 时生效） */
   spriteId: string | null
-  /** 立绘模式情绪映射：情绪 → 立绘集内文件名 */
-  emotionMap: Partial<Record<StandardEmotion, string>> | null
-  /** Live2D 模式情绪映射：情绪 → exp3 表情名 */
-  live2dExpressionMap: Partial<Record<StandardEmotion, string>> | null
 }
 
 /** 角色卡创建/更新时的业务输入字段（不含 id/时间戳/版本，由主进程生成） */
@@ -246,11 +228,8 @@ export type CharacterCardInput = Pick<
   | 'voiceMode'
   | 'genieOverride'
   | 'ttsOverride'
-  | 'modelOverride'
   | 'renderMode'
   | 'spriteId'
-  | 'emotionMap'
-  | 'live2dExpressionMap'
   | 'avatar'
 >
 
@@ -336,18 +315,17 @@ export interface MemoryItem {
   characterCardId: string | null
   /** 是否已确认（false = 待确认候选，不注入 system prompt） */
   confirmed: boolean
-  /** 自动沉淀来源会话 id（追溯用，手动添加无） */
+  /** 自动沉淀来源会话 id（追溯用，手动添加无；剧情沉淀时存 runId） */
   sourceSessionId?: string | null
+  /** 记忆来源标记：缺省 = 对话沉淀/手动添加；'story' = 剧情经历沉淀（戏内延续口径） */
+  origin?: 'story'
+  /** 注入开关：缺省 true = 注入 system prompt；false = 暂停注入（保留条目，不删除） */
+  enabled?: boolean
 }
 
-/** 编年史条目（长期经历的按期滚动摘要，分层压缩产物） */
-export interface ChronicleEntry {
-  id: string
-  text: string
-  createdAt: number
-}
-
-/** 单个角色（或全局）的记忆分层压缩档案 */
+/** 单个角色（或全局）的记忆分层压缩档案。
+ *  注：旧数据文件里可能残留 chronicle/chronicleSourceIds 字段（原编年史模块已移除），
+ *  代码不再读写；运行时 spread 保留无害 */
 export interface MemoryProfile {
   /** 归属键：角色卡 id，'_global' = 全局 */
   key: string
@@ -360,11 +338,9 @@ export interface MemoryProfile {
   pendingDigest: string | null
   /** 待采纳草稿对应的来源记忆 id 列表（采纳时并入 personaSourceIds） */
   pendingSourceIds: string[]
-  /** 编年史条目（滚动摘要，作为长期经历的检索候选与兜底注入） */
-  chronicle: ChronicleEntry[]
-  /** 已被编年史吸收的 long_term 记忆 id 列表 */
-  chronicleSourceIds: string[]
-  /** 最近一次整理（画像+编年史）时间 */
+  /** 画像注入开关：缺省 true = 常驻注入；false = 暂停注入（画像保留，可随时恢复） */
+  personaEnabled?: boolean
+  /** 最近一次整理时间 */
   lastConsolidatedAt: number
 }
 
@@ -403,6 +379,8 @@ export interface AppSettings {
   enableAutoCompact: boolean
   /** 是否启用记忆自动沉淀（会话结束后后台从对话抽取候选记忆，需用户确认后生效） */
   enableMemoryExtraction: boolean
+  /** 回答仅含台词：普通聊天不生成也不显示（）内的心理/动作/环境描写（剧情模式与主动搭话旁白不受影响） */
+  stripParenNarration: boolean
   /** 是否启用主动搭话（桌宠在长时间无交互后由角色主动开口；旁白入史走完整聊天管线） */
   enableProactive: boolean
   /** 是否启用屏幕感知（与主动搭话同时开启时：先感知屏幕内容再搭话；截图不落盘） */
@@ -446,24 +424,25 @@ export interface Live2DModelMeta {
 // ---------------- 情绪标签（结构化情绪输出） ----------------
 
 /**
- * 标准情绪：AI 回复的情绪标签、角色卡情绪映射的唯一定义。
- * 顺序即语义，全小写下划线命名，保证 prompt 与解析一致。
- * 原「担心」「亲近」已删除，分别回退到 sad(难过) / happy(开心)。
- * 解析失败 / 缺图一律回退 DEFAULT_EMOTION(neutral)，保证任何输入都有确定输出。
+ * 内置默认情绪词（词表方案唯一保留字）：
+ * 立绘集未打标/未建词表时，自动获得仅含该词的最小词表（解析落首图/说话图）。
+ * 历史 6 枚举（neutral/happy/...）不再是值域，仅在归一化别名表中作为旧词识别。
  */
-export const STANDARD_EMOTIONS = [
-  'neutral', // 平静：默认/兜底
-  'happy', // 开心
-  'sad', // 难过
-  'angry', // 生气
-  'surprised', // 惊讶
-  'shy', // 害羞
-] as const
+export const BUILTIN_DEFAULT_EMOTION = '平静'
 
-export type StandardEmotion = (typeof STANDARD_EMOTIONS)[number]
+/** 内置默认情绪的释义（prompt 与最小词表共用） */
+export const BUILTIN_DEFAULT_GLOSS = '从容放松'
 
-/** 兜底情绪：任何未映射/解析失败的情绪都收敛到这里 */
-export const DEFAULT_EMOTION: StandardEmotion = 'neutral'
+/**
+ * 内置最小词表（每次返回新对象，调用方可自由改写）：
+ * 单词条。立绘侧：解析落首图/说话图，等价旧的"无映射"行为；模型侧：无表情联动，回落静态表情。
+ */
+export function builtinPalette(): EmotionPaletteRef {
+  return {
+    entries: [{ name: BUILTIN_DEFAULT_EMOTION, gloss: BUILTIN_DEFAULT_GLOSS }],
+    defaultEmotion: BUILTIN_DEFAULT_EMOTION,
+  }
+}
 
 // ---------------- 2D 立绘 ----------------
 
@@ -477,9 +456,53 @@ export interface CharacterSpriteImage {
 }
 
 /**
+ * 情绪词表条目：立绘集的细粒度情绪（词表方案的事实源，导入打标自动生成 + 编辑器可改）。
+ * prompt 的 emotion 值域 = 词表全部 name；解析链 = 精确命中 → 默认情绪。
+ */
+export interface SpritePaletteEntry {
+  /** 情绪词（唯一，2-4 个中文字为宜，如"傲娇"） */
+  name: string
+  /** 中文释义（注入 prompt，帮助模型选词） */
+  gloss: string
+  /** 对应立绘文件（相对 sprites/{id}/；编辑器保存时必填校验） */
+  image: string
+}
+
+/**
+ * Live2D 模型情绪词表条目（模型侧演出词表：情绪演出 = 切表情，与立绘集词表对等）。
+ * Live2D 模型与立绘集是二选一的演出形象，各自拥有独立的情绪词表。
+ */
+export interface ModelPaletteEntry {
+  /** 情绪词（唯一，2-4 个中文字为宜） */
+  name: string
+  /** 中文释义（注入 prompt，帮助模型选词） */
+  gloss: string
+  /** 联动的 Live2D 表情名（model3.json Expressions 的 Name；缺省 = 不联动表情） */
+  expression?: string
+}
+
+/** Live2D 模型演出词表（纯「词→表情」映射，存 data/model-palettes.json）。
+ *  无默认情绪概念：AI 输出词未命中词条 → 不联动表情（回落全局静态表情）；
+ *  归一化兜底词固定取「平静」（在表内）或第一个词条，仅用于 prompt 契约与情绪归一。 */
+export interface ModelPalette {
+  entries: ModelPaletteEntry[]
+}
+
+/**
+ * 情绪词表视图（供主进程归一化与 prompt 注入使用的最小结构）。
+ * 演出词表双轨对等：sprite 模式 = 立绘集词表（paletteFromSprite）；live2d 模式 = 模型词表。
+ * 任一词表为空时由 builtinPalette 返回内置最小词表（仅"平静"），系统内永远只有词表一条链。
+ */
+export interface EmotionPaletteRef {
+  entries: Array<{ name: string; gloss: string }>
+  /** 默认情绪：必须是 entries 中某词的 name；兜底终点（系统唯一保留字） */
+  defaultEmotion: string
+}
+
+/**
  * 立绘集元信息（sprites/index.json）。
  * 一个立绘集 = 导入的一个文件夹，内含多张情绪切图（png/jpg/webp 等）。
- * 通过角色卡的 emotionMap 或本集的 emotionMap 把 8 标准情绪映射到某张图。
+ * 情绪演出唯一事实源 = emotions 词表；未打标时运行时按内置最小词表（仅"平静"）处理。
  */
 export interface CharacterSprite {
   id: string
@@ -487,13 +510,55 @@ export interface CharacterSprite {
   name: string
   /** 该立绘集下的图片列表 */
   images: CharacterSpriteImage[]
-  /** 立绘集自身的情绪 → 立绘图 映射（全局使用该立绘集时生效，缺项回退 neutral/首图） */
-  emotionMap: Partial<Record<StandardEmotion, string>> | null
-  /** 说话立绘图（相对文件路径，空 = 未配置）：情绪为平静且正在说话时使用 */
+  /** 情绪词表（唯一事实源；空数组 = 未打标，运行时按内置最小词表处理） */
+  emotions: SpritePaletteEntry[]
+  /** 默认情绪词（词表非空时必为 emotions 中某词；空串 = 未设置） */
+  defaultEmotion: string
+  /** 说话立绘图（相对文件路径，空 = 未配置）：解析图等于默认图且正在说话时使用 */
   speakingImage: string | null
   /** 思考立绘图（相对文件路径，空 = 未配置）：AI 开始准备回答到输出文本前使用 */
   thinkingImage: string | null
   createdAt: number
+}
+
+/**
+ * 从立绘集提取词表视图（系统内唯一的取词表入口）：
+ * emotions 非空 → 真实词表；为空 → 内置最小词表（仅"平静"，image 留空解析落首图）。
+ * 主进程归一化、prompt 注入、渲染端查表统一经此入口，永远不返回 null。
+ */
+export function paletteFromSprite(
+  spr: Pick<CharacterSprite, 'emotions' | 'defaultEmotion'> | null | undefined,
+): EmotionPaletteRef {
+  if (!spr || !Array.isArray(spr.emotions) || spr.emotions.length === 0) return builtinPalette()
+  const names = new Set(spr.emotions.map((e) => e.name))
+  const def = spr.defaultEmotion && names.has(spr.defaultEmotion) ? spr.defaultEmotion : spr.emotions[0]!.name
+  return { entries: spr.emotions, defaultEmotion: def }
+}
+
+/**
+ * 词表链解析：情绪词 → 精确命中词条的图；未命中 → 默认情绪词条的图。
+ * 内置最小词表（未打标集，单词条无图）的"平静"定义为首图——链上不存在通用首图兜底。
+ * 直接查 spr.emotions 原始词条（含 image）；未打标集（emotions 空）= 首图。
+ * @returns 命中的立绘文件名；词条图缺失且非内置最小词表时返回 null（由调用方按 说话图 兜底）
+ */
+export function resolvePaletteImage(
+  spr: Pick<CharacterSprite, 'emotions' | 'defaultEmotion' | 'images'>,
+  emotion: string,
+): string | null {
+  const has = (f: string) => !!f && spr.images.some((i) => i.filePath === f)
+  const entries = Array.isArray(spr.emotions) ? spr.emotions : []
+  const byName = new Map(entries.map((e) => [e.name, e]))
+  // 内置最小词表（未打标集，emotions 空）：平静 = 首图（默认展示与兜底）
+  if (entries.length === 0) {
+    return spr.images[0]?.filePath ?? null
+  }
+  const defName = byName.has(spr.defaultEmotion) ? spr.defaultEmotion : entries[0]!.name
+  // 1) 精确命中词条的图
+  const direct = byName.get(emotion.trim())
+  if (direct && has(direct.image)) return direct.image
+  // 2) 未命中：默认情绪词条的图（词表图必填，正常恒有；异常配置返回 null 由调用方按说话图兜底）
+  const defEntry = byName.get(defName)
+  return defEntry && has(defEntry.image) ? defEntry.image : null
 }
 
 // ---------------- Live2D 模型设置 ----------------
@@ -765,19 +830,19 @@ export interface StoryAiJudge {
   options: StoryAiJudgeOption[]
 }
 
-/** 剧本事件（一期 12 种，源自 LingChat schema 裁剪；所有事件可携带 condition 条件） */
+/** 剧本事件（一期 12 种，源自 schema 裁剪；所有事件可携带 condition 条件） */
 export type StoryEvent = ({
     type: 'background'; image: string; duration?: number
   } | {
     type: 'music'; file?: string; loop?: boolean; stop?: boolean
   } | {
-    type: 'modify_character'; emotion: StandardEmotion
+    type: 'modify_character'; emotion: string
   } | {
     type: 'narration'; text: string
   } | {
     type: 'player'; text: string
   } | {
-    type: 'dialogue'; character?: string; text: string; emotion?: StandardEmotion
+    type: 'dialogue'; character?: string; text: string; emotion?: string
   } | {
     type: 'ai_dialogue'; prompt: string
   } | {
@@ -803,8 +868,14 @@ export interface ScriptMeta {
   cover?: string
   /** 绑定角色卡（一期单角色；cardId 为系统角色卡 id，如 card_xxxxxxxxxxxx） */
   characters?: Array<{ cardId?: string }>
+  /** 创作词表来源：绑定的立绘集 id（情绪下拉按该集词表生成；缺省 = 未绑定，按内置最小词表"平静"处理） */
+  spriteSetId?: string
+  /** 绑定词表的内容指纹（表单保存时写入）：打开剧本时比对检测"词表已变" */
+  vocabHash?: string
   /** 起始章节文件名（chapters/ 下的 yaml 文件名，如 01-intro） */
   startChapter: string
+  /** 是否允许 AI 自由演绎时自行切换背景（7.3 导演联动；默认关闭——背景切换仅由剧本 background 事件编排） */
+  aiBackground?: boolean
   version: number
 }
 
@@ -836,6 +907,8 @@ export interface ScriptIndexItem {
   chapters: number
   /** story.yaml 建议绑定的角色卡（存在性由渲染端校验） */
   characterCardId: string | null
+  /** 创作词表来源：绑定的立绘集 id（开演前与所选演出立绘集比对提示用；null = 未绑定） */
+  spriteSetId: string | null
 }
 
 /** 剧本导入/导出校验报告 */
@@ -881,6 +954,19 @@ export interface StoryRun {
   storyState: StoryState
   /** 演出对话记录（backlog 与 AI 上下文来源） */
   messages: ChatMessage[]
+  /** 剧情记忆沉淀游标：已沉淀为记忆的 run.messages 位置（下次从此切片；缺省 0 = 未沉淀）。
+   *  独立于 storyState——引擎 updateRunState 整体覆盖 storyState 字段，独立字段避免互相踩写 */
+  memoryCursor?: number
+}
+
+/** 剧情记忆沉淀结果（story:consolidate-memory） */
+export interface StoryConsolidateResult {
+  ok: boolean
+  /** true = 无新可沉淀内容（游标已到末尾 / 切片无有效内容 / 摘要与现有记忆重复） */
+  nothing?: boolean
+  /** 实际写入的候选记忆条数（成功且非 nothing 时为 1） */
+  written?: number
+  error?: string
 }
 
 /** 存档列表条目（story:list-runs） */
@@ -907,6 +993,8 @@ export interface StoryState {
   eventIndex: number
   vars: Record<string, unknown>
   status: 'running' | 'ended'
+  /** 当前背景（随 background 事件与 AI 联动持久化；续玩时恢复演出画面，覆盖背景优先） */
+  background?: string | null
 }
 
 /** 渲染端等待提交的交互（挂起中的 choices/input/free_dialogue） */
@@ -990,8 +1078,20 @@ export interface EditorReadResult {
     summary: string
     startChapter: string
     characterCardId: string | null
+    /** 创作词表来源：绑定的立绘集 id（null = 未绑定） */
+    spriteSetId: string | null
+    /** 绑定立绘集的词表词列表（未绑定时为内置最小词表词 ["平静"]） */
+    emotionWords: string[] | null
+    /** 绑定立绘集的默认情绪词（未启用词表时为 null） */
+    paletteDefault: string | null
+    /** 词表指纹与 story.yaml 记录不一致（词表在绑定后被编辑过）；无记录时为 false */
+    paletteChanged: boolean
+    /** 事件中引用但不在当前词表的未知情绪词（去重；旧英文枚举词经别名表归一后仍落默认） */
+    staleWords: string[]
     /** 手写剧本默认只读：仅 story.yaml 带 editedVia: form 时允许表单写回 */
     editedVia: boolean
+    /** AI 背景联动开关（默认关闭） */
+    aiBackground: boolean
   } | null
   chapters?: Array<{
     file: string
@@ -1008,7 +1108,7 @@ export type EditorSavePayload =
   | {
       mode: 'form'
       scriptId: string
-      meta: { title: string; summary: string; startChapter: string; characterCardId: string | null }
+      meta: { title: string; summary: string; startChapter: string; characterCardId: string | null; aiBackground: boolean; spriteSetId: string | null }
       chapters: Array<{ file: string; name: string; enterWhen?: StoryCondition | null; fallbackChapter?: string | null; events: StoryEvent[] }>
     }
   | {
@@ -1082,7 +1182,7 @@ export interface WindowApi {
     /** 手动新增一条记忆（category 缺省 long_term；characterCardId null = 全局背景），返回新条目 */
     add: (input: { content: string; category: MemoryCategory; characterCardId: string | null }) => Promise<MemoryItem>
     /** 更新记忆内容或分类 */
-    update: (id: string, patch: { content?: string; category?: MemoryCategory }) => Promise<void>
+    update: (id: string, patch: { content?: string; category?: MemoryCategory; enabled?: boolean }) => Promise<void>
     /** 确认待确认候选（确认后注入 system prompt） */
     confirm: (id: string) => Promise<void>
     remove: (id: string) => Promise<void>
@@ -1094,20 +1194,20 @@ export interface WindowApi {
     reembedAll: () => Promise<{ embedded: number; failed: number; unavailable?: boolean }>
     /** 测试嵌入配置连通性（独立地址/模型/Key），成功返回向量维度 */
     testEmbedding: () => Promise<{ ok: boolean; dim?: number; error?: string }>
-    /** 读取指定角色（或全局）的画像/编年史档案 */
+    /** 读取指定角色（或全局）的画像档案 */
     getProfile: (cardId?: string | null) => Promise<MemoryProfile | null>
-    /** 触发画像/编年史整理（画像草稿待采纳，编年史直接生效） */
-    consolidateProfile: (cardId?: string | null) => Promise<{ ok: boolean; draft: string | null; chronicleAdded: number; error?: string }>
+    /** 档案总览（画像 tab「全局」查看态）：所有已生成画像的档案（key = 角色卡 id 或 '_global'） */
+    getProfileOverview: () => Promise<Array<{ key: string; personaDigest: string; personaUpdatedAt: number; personaEnabled?: boolean }>>
+    /** 触发画像整理（聚合「用户信息」类记忆为画像草稿，待采纳） */
+    consolidateProfile: (cardId?: string | null) => Promise<{ ok: boolean; draft: string | null; error?: string }>
+    /** 切换画像注入开关（false = 暂停注入，画像保留） */
+    setProfileEnabled: (cardId: string | null, enabled: boolean) => Promise<void>
     /** 采纳/放弃画像草稿（采纳后常驻注入 system prompt） */
     adoptProfile: (cardId: string | null, adopt: boolean) => Promise<void>
     /** 编辑已生效画像文本（面板手动修改整理结果；空串 = 清除画像） */
     updateProfileDigest: (cardId: string | null, text: string) => Promise<void>
     /** 删除已生效画像（来源记忆恢复"未吸收"，可重新整理生成） */
     deleteProfileDigest: (cardId: string | null) => Promise<void>
-    /** 编辑单条编年史条目文本 */
-    updateChronicleEntry: (cardId: string | null, entryId: string, text: string) => Promise<void>
-    /** 删除单条编年史条目（原始记忆保持不变，仅移除摘要） */
-    deleteChronicleEntry: (cardId: string | null, entryId: string) => Promise<void>
   }
   session: {
     list: () => Promise<SessionIndexItem[]>
@@ -1126,6 +1226,10 @@ export interface WindowApi {
     motionGroups: (modelId: string) => Promise<string[]>
     /** 读取指定模型的表情列表（从 model3.json 的 FileReferences.Expressions + exp3.json 解析） */
     expressionList: (modelId: string) => Promise<ExpressionMeta[]>
+    /** 读取 Live2D 模型演出词表（data/model-palettes.json；未配置 = null，运行时按内置最小词表兜底） */
+    getPalette: (modelId: string) => Promise<ModelPalette | null>
+    /** 保存 Live2D 模型演出词表（词 + 释义 + 表情联动 + 默认情绪，全量写回） */
+    updatePalette: (modelId: string, palette: ModelPalette) => Promise<void>
     /**
      * 扫描模型文件夹自动识别表情（*.exp3.json）/动作（*.motion3.json）文件，
      * 合并写回 model3.json（手写条目保留、File 路径去重、写前备份）。
@@ -1149,8 +1253,10 @@ export interface WindowApi {
     importFromFolder: () => Promise<CharacterSprite | null>
     /** 删除指定立绘集（同时删除资源目录与索引条目） */
     remove: (spriteId: string) => Promise<void>
-    /** 更新立绘集展示资产：名称 / 情绪→立绘图映射 / 说话立绘 / 思考立绘 */
-    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotionMap' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
+    /** 更新立绘集展示资产：名称 / 情绪词表 / 说话立绘 / 思考立绘 */
+    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
+    /** 视觉打标：对指定立绘集逐张生成情绪词建议（产物不落库，回填编辑器确认）；未配置视觉模型时返回 ok:false */
+    annotate: (spriteId: string) => Promise<{ ok: boolean; suggestions?: Array<{ filePath: string; name: string; desc: string }>; failed?: number; error?: string }>
     /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }
@@ -1230,8 +1336,8 @@ export interface WindowApi {
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
      *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放 */
     onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => void) => () => void
-    /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘） */
-    onEmotion: (cb: (emotion: StandardEmotion) => void) => () => void
+    /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘；词表方案下为自由情绪词） */
+    onEmotion: (cb: (emotion: string) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
     /** 订阅流式开始时的"本轮语音模式"（是否有语音），宠物窗提前决定文本展示方式 */
@@ -1269,7 +1375,7 @@ export interface WindowApi {
     /** 合成语音：传入文本与参考音频 id，返回 wav 格式的 ArrayBuffer。
      *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）；
      *  engine=genie 时 voiceId 可空（本地声库语音服务不需要参考音频）。 */
-    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: StandardEmotion | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => Promise<ArrayBuffer | null>
+    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => Promise<ArrayBuffer | null>
     /** 重命名参考音频，返回更新后的对象 */
     renameReference: (id: string, name: string) => Promise<VoiceReference>
     /** 读取 GenieTTS(本地声库语音服务) 配置 */
@@ -1347,6 +1453,8 @@ export interface WindowApi {
     getState: (runId: string) => Promise<StorySnapshot | null>
     /** 读取 run 存档全文（backlog 回看与重开重建用） */
     getRun: (runId: string) => Promise<StoryRun | null>
+    /** 手动沉淀剧情记忆：从上次沉淀游标到存档末尾提取一条记忆摘要，写入记忆面板待确认候选（剧情窗完结屏兜底按钮） */
+    consolidateMemory: (runId: string) => Promise<StoryConsolidateResult>
     /** 调整立绘视图（大小/位置；随 run 存档并广播快照） */
     setSpriteView: (runId: string, view: StorySpriteView) => Promise<{ ok: boolean }>
     /** 剧情 TTS 合成（本地 Genie 声库 + 语言）→ WAV base64 */
@@ -1357,8 +1465,8 @@ export interface WindowApi {
     uploadBackgrounds: () => Promise<{ ok: boolean; added?: string[]; error?: string }>
     /** 删除背景库文件 */
     removeBackground: (name: string) => Promise<{ ok: boolean; error?: string }>
-    /** AI 辅助写剧本：梗概（+可选参考角色卡）→ 单文件 YAML 剧本草稿（含校验报告，不直接入库） */
-    generateDraft: (params: { premise: string; cardId?: string | null }) => Promise<StoryDraftResult>
+    /** AI 辅助写剧本：梗概（+可选参考角色卡 +可选情绪词表来源立绘集）→ 单文件 YAML 剧本草稿（含校验报告，不直接入库）；指定立绘集时草稿注入 spriteSetId/vocabHash（导入即绑定） */
+    generateDraft: (params: { premise: string; cardId?: string | null; spriteSetId?: string | null }) => Promise<StoryDraftResult>
     /** 导入 AI 剧本草稿：schema 全量校验通过后拆分写入剧本库 */
     importDraft: (draft: string) => Promise<{ ok: boolean; scriptId?: string; errors: Array<{ file: string; message: string }>; error?: string }>
     /** 打开/聚焦剧情窗（演出不中断，按快照恢复） */
@@ -1381,6 +1489,14 @@ export interface WindowApi {
     openEditor: (scriptId: string) => Promise<{ ok: boolean; error?: string }>
     /** 新增骨架剧本并直接进入编辑器 */
     editorCreate: () => Promise<{ ok: boolean; scriptId?: string; error?: string }>
+    /** 编辑器素材清单：剧本内图片/音乐 + 用户背景库/音乐库（背景与音乐事件下拉选择用，user: 引用） */
+    editorAssets: (scriptId: string) => Promise<{ ok: boolean; error?: string; images?: string[]; musics?: string[]; userBackgrounds?: string[]; userMusics?: string[] }>
+    /** 音乐库：列表 / 上传（弹文件框）/ 删除 */
+    listMusics: () => Promise<string[]>
+    uploadMusics: () => Promise<{ ok: boolean; added?: string[]; error?: string }>
+    removeMusic: (name: string) => Promise<{ ok: boolean; error?: string }>
+    /** 音乐库资源 URL：pet-res://story-music/{文件名} */
+    musicUrl: (name: string) => string
     /** 编辑器当前编辑的剧本 id */
     editorCurrent: () => Promise<string | null>
     /** 编辑器读取剧本（结构化 + 原文双份；允许带错读取） */

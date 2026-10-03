@@ -206,7 +206,8 @@ export function ProactivePanel() {
             <div>
               今日已搭话：
               <span className="font-semibold text-text">{state.timesToday}</span>
-              <span className="text-text-muted"> / {state.maxPerDay}</span>
+              {/* 上限直接读设置存储（保存即更新）；state.maxPerDay 是调度器 tick 时的快照，会滞后一轮 */}
+              <span className="text-text-muted"> / {settings.maxProactivePerDay}</span>
             </div>
             <div>
               最近搭话：

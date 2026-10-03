@@ -1,5 +1,5 @@
 /**
- * 剧情演出窗（galgame 式）：背景（剧本素材 / 背景库 user: 引用）+ 2D 立绘（可调整大小/位置）+ 底部合并对话框（LingChat 式）。
+ * 剧情演出 式）： 式）：背景（剧本素材 / 背景库 user: 引用）+ 2D 立绘（可调整大小/位置）+ 底部合并对话框）。
  *
  * 数据流（与聊天系统完全分离）：
  *  - 演出驱动：run 消息增量同步（story:message 广播 → 剧情窗按已演游标从 run.messages 补演），
@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { History, Settings2, X } from 'lucide-react'
+import { History, Music, Settings2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../api'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -21,21 +21,26 @@ import { initSettingsSync, useSettingsStore, typingSpeedToMs } from '../store/se
 import type {
   CharacterSprite,
   ChatMessage,
-  StandardEmotion,
   StorySnapshot,
   StorySpriteView,
   StoryTtsResult,
 } from '../types'
+import { BUILTIN_DEFAULT_EMOTION, paletteFromSprite, resolvePaletteImage } from '../types'
 import { cn } from '../lib/utils'
 
-/** 情绪中文名（对话框情绪标签） */
-const EMOTION_LABEL: Record<StandardEmotion, string> = {
+/** 情绪中文名（对话框情绪标签；旧英文枚举词作显示兜底，词表自由词直接显示原词） */
+const EMOTION_LABEL: Record<string, string> = {
   neutral: '平静',
   happy: '开心',
   sad: '难过',
   angry: '生气',
   surprised: '惊讶',
   shy: '害羞',
+}
+
+/** 情绪标签显示：旧英文枚举词走中文映射，其余显示原词 */
+function emotionLabel(word: string): string {
+  return EMOTION_LABEL[word] ?? word
 }
 
 /** 纯括号文本（整体只由 （…） 动作/心理描写构成）：按演出规范属于"不发声"内容，
@@ -48,7 +53,7 @@ function isUnspoken(text: string): boolean {
 interface QueueItem {
   kind: 'narration' | 'line'
   text: string
-  emotion?: StandardEmotion
+  emotion?: string
   /** line：说话人（player = 玩家台词不配音；ai = 角色台词） */
   speaker?: 'player' | 'ai'
   /** 是否用 TTS 播报（启用语音且为角色台词时 true） */
@@ -94,7 +99,7 @@ export function StoryApp() {
   useEffect(() => {
     autoModeRef.current = autoMode
   }, [autoMode])
-  const [spriteEmotion, setSpriteEmotion] = useState<StandardEmotion>('neutral')
+  const [spriteEmotion, setSpriteEmotion] = useState<string>(BUILTIN_DEFAULT_EMOTION)
 
   // ---- 段级语音预取（7.7 性能第一批）：消息到达即按序发起合成，播放到段时音频多半已就绪，
   //      段间合成等待清零（Genie 主进程串行链天然排队）。key = ttsModelId|language|text ----
@@ -105,6 +110,25 @@ export function StoryApp() {
   // ---- 背景与 BGM ----
   const [background, setBackground] = useState<string | null>(null)
   const [music, setMusic] = useState<string | null>(null)
+  /** BGM 音量（0-100，仅背景音乐；不控制 AI 角色语音）——localStorage 持久化，默认 20。
+   *  key 带 :v2：旧版会在挂载时把当时的默认值 100 写入存储，换 key 让新默认生效。 */
+  const [bgmOpen, setBgmOpen] = useState(false)
+  const [bgmVolume, setBgmVolume] = useState(() => {
+    const raw = localStorage.getItem('story-bgm-volume:v2')
+    if (raw === null) return 20
+    const v = Number(raw)
+    return Number.isFinite(v) && v >= 0 && v <= 100 ? v : 20
+  })
+  /** 滑杆调整：写入存储（挂载时用默认值，不写存储） */
+  const setBgmVolumePersist = useCallback((v: number) => {
+    setBgmVolume(v)
+    localStorage.setItem('story-bgm-volume:v2', String(v))
+  }, [])
+  /** 当前 BGM 实际设置的 URL（audio.src getter 会把中文 percent 编码，直接比较会误判不等 → 重设 src 导致重头播放） */
+  const bgmUrlRef = useRef('')
+  useEffect(() => {
+    if (bgmRef.current) bgmRef.current.volume = bgmVolume / 100
+  }, [bgmVolume])
 
   // ---- 立绘视图调整（本地即时生效，防抖持久化到 run） ----
   const [spriteView, setSpriteView] = useState<StorySpriteView>(DEFAULT_SPRITE_VIEW)
@@ -115,6 +139,28 @@ export function StoryApp() {
   const [backlogOpen, setBacklogOpen] = useState(false)
   const [backlogMessages, setBacklogMessages] = useState<ChatMessage[]>([])
   const [inputText, setInputText] = useState('')
+
+  // ---- 剧情记忆沉淀（完结屏手动兜底） ----
+  const [consolidating, setConsolidating] = useState(false)
+  /** 沉淀操作结果提示（null = 未操作；完结屏按钮下方展示） */
+  const [consolidateMsg, setConsolidateMsg] = useState<string | null>(null)
+
+  /** 手动沉淀剧情记忆：从上次沉淀游标到存档末尾提取一条摘要，写入记忆面板待确认候选 */
+  const handleConsolidateMemory = useCallback(async (runId: string) => {
+    if (consolidating) return
+    setConsolidating(true)
+    setConsolidateMsg(null)
+    try {
+      const r = await api.story.consolidateMemory(runId)
+      if (r.ok && r.nothing) setConsolidateMsg('没有新的剧情经历需要沉淀')
+      else if (r.ok) setConsolidateMsg('已沉淀为记忆候选，可在 设置 → 记忆体 中编辑并保留')
+      else setConsolidateMsg(`沉淀失败：${r.error ?? '未知错误'}`)
+    } catch (err) {
+      setConsolidateMsg(`沉淀失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setConsolidating(false)
+    }
+  }, [consolidating])
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const bgmRef = useRef<HTMLAudioElement | null>(null)
@@ -154,7 +200,7 @@ export function StoryApp() {
       // player：剧本编排的玩家独白，对话框呈现
       return m.content.trim() ? [{ kind: 'line', text: m.content, speaker: 'player' }] : []
     }
-    const spoken = (text: string, emotion?: StandardEmotion): QueueItem => ({
+    const spoken = (text: string, emotion?: string): QueueItem => ({
       kind: 'line', text, emotion, speaker: 'ai', voice: true,
     })
     const chunks = (m.chunks ?? []).filter((c) => typeof c.text === 'string' && c.text.trim())
@@ -439,13 +485,15 @@ export function StoryApp() {
         setSpriteView(s.spriteView ?? DEFAULT_SPRITE_VIEW)
         setBackground(s.background)
         setMusic(s.music)
-        setSpriteEmotion('neutral')
         setAdjustOpen(false)
         void (async () => {
           const cards = await api.characterCard.list()
           setCardName(cards.find((c) => c.id === s.cardId)?.name ?? 'AI')
           const sprites = await api.sprite.list()
-          setSprite(sprites.find((sp) => sp.id === s.spriteId) ?? null)
+          const spr = sprites.find((sp) => sp.id === s.spriteId) ?? null
+          setSprite(spr)
+          // 初始情绪 = 词表默认情绪（默认展示跟随用户配置的默认词）
+          if (spr) setSpriteEmotion(paletteFromSprite(spr).defaultEmotion)
           try {
             const run = await api.story.getRun(s.runId)
             if (!run) return
@@ -497,16 +545,23 @@ export function StoryApp() {
   useEffect(() => {
     const audio = bgmRef.current
     if (!audio) return
-    const url = music && snapshot?.scriptId ? api.story.assetUrl(snapshot.scriptId, music) : null
+    // 音乐引用两种形态：剧本内相对路径（pet-res://stories/…）与音乐库 user:文件名（pet-res://story-music/…）。
+    // 用 bgmUrlRef 记录实际设置的 URL：audio.src getter 会把中文 percent 编码，直接与拼接串比较会误判不等 → 重设 src 导致音乐重头播放
+    const url = music && snapshot?.scriptId ? (music.startsWith('user:') ? api.story.musicUrl(music.slice('user:'.length)) : api.story.assetUrl(snapshot.scriptId, music)) : null
     if (url) {
-      if (audio.src !== url) audio.src = url
+      if (bgmUrlRef.current !== url) {
+        bgmUrlRef.current = url
+        audio.src = url
+      }
       audio.loop = true
+      audio.volume = bgmVolume / 100
       void audio.play().catch(() => { /* 自动播放被拦截时由交互后恢复 */ })
     } else {
+      bgmUrlRef.current = ''
       audio.pause()
       audio.src = ''
     }
-  }, [music, snapshot?.scriptId])
+  }, [music, snapshot?.scriptId, bgmVolume])
 
   // ---- 立绘视图滑杆（本地即时 + 防抖持久化） ----
   const applySpriteView = useCallback((patch: Partial<StorySpriteView>) => {
@@ -539,17 +594,24 @@ export function StoryApp() {
     api.win.close()
   }, [])
 
-  // ---- 立绘解析：thinkingImage（仅队列空闲且无当前段时，避免语音已起播仍锁思考图）
-  //      > 说话图（正在播放语音且情绪为平静时，与桌宠端规则一致）
-  //      > emotionMap[emotion] > speakingImage > 首图 ----
+  // ---- 立绘解析（词表单链）：thinkingImage（仅队列空闲且无当前段时，避免语音已起播仍锁思考图）
+  //      > 说话图（正在播放语音且情绪未命中/等于默认图时先落说话图，兜底顺序：说话图 → 默认情绪图）
+  //      > 词表图（命中词条图 → 默认情绪图；未打标集=内置最小词表，解析落首图）----
   const speakingNow = phase === 'voice' && current?.kind === 'line' && current.speaker === 'ai'
   const spriteSrc = (() => {
     if (!sprite) return null
     if (snapshot?.thinking && phase === 'idle' && !current && sprite.thinkingImage) return api.story.spriteUrl(sprite.id, sprite.thinkingImage)
-    if (speakingNow && spriteEmotion === 'neutral' && sprite.speakingImage) return api.story.spriteUrl(sprite.id, sprite.speakingImage)
-    const byEmotion = sprite.emotionMap?.[spriteEmotion]
-    if (byEmotion) return api.story.spriteUrl(sprite.id, byEmotion)
-    if (sprite.speakingImage) return api.story.spriteUrl(sprite.id, sprite.speakingImage)
+    // 情绪查表（词表单链）：命中词条图 → 默认情绪图；未打标集（内置最小词表）= 首图
+    const emotionFile = resolvePaletteImage(sprite, spriteEmotion)
+    // 说话图使用条件：正在说话且情绪=「平静」；默认情绪可设为其它词，说话时显示其对应图
+    const calmFile = resolvePaletteImage(sprite, BUILTIN_DEFAULT_EMOTION)
+    // 说话图让位规则：语音播放中且情绪=平静（默认状态出场才让位，不覆盖真正的情绪演出）
+    const speakingFile = sprite.speakingImage && sprite.images.some((i) => i.filePath === sprite.speakingImage) ? sprite.speakingImage : null
+    if (speakingNow && speakingFile && (emotionFile == null || (calmFile != null && emotionFile === calmFile))) {
+      return api.story.spriteUrl(sprite.id, speakingFile)
+    }
+    if (emotionFile) return api.story.spriteUrl(sprite.id, emotionFile)
+    if (speakingFile) return api.story.spriteUrl(sprite.id, speakingFile)
     const first = sprite.images[0]?.filePath
     return first ? api.story.spriteUrl(sprite.id, first) : null
   })()
@@ -570,6 +632,19 @@ export function StoryApp() {
         <div className="flex flex-1 flex-col items-center justify-center gap-3">
           <p className="text-sm text-text-2">{storyEnded ? '本段剧情已完结（存档已保留，可在设置页重开）' : '没有进行中的剧情演出'}</p>
           {!storyEnded && <p className="text-xs text-text-muted">在设置页「剧情系统」开始或继续演出</p>}
+          {/* 手动兜底沉淀：章节切换/完结时会自动沉淀剧情记忆；失败（如网络/API 异常）可在此重试 */}
+          {storyEnded && (
+            <>
+              <button
+                onClick={() => snapshot && void handleConsolidateMemory(snapshot.runId)}
+                disabled={consolidating}
+                className="rounded-[var(--radius-md)] border border-border px-4 py-1.5 text-xs text-text-2 transition-colors hover:bg-card-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {consolidating ? '正在沉淀这段经历…' : '把这段剧情沉淀为记忆'}
+              </button>
+              {consolidateMsg && <p className="max-w-[420px] text-center text-xs text-text-muted">{consolidateMsg}</p>}
+            </>
+          )}
           <button
             onClick={() => api.win.close()}
             className="rounded-[var(--radius-md)] border border-border px-4 py-1.5 text-xs text-text-2 hover:bg-card-hover hover:text-text"
@@ -622,7 +697,7 @@ export function StoryApp() {
           />
         )}
 
-        {/* 底部合并对话框（LingChat 式：名牌 + 文本 + 选项/输入 同框）；mt-auto 钉在底部。
+        {/* 底部合并对话框（名牌 + 文本 + 选项/输入 同框）；mt-auto 钉在底部。
             对话框上方一行放演出控制按钮（自动/历史/立绘/退出，与对话框右缘对齐）；
             立绘调整浮层从按钮行上方弹出，不遮挡按钮 */}
         <div
@@ -653,7 +728,10 @@ export function StoryApp() {
               历史
             </button>
             <button
-              onClick={() => setAdjustOpen((v) => !v)}
+              onClick={() => {
+                setBgmOpen(false)
+                setAdjustOpen((v) => !v)
+              }}
               title="调整立绘大小/位置"
               className={cn(
                 'flex items-center gap-1 rounded-[var(--radius-md)] px-2.5 py-1 text-xs backdrop-blur-sm transition-colors',
@@ -663,6 +741,43 @@ export function StoryApp() {
               <Settings2 size={12} strokeWidth={1.75} />
               立绘
             </button>
+            <button
+              onClick={() => {
+                setAdjustOpen(false)
+                setBgmOpen((v) => !v)
+              }}
+              title="调整背景音乐音量（不影响角色语音）"
+              className={cn(
+                'flex items-center gap-1 rounded-[var(--radius-md)] px-2.5 py-1 text-xs backdrop-blur-sm transition-colors',
+                bgmOpen ? 'bg-primary-500/15 text-primary-400' : 'text-text-2 hover:bg-card-hover hover:text-text',
+              )}
+            >
+              <Music size={12} strokeWidth={1.75} />
+              音乐
+            </button>
+            {/* BGM 音量浮层：从按钮行上方弹出（与立绘浮层互斥），只控制背景音乐 */}
+            <AnimatePresence>
+              {bgmOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 6 }}
+                  className="glass-strong app-no-drag absolute bottom-full right-0 z-30 mb-2 w-64 rounded-[var(--radius-lg)] border border-border p-3"
+                >
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-text">背景音乐音量</span>
+                    <button
+                      onClick={() => setBgmVolume(100)}
+                      className="text-[11px] text-text-2 hover:text-text"
+                    >
+                      重置
+                    </button>
+                  </div>
+                  <SliderRow label="音量" value={bgmVolume} min={0} max={100} step={1} format={(v) => `${Math.round(v)}%`} onChange={(v) => setBgmVolumePersist(v)} />
+                  <p className="mt-1.5 text-[10px] text-text-2">仅控制背景音乐，不影响角色语音。</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
             <button
               onClick={() => void handleStop()}
               title="退出剧情（存档并关闭）"
@@ -704,7 +819,7 @@ export function StoryApp() {
                   <span className="text-sm font-semibold text-text">{current.speaker === 'player' ? '你' : cardName}</span>
                   {current.emotion && current.speaker !== 'player' && (
                     <span className="rounded-full bg-primary-500/15 px-2 py-0.5 text-[10px] text-primary-400">
-                      {EMOTION_LABEL[current.emotion]}
+                      {emotionLabel(current.emotion)}
                     </span>
                   )}
                 </>
@@ -730,7 +845,7 @@ export function StoryApp() {
               )}
             </div>
 
-            {/* 文本区：挂起输入时直接在对话框中输入（LingChat 式，Enter 发送）；否则点击推进/跳过语音 */}
+            {/* 文本区：挂起输入时直接在对话框中输入（Enter 发送）；否则点击推进/跳过语音 */}
             {showInteraction && inputActive ? (
               <textarea
                 autoFocus

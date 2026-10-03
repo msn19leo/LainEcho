@@ -1,5 +1,7 @@
 /**
- * 内置示例剧本（首次启动时写入 data/stories/，已存在的目录不覆盖）。
+ * 内置示例剧本（仅首次启动写入 data/stories/，之后与普通剧本完全同权：删除即永久删除）。
+ * 通过标记文件记录"示例已安装过"——用户删掉示例目录后重启不会再复活；
+ * 部分写入中途崩溃时标记未落，下次启动可补齐缺失的（目录级幂等，绝不覆盖已有剧本）。
  * 示例不依赖任何外部图片/音频素材（背景可在设置页「剧情系统 → 背景库」上传后，
  * 通过「覆盖背景」或剧本 background 事件的 user: 引用启用）；
  * 同时演示二期能力：数值条件（closeness >= / <=）与 chapter_end 分支结局（AI 判定结局以注释示例给出）。
@@ -7,6 +9,9 @@
 import { promises as fs } from 'fs'
 import path from 'path'
 import { paths } from '../storage'
+
+/** 示例剧本"已安装"标记文件名（位于 storiesDir 根下，用户不可见即可） */
+export const SAMPLES_MARKER_FILE = '.samples-installed'
 
 const STARLIGHT = `id: starlight-night
 title: 深夜观星
@@ -136,8 +141,19 @@ events:
   - type: chapter_end
 `
 
-/** 首次启动写入示例剧本（按剧本 id 目录是否已存在判断，绝不覆盖用户数据） */
+/**
+ * 写入示例剧本（按剧本 id 目录是否已存在判断，绝不覆盖用户数据）。
+ * 默认只生效一次：storiesDir 下存在安装标记即整体跳过——示例删除后与普通剧本一样不会复活。
+ * 部分写入中途崩溃时标记未落，下次启动可补齐缺失的（目录级幂等）。
+ */
 export async function ensureSampleStories(): Promise<void> {
+  const marker = path.join(paths.storiesDir, SAMPLES_MARKER_FILE)
+  try {
+    await fs.access(marker)
+    return // 标记已存在：示例安装过（可能已被用户删除），不再写入
+  } catch {
+    // 无标记：首次安装，继续写入
+  }
   const samples: Array<{ id: string; files: Record<string, string> }> = [
     {
       id: 'starlight-night',
@@ -173,4 +189,6 @@ export async function ensureSampleStories(): Promise<void> {
     }
     console.log('[story] 已写入示例剧本：%s', sample.id)
   }
+  // 全部写入完成后落安装标记（写一半崩溃则标记未落，下次启动可补齐缺失的）
+  await fs.writeFile(marker, new Date().toISOString(), 'utf-8')
 }

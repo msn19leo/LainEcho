@@ -142,6 +142,7 @@ export async function listScripts(): Promise<ScriptIndexItem[]> {
         cover: meta.value.cover ?? null,
         chapters: chapterCount,
         characterCardId: meta.value.characters?.[0]?.cardId ?? null,
+        spriteSetId: meta.value.spriteSetId ?? null,
       })
     } catch (err) {
       console.warn('[story] 读取剧本元信息失败（跳过）：%s', name, err instanceof Error ? err.message : err)

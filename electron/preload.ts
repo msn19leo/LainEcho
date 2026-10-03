@@ -76,21 +76,19 @@ const api: WindowApi = {
     reembedAll: () => ipcRenderer.invoke('memory:reembed-all'),
     /** 测试嵌入配置连通性（独立地址/模型/Key） */
     testEmbedding: () => ipcRenderer.invoke('memory:test-embedding'),
-    /** 读取画像/编年史档案 */
+    /** 读取画像档案 */
     getProfile: (cardId) => ipcRenderer.invoke('memory:get-profile', { cardId }),
-    /** 触发画像/编年史整理 */
-    consolidateProfile: (cardId) => ipcRenderer.invoke('memory:consolidate-profile', { cardId }),
+    getProfileOverview: () => ipcRenderer.invoke('memory:get-profile-overview') as Promise<Array<{ key: string; personaDigest: string; personaUpdatedAt: number }>>,
+    /** 触发画像整理 */
+    consolidateProfile: (cardId) => ipcRenderer.invoke('memory:consolidate-profile', { cardId }) as Promise<{ ok: boolean; draft: string | null; error?: string }>,
+    /** 切换画像注入开关（false = 暂停注入，画像保留） */
+    setProfileEnabled: (cardId, enabled) => ipcRenderer.invoke('memory:set-profile-enabled', { cardId, enabled }),
     /** 采纳/放弃画像草稿 */
     adoptProfile: (cardId, adopt) => ipcRenderer.invoke('memory:adopt-profile', { cardId, adopt }),
     /** 编辑已生效画像文本（空串 = 清除画像） */
     updateProfileDigest: (cardId, text) => ipcRenderer.invoke('memory:update-profile-digest', { cardId, text }),
     /** 删除已生效画像 */
     deleteProfileDigest: (cardId) => ipcRenderer.invoke('memory:delete-profile-digest', { cardId }),
-    /** 编辑单条编年史条目 */
-    updateChronicleEntry: (cardId, entryId, text) =>
-      ipcRenderer.invoke('memory:update-chronicle-entry', { cardId, entryId, text }),
-    /** 删除单条编年史条目 */
-    deleteChronicleEntry: (cardId, entryId) => ipcRenderer.invoke('memory:delete-chronicle-entry', { cardId, entryId }),
   },
   session: {
     list: () => ipcRenderer.invoke('session:list'),
@@ -109,6 +107,8 @@ const api: WindowApi = {
     list: () => ipcRenderer.invoke('model:list'),
     motionGroups: (modelId) => ipcRenderer.invoke('model:motion-groups', modelId),
     expressionList: (modelId) => ipcRenderer.invoke('model:expression-list', modelId),
+    getPalette: (modelId) => ipcRenderer.invoke('model:get-palette', modelId),
+    updatePalette: (modelId, palette) => ipcRenderer.invoke('model:update-palette', modelId, palette),
     scanAssets: (modelId) => ipcRenderer.invoke('model:scan-assets', modelId),
     importFromFolder: () => ipcRenderer.invoke('model:import-from-folder'),
     rename: (modelId, name) => ipcRenderer.invoke('model:rename', modelId, name),
@@ -121,6 +121,7 @@ const api: WindowApi = {
     importFromFolder: () => ipcRenderer.invoke('sprite:import-from-folder'),
     remove: (spriteId) => ipcRenderer.invoke('sprite:remove', spriteId),
     update: (spriteId, patch) => ipcRenderer.invoke('sprite:update', spriteId, patch),
+    annotate: (spriteId) => ipcRenderer.invoke('sprite:annotate', spriteId),
     onChanged: (cb) => {
       const listener = () => cb()
       ipcRenderer.on('pet:sprites-changed', listener)
@@ -243,7 +244,7 @@ const api: WindowApi = {
     reportReadingActive: (active: boolean) => ipcRenderer.send('pet:reading-active', active),
     /** 订阅 AI 回复情绪事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
     onEmotion: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, emotion: import('../src/types').StandardEmotion) => cb(emotion)
+      const listener = (_e: Electron.IpcRendererEvent, emotion: string) => cb(emotion)
       ipcRenderer.on('pet:emotion', listener)
       return () => ipcRenderer.removeListener('pet:emotion', listener)
     },
@@ -338,6 +339,7 @@ const api: WindowApi = {
     stop: (runId) => ipcRenderer.invoke('story:stop', runId),
     getState: (runId) => ipcRenderer.invoke('story:get-state', runId),
     getRun: (runId) => ipcRenderer.invoke('story:get-run', runId),
+    consolidateMemory: (runId) => ipcRenderer.invoke('story:consolidate-memory', runId) as Promise<{ ok: boolean; nothing?: boolean; written?: number; error?: string }>,
     setSpriteView: (runId, view) => ipcRenderer.invoke('story:set-sprite-view', { runId, view }),
     synthesize: (params) => ipcRenderer.invoke('story:tts-synthesize', params),
     openWindow: () => ipcRenderer.send('app:open-story-window'),
@@ -345,6 +347,14 @@ const api: WindowApi = {
     openEditor: (scriptId) => ipcRenderer.invoke('story:open-editor', scriptId),
     /** 新增骨架剧本并直接进入编辑器 */
     editorCreate: () => ipcRenderer.invoke('story:editor-create') as Promise<{ ok: boolean; scriptId?: string; error?: string }>,
+    /** 编辑器素材清单：剧本内图片/音乐 + 用户背景库/音乐库（背景与音乐事件下拉选择用，user: 引用） */
+    editorAssets: (scriptId) => ipcRenderer.invoke('story:editor-assets', scriptId),
+    /** 音乐库：列表 / 上传（弹文件框）/ 删除；剧情窗 BGM 以 pet-res://story-music/ 读取 */
+    listMusics: () => ipcRenderer.invoke('story:list-musics'),
+    uploadMusics: () => ipcRenderer.invoke('story:upload-musics'),
+    removeMusic: (name) => ipcRenderer.invoke('story:remove-music', name),
+    /** 音乐库资源 URL：pet-res://story-music/{文件名}（music 事件 user: 引用解析用） */
+    musicUrl: (name) => `pet-res://story-music/${name.split('\\').join('/')}`,
     /** 编辑器当前编辑的剧本 id（窗口创建时由主进程记住） */
     editorCurrent: () => ipcRenderer.invoke('story:editor-current') as Promise<string | null>,
     /** 编辑器读取剧本（结构化 + 原文双份；允许带错读取） */

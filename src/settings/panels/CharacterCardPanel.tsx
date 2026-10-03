@@ -4,7 +4,7 @@
  * 借鉴 airi 多 Tab 编辑器设计，精简为三个 Tab：
  * - 人设：name / 动漫角色复刻结构（存在锚点/内心结构/感知方式/关系模式/语言质感/
  *   状态系统/世界观碎片/禁止项/自由补充，折叠分组编辑）+ 对话增强 + AI 生成草稿
- * - 外观：modelId / avatar / modelOverride（表情/待机动作覆盖）
+ * - 外观：modelId / avatar
  * - 声音：voiceId / ttsOverride（language/autoPlay 覆盖）
  */
 import { useEffect, useState } from 'react'
@@ -28,13 +28,10 @@ import { useCharacterStore } from '../../store/characterStore'
 import type {
   CharacterCard,
   CharacterCardInput,
-  CharacterModelOverride,
   CharacterPersona,
   CharacterSprite,
   CharacterTTSOverride,
-  ExpressionMeta,
   RenderMode,
-  StandardEmotion,
   TTSLanguage,
   VoiceReference,
 } from '../../types'
@@ -49,9 +46,9 @@ import {
   Loading,
   Modal,
   SegmentedControl,
-  Select,
   Textarea,
 } from '../../components/ui'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import { truncate } from '../../lib/utils'
 
@@ -103,9 +100,6 @@ interface EditorState {
   ttsModelId: string
   // TTS 覆盖
   ttsLanguageOverride: 'global' | TTSLanguage
-  // 模型覆盖
-  expressionOverride: 'global' | string
-  idleAnimationOverride: 'global' | string
   // 形象呈现（2D 立绘 / Live2D 并行切换）
   /** 'global' = 跟随全局当前形象（角色模型面板中选 live2d 还是立绘） */
   renderMode: 'global' | RenderMode
@@ -124,8 +118,6 @@ const EMPTY_EDITOR: EditorState = {
   voiceMode: 'none',
   ttsModelId: '',
   ttsLanguageOverride: 'global',
-  expressionOverride: 'global',
-  idleAnimationOverride: 'global',
   renderMode: 'global',
   spriteId: '',
 }
@@ -211,33 +203,12 @@ function editorToTtsOverride(language: 'global' | TTSLanguage): CharacterTTSOver
   return { language: lang }
 }
 
-/** 将 CharacterModelOverride 转为编辑器选择值 */
-function expressionToEditor(v: CharacterModelOverride | null): 'global' | string {
-  if (v?.selectedExpression === null || v?.selectedExpression === undefined) return 'global'
-  return v.selectedExpression
-}
-
-function idleAnimToEditor(v: CharacterModelOverride | null): 'global' | string {
-  if (v?.idleAnimation === null || v?.idleAnimation === undefined) return 'global'
-  return v.idleAnimation
-}
-
-/** 将编辑器选择值转为 CharacterModelOverride */
-function editorToModelOverride(expression: 'global' | string, idleAnim: 'global' | string): CharacterModelOverride | null {
-  const expr = expression === 'global' ? null : expression
-  const idle = idleAnim === 'global' ? null : idleAnim
-  if (expr === null && idle === null) return null
-  return { selectedExpression: expr, idleAnimation: idle }
-}
-
 export function CharacterCardPanel() {
   const { cards, loading, load } = useCharacterStore()
   const [models, setModels] = useState<{ id: string; name: string }[]>([])
   const [voices, setVoices] = useState<VoiceReference[]>([])
   const [ttsModels, setTtsModels] = useState<import('../../types').TTSModelCard[]>([])
   const [sprites, setSprites] = useState<CharacterSprite[]>([])
-  const [expressions, setExpressions] = useState<ExpressionMeta[]>([])
-  const [motionGroups, setMotionGroups] = useState<string[]>([])
   const [editor, setEditor] = useState<EditorState | null>(null)
   const [activeTab, setActiveTab] = useState<EditorTab>('persona')
   const [deleting, setDeleting] = useState<CharacterCard | null>(null)
@@ -280,26 +251,6 @@ export function CharacterCardPanel() {
     }
   }
 
-  /** 根据 modelId 加载表情列表和动作组（编辑器外观 Tab 用） */
-  const loadModelAssets = async (modelId: string) => {
-    if (!modelId) {
-      setExpressions([])
-      setMotionGroups([])
-      return
-    }
-    try {
-      const [exprList, groups] = await Promise.all([
-        api.model.expressionList(modelId),
-        api.model.motionGroups(modelId),
-      ])
-      setExpressions(exprList)
-      setMotionGroups(groups)
-    } catch {
-      setExpressions([])
-      setMotionGroups([])
-    }
-  }
-
   useEffect(() => {
     void load()
     void loadModels()
@@ -321,15 +272,6 @@ export function CharacterCardPanel() {
     return () => window.removeEventListener('focus', onFocus)
   }, [])
 
-  // 编辑器 modelId 变化时加载表情/动作组
-  useEffect(() => {
-    if (editor?.modelId) void loadModelAssets(editor.modelId)
-    else {
-      setExpressions([])
-      setMotionGroups([])
-    }
-  }, [editor?.modelId])
-
   /** 打开新建编辑器 */
   const openCreate = () => {
     setEditor({ ...EMPTY_EDITOR })
@@ -348,8 +290,6 @@ export function CharacterCardPanel() {
       voiceMode: card.voiceMode ?? (card.voiceId ? 'mimo' : 'none'),
       ttsModelId: card.genieOverride?.ttsModelId ?? '',
       ttsLanguageOverride: ttsLanguageToEditor(card.ttsOverride),
-      expressionOverride: expressionToEditor(card.modelOverride),
-      idleAnimationOverride: idleAnimToEditor(card.modelOverride),
       renderMode: card.renderMode ?? 'global',
       spriteId: card.spriteId ?? '',
     })
@@ -373,11 +313,8 @@ export function CharacterCardPanel() {
             ? { ttsModelId: editor.ttsModelId }
             : null,
         ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride),
-        modelOverride: editorToModelOverride(editor.expressionOverride, editor.idleAnimationOverride),
         renderMode: editor.renderMode === 'global' ? null : editor.renderMode,
         spriteId: editor.spriteId || null,
-        emotionMap: null,
-        live2dExpressionMap: null,
         avatar: editor.card?.avatar ?? null,
       }
 
@@ -481,11 +418,6 @@ export function CharacterCardPanel() {
                 {card.ttsOverride && (
                   <span className="rounded-full bg-warning/15 px-2 py-1 text-[10px] text-warning ring-1 ring-warning/30">
                     TTS覆盖
-                  </span>
-                )}
-                {card.modelOverride && (
-                  <span className="rounded-full bg-warning/15 px-2 py-1 text-[10px] text-warning ring-1 ring-warning/30">
-                    外观覆盖
                   </span>
                 )}
               </div>
@@ -870,66 +802,29 @@ export function CharacterCardPanel() {
                 {editor.renderMode === 'live2d' ? (
                   <>
                     <Field label="绑定 Live2D 模型（可选）" hint="不绑定则使用全局当前模型">
-                      <Select
+                      <SelectMenu
                         value={editor.modelId}
-                        onChange={(e) => setEditor({ ...editor, modelId: e.target.value })}
-                      >
-                        <option value="">不绑定（使用全局当前模型）</option>
-                        {models.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name}
-                          </option>
-                        ))}
-                      </Select>
+                        onChange={(v) => setEditor({ ...editor, modelId: v })}
+                        options={[
+                          { value: '', label: '不绑定（使用全局当前模型）' },
+                          ...models.map((m) => ({ value: m.id, label: m.name })),
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
-                    <Field label="表情覆盖（modelOverride.selectedExpression）" hint="角色级表情覆盖。需先绑定模型。null = 跟随全局；空串 = 清除表情">
-                      <Select
-                        value={editor.expressionOverride}
-                        onChange={(e) => setEditor({ ...editor, expressionOverride: e.target.value as 'global' | string })}
-                        disabled={!editor.modelId}
-                      >
-                        <option value="global">跟随全局</option>
-                        <option value="">清除表情（不应用任何表情）</option>
-                        {expressions.map((ex) => (
-                          <option key={ex.name} value={ex.name}>
-                            {ex.name}
-                          </option>
-                        ))}
-                      </Select>
-                    </Field>
-                    <Field label="待机动作覆盖（modelOverride.idleAnimation）" hint="角色级待机动作组覆盖。需先绑定模型。null = 跟随全局；空串 = 不应用动作（模型静止）">
-                      <Select
-                        value={editor.idleAnimationOverride}
-                        onChange={(e) => setEditor({ ...editor, idleAnimationOverride: e.target.value as 'global' | string })}
-                        disabled={!editor.modelId}
-                      >
-                        <option value="global">跟随全局</option>
-                        <option value="">不应用动作</option>
-                        {motionGroups.map((g) => (
-                          <option key={g} value={g}>
-                            {g}
-                          </option>
-                        ))}
-                      </Select>
-                    </Field>
-                    {!editor.modelId && (
-                      <p className="text-xs text-text-muted">绑定 Live2D 模型后可选择表情/待机动作覆盖</p>
-                    )}
                   </>
                 ) : editor.renderMode === 'sprite' ? (
                   <>
                     <Field label="绑定 2D 立绘集（可选）" hint="不绑定则使用全局当前立绘集（在「角色模型」中选中）。">
-                      <Select
+                      <SelectMenu
                         value={editor.spriteId}
-                        onChange={(e) => setEditor({ ...editor, spriteId: e.target.value })}
-                      >
-                        <option value="">不绑定（使用全局当前立绘集）</option>
-                        {sprites.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </Select>
+                        onChange={(v) => setEditor({ ...editor, spriteId: v })}
+                        options={[
+                          { value: '', label: '不绑定（使用全局当前立绘集）' },
+                          ...sprites.map((s) => ({ value: s.id, label: s.name })),
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
                     {editor.spriteId && (
                       <p className="text-xs text-text-muted">情绪映射使用角色模型中 2D 立绘卡所设置的情绪映射</p>
@@ -976,31 +871,31 @@ export function CharacterCardPanel() {
                 {editor.voiceMode === 'genie' && (
                   <>
                     <Field label="绑定 TTS 模型" hint="选择本地声库的角色 TTS 模型。需先在「语音合成」中创建模型卡。">
-                      <Select
+                      <SelectMenu
                         value={editor.ttsModelId}
-                        onChange={(e) => setEditor({ ...editor, ttsModelId: e.target.value })}
-                      >
-                        <option value="">选择 TTS 模型…</option>
-                        {ttsModels.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name}
-                          </option>
-                        ))}
-                      </Select>
+                        onChange={(v) => setEditor({ ...editor, ttsModelId: v })}
+                        options={[
+                          { value: '', label: '选择 TTS 模型…' },
+                          ...ttsModels.map((m) => ({ value: m.id, label: m.name })),
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
                     {!editor.ttsModelId && (
                       <p className="text-[11px] text-warning">请先在「设置 → 语音合成」中创建角色 TTS 模型卡</p>
                     )}
                     <Field label="TTS 语言覆盖" hint="角色级语言覆盖（跟随全局 = 用设置页语言）">
-                      <Select
+                      <SelectMenu
                         value={editor.ttsLanguageOverride}
-                        onChange={(e) => setEditor({ ...editor, ttsLanguageOverride: e.target.value as 'global' | TTSLanguage })}
+                        onChange={(v) => setEditor({ ...editor, ttsLanguageOverride: v as 'global' | TTSLanguage })}
                         disabled={!editor.ttsModelId}
-                      >
-                        <option value="global">跟随全局</option>
-                        <option value="zh">强制中文</option>
-                        <option value="ja">强制日文</option>
-                      </Select>
+                        options={[
+                          { value: 'global', label: '跟随全局' },
+                          { value: 'zh', label: '强制中文' },
+                          { value: 'ja', label: '强制日文' },
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
                   </>
                 )}
@@ -1009,28 +904,28 @@ export function CharacterCardPanel() {
                 {editor.voiceMode === 'mimo' && (
                   <>
                     <Field label="绑定参考音频" hint="绑定后该角色回复用此声音克隆合成。需先在「语音合成」中导入参考音频。">
-                      <Select
+                      <SelectMenu
                         value={editor.voiceId}
-                        onChange={(e) => setEditor({ ...editor, voiceId: e.target.value })}
-                      >
-                        <option value="">选择参考音频…</option>
-                        {voices.map((v) => (
-                          <option key={v.id} value={v.id}>
-                            {v.name}
-                          </option>
-                        ))}
-                      </Select>
+                        onChange={(v) => setEditor({ ...editor, voiceId: v })}
+                        options={[
+                          { value: '', label: '选择参考音频…' },
+                          ...voices.map((v) => ({ value: v.id, label: v.name })),
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
                     <Field label="TTS 语言覆盖" hint="角色级语言覆盖（跟随全局 = 用设置页语言）">
-                      <Select
+                      <SelectMenu
                         value={editor.ttsLanguageOverride}
-                        onChange={(e) => setEditor({ ...editor, ttsLanguageOverride: e.target.value as 'global' | TTSLanguage })}
+                        onChange={(v) => setEditor({ ...editor, ttsLanguageOverride: v as 'global' | TTSLanguage })}
                         disabled={!editor.voiceId}
-                      >
-                        <option value="global">跟随全局</option>
-                        <option value="zh">强制中文</option>
-                        <option value="ja">强制日文</option>
-                      </Select>
+                        options={[
+                          { value: 'global', label: '跟随全局' },
+                          { value: 'zh', label: '强制中文' },
+                          { value: 'ja', label: '强制日文' },
+                        ]}
+                        className="w-full"
+                      />
                     </Field>
                     {!editor.voiceId && (
                       <p className="text-xs text-text-muted">选择参考音频后可配置语言覆盖</p>

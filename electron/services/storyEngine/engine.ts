@@ -1,5 +1,5 @@
 /**
- * 剧情引擎：线性游标执行器（参照 LingChat EventsHandler 顺序迭代模型）。
+ * 剧情引擎：线性游标执行器。
  * 关键差异：用 Promise 挂起替代 Rust 侧 oneshot channel 阻塞。
  *
  * v2.0：与聊天系统完全分离——引擎跑在 run 存档（data/story-runs/）上，
@@ -31,6 +31,7 @@ import { runChatTurn } from '../chatTurn'
 import { windowManager } from '../../windows/windowManager'
 import { loadScript } from './loader'
 import { appendRunMessages, createRun, getRun, updateRunSpriteView, updateRunState } from './runs'
+import { consolidateStoryMemory } from './storyMemory'
 import { judgeEnding } from './judge'
 import { evalCondition } from './conditions'
 
@@ -56,6 +57,9 @@ export interface RunRuntime {
   startMode: 'start' | 'resume'
   /** 剧情窗是否已完成首次接入（此后重开一律按 resume 处理，不重播全文） */
   attached: boolean
+  /** AI 背景联动是否启用（剧本 story.yaml 显式 aiBackground: true 才开启；默认关闭——
+   *  防止模型因台词/旁白提及景物（如"夕阳"）而误切到同名词背景） */
+  allowAiBackground: boolean
   /** 已通过（或已判定不满足）enterWhen 的章节 file 集合（7.5 防环：每章每次演出至多求值一次；
    *  仅运行期内存态——存档保存的游标一定是"已通过检查"的章节，续玩恢复时预标记当前章不再重复检查） */
   enterWhenVisited: Set<string>
@@ -211,7 +215,8 @@ export async function startStory(params: {
     const rt: RunRuntime = {
       run,
       bundle: rtBundle,
-      background: run.backgroundOverride ?? null,
+      // 背景恢复优先级：本次演出覆盖背景 > 存档的背景状态（background 事件/AI 联动持久化）
+      background: run.backgroundOverride ?? run.storyState.background ?? null,
       backgroundChoices: await collectBackgroundChoices(path.join(paths.storiesDir, run.scriptId)),
       music: null,
       pending: null,
@@ -220,6 +225,7 @@ export async function startStory(params: {
       thinking: false,
       startMode: 'resume',
       attached: false,
+      allowAiBackground: rtBundle.meta.aiBackground === true,
       // 续玩：存档游标一定是"已通过 enterWhen 检查"的章节，预标记避免变量随剧情变化后被中途踢出章节
       enterWhenVisited: new Set([rtBundle.chapters[run.storyState.chapterIndex]?.file].filter((f): f is string => !!f)),
     }
@@ -254,6 +260,7 @@ export async function startStory(params: {
     startMode: 'start',
     attached: false,
     enterWhenVisited: new Set(),
+    allowAiBackground: bundle.meta.aiBackground === true,
   }
   runtimes.set(run.runId, rt)
   console.log('[story] 剧情启动：%s（%s）→ run %s', scriptId, bundle.meta.title, run.runId)
@@ -332,6 +339,9 @@ async function endStory(rt: RunRuntime): Promise<void> {
   console.log('[story] 剧情完结：%s（run %s）', rt.run.scriptId, rt.run.runId)
   broadcastState(rt)
   runtimes.delete(rt.run.runId)
+  // 末章沉淀（fire-and-forget）：storyState 已落盘，沉淀模块按 run 文件读切片，与运行时清理无关；
+  // 失败游标原地，用户可在剧情窗完结屏手动兜底
+  void consolidateStoryMemory(rt.run.runId)
 }
 
 // ---------------- 主循环 ----------------
@@ -417,6 +427,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
         }
       }
       rt.background = event.image
+      rt.run.storyState.background = event.image // 随游标推进持久化：续玩时恢复演出画面
       broadcastEvent(rt, event)
       return false
     }
@@ -453,6 +464,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
           content: `（剧情演出：${event.prompt}）`,
           meta: { ...meta, storyKind: 'narration' },
           storyDirective: buildStoryDirective(rt, event.prompt),
+          spriteId: rt.run.spriteId, // 演出词表：AI 情绪值域与解析按 run 绑定的立绘集
           store: { cardId: rt.run.cardId, history: [...rt.run.messages], append: (msgs) => appendTurnMessages(rt, msgs), storyRunId: rt.run.runId },
         })
         broadcastMessageSync(rt)
@@ -489,6 +501,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
             content: text,
             meta: { ...meta, storyKind: 'free' },
             storyDirective: buildStoryDirective(rt),
+            spriteId: rt.run.spriteId, // 演出词表：AI 情绪值域与解析按 run 绑定的立绘集
             store: { cardId: rt.run.cardId, history: [...rt.run.messages], append: (msgs) => appendTurnMessages(rt, msgs), storyRunId: rt.run.runId },
           })
           broadcastMessageSync(rt)
@@ -595,6 +608,9 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
           rt.run.storyState.eventIndex = -1 // 交还主循环后统一推进为 0
           console.log('[story] 章节切换 → %s（run %s）', next, rt.run.runId)
           broadcastState(rt)
+          // 剧情记忆沉淀（戏内延续）：把刚演完的章节沉淀为陪伴记忆。fire-and-forget 不阻塞演出；
+          // 沉淀模块自管游标与串行（重复触发/失败重试见 storyMemory.ts）
+          void consolidateStoryMemory(rt.run.runId)
           return false
         }
         console.warn('[story] chapter_end 指向的章节不存在：%s（视为完结）', next)
@@ -609,7 +625,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
 
 // ---------------- 挂起交互 ----------------
 
-/** 挂起等待渲染端提交交互结果（Promise 挂起替代 LingChat 的 oneshot channel） */
+/** 挂起等待渲染端提交交互结果 */
 function waitRespond(rt: RunRuntime): Promise<StoryResponse> {
   return new Promise<StoryResponse>((resolve) => {
     rt.resolver = resolve
@@ -633,10 +649,13 @@ function buildStoryDirective(rt: RunRuntime, prompt?: string): string {
   // 生成时长收敛（7.7 性能第一批）：硬性约束分段数量与每段长度，直接减少生成 token、缩短整轮等待
   lines.push('分段与长度硬性要求：dialogue 数组只输出 2~4 项，每项 1~2 句话（20~60 字），宁可少而精，不要长篇大论。')
   if (prompt) lines.push(`本段导演指令：${prompt}`)
-  if (!rt.run.backgroundOverride && rt.backgroundChoices.length > 0) {
+  // AI 背景联动（7.3）：仅当剧本作者写过 background 事件（allowAiBackground）且未启用覆盖背景时注入说明；
+  // 作者没写背景切换 = 不允许 AI 自行切背景（防止模型因台词/旁白提及景物而误切同名词背景）
+  if (!rt.run.backgroundOverride && rt.allowAiBackground && rt.backgroundChoices.length > 0) {
     lines.push(
-      '演出中如需切换背景，你可以在输出 JSON 对象的顶层额外输出一个 "background" 键（可省略，仅在场景确实发生变化时使用），' +
+      '演出中如需切换背景，你可以在输出 JSON 对象的顶层额外输出一个 "background" 键（可省略，仅在剧情场景确实发生地点转换时使用），' +
         `值为下列背景引用之一：${rt.backgroundChoices.join('、')}。` +
+        '注意：旁白或台词中"提到"某个景物名称不代表场景变化，严禁仅因文本提及某景物就切换到同名背景；' +
         '除此之外仍严格只保留一个顶层键 "dialogue"，不允许输出其他任何内容。',
     )
   }
@@ -644,9 +663,11 @@ function buildStoryDirective(rt: RunRuntime, prompt?: string): string {
 }
 
 /** 导演指令联动（7.3）：AI 回复携带的 background 字段 → 走现有 background 事件通道。
- *  仅接受背景清单内的引用（防止幻觉路径）；覆盖背景启用时联动关闭。 */
+ *  仅接受背景清单内的引用（防止幻觉路径）；覆盖背景启用时联动关闭；
+ *  剧本未写任何 background 事件时联动整体关闭（作者意图 = 不切背景，防 AI 误切，2026-09-26）。 */
 function applyStoryBackground(rt: RunRuntime, asst: ChatMessage): void {
   if (rt.run.backgroundOverride) return
+  if (!rt.allowAiBackground) return
   const ref = asst.meta?.storyBackground?.trim()
   if (!ref || ref === rt.background) return
   if (!rt.backgroundChoices.includes(ref)) {
@@ -654,6 +675,7 @@ function applyStoryBackground(rt: RunRuntime, asst: ChatMessage): void {
     return
   }
   rt.background = ref
+  rt.run.storyState.background = ref // 随游标推进持久化：续玩时恢复演出画面
   broadcastEvent(rt, { type: 'background', image: ref })
   console.log('[story] AI 背景联动：%s（run %s）', ref, rt.run.runId)
 }

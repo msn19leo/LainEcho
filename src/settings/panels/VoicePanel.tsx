@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 语音合成配置面板。
  * 双引擎：
  * - 本地声库（engine=genie，默认）：本地 GenieTTS 服务，声库自带性格；自动拉起 + 健康检测。
@@ -15,7 +15,7 @@ import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, Play, Plus, Trash2, XCircle, Pencil, PlugZap, Rocket, Loader2, FolderOpen, FileAudio } from 'lucide-react'
 import { api } from '../../api'
 import type { TTSConfig, VoiceReference, TTSLanguage, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../types'
-import { Button, Card, Field, Input, Loading, Modal, PanelHeader } from '../../components/ui'
+import { Button, Card, ConfirmModal, Field, Input, Loading, Modal, PanelHeader } from '../../components/ui'
 import { toast } from '../../components/toast'
 
 /** 测试合成的按语言默认文本 */
@@ -44,6 +44,8 @@ export function VoicePanel() {
   const [ttsModels, setTtsModels] = useState<TTSModelCard[]>([])
   /** 当前选中的模型卡（用于测试合成） */
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
+  /** 当前选中的参考音频 id（mimo 引擎测试合成用；null = 回退第一条） */
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string | null>(null)
   /** 模型卡编辑器 */
   const [showEditor, setShowEditor] = useState(false)
   const [editingModel, setEditingModel] = useState<TTSModelCard | null>(null)
@@ -203,11 +205,12 @@ export function VoicePanel() {
     }
   }
 
-  /** 删除参考音频 */
+  /** 删除参考音频（选中态同步清理） */
   const handleRemove = async (id: string) => {
     try {
       await api.tts.removeReference(id)
       setVoices((prev) => prev.filter((v) => v.id !== id))
+      if (selectedVoiceId === id) setSelectedVoiceId(null)
       toast('已删除')
     } catch (err) {
       toast(err instanceof Error ? err.message : '删除失败', 'error')
@@ -289,7 +292,10 @@ export function VoicePanel() {
     }
   }
 
-  /** 删除模型卡 */
+  /** 待删除的模型卡（非空 = 确认弹窗打开） */
+  const [deletingModel, setDeletingModel] = useState<TTSModelCard | null>(null)
+
+  /** 删除模型卡（确认弹窗 onConfirm 后执行） */
   const handleDeleteModel = async (id: string) => {
     try {
       await api.ttsModel.delete(id)
@@ -329,6 +335,8 @@ export function VoicePanel() {
         return
       }
     }
+    // mimo 引擎：选中参考音频优先，未选中回退第一条（保持旧行为兼容）
+    const targetVoice = voices.find((v) => v.id === selectedVoiceId) ?? voices[0]
     setTesting(true)
     setTestResult(null)
     try {
@@ -336,7 +344,7 @@ export function VoicePanel() {
       const speakText = testText.trim() || TEST_TEXT_DEFAULTS[lang]
       const audio = await api.tts.synthesize({
         text: speakText,
-        voiceId: isGenie ? null : voices[0]!.id,
+        voiceId: isGenie ? null : targetVoice!.id,
         engine: isGenie ? 'genie' : 'mimo',
         genieOverride: isGenie && selectedModelId ? { ttsModelId: selectedModelId } : null,
       })
@@ -362,6 +370,7 @@ export function VoicePanel() {
   if (!config || !genieCfg) return <Loading />
 
   const selectedModel = ttsModels.find((m) => m.id === selectedModelId)
+  const selectedVoice = voices.find((v) => v.id === selectedVoiceId) ?? null
 
   return (
     <div className="space-y-5">
@@ -543,7 +552,7 @@ export function VoicePanel() {
                       <Pencil size={13} strokeWidth={1.75} />
                     </button>
                     <button
-                      onClick={(e) => { e.stopPropagation(); void handleDeleteModel(model.id) }}
+                      onClick={(e) => { e.stopPropagation(); setDeletingModel(model) }}
                       title="删除"
                       className="rounded p-1 text-text-muted hover:text-danger hover:bg-danger/10"
                     >
@@ -632,10 +641,21 @@ export function VoicePanel() {
                 {voices.map((voice) => {
                   const duration = voice.durationSec
                   const durationWarn = duration > 0 && (duration < 5 || duration > 30)
+                  const isSelected = voice.id === selectedVoiceId
                   return (
                     <div
                       key={voice.id}
-                      className="flex items-center gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2/50 px-3 py-2.5"
+                      onClick={() => {
+                        // 重命名输入中点击行（聚焦输入框）不切换选中，避免误触
+                        if (renamingId !== voice.id) {
+                          setSelectedVoiceId(isSelected ? null : voice.id)
+                        }
+                      }}
+                      className={`flex items-center gap-3 rounded-[var(--radius-md)] border px-3 py-2.5 transition-all ${
+                        isSelected
+                          ? 'border-brand bg-brand/5 shadow-[0_0_8px_var(--primary-glow)] cursor-pointer'
+                          : 'border-border bg-surface-2/50 hover:border-border-strong cursor-pointer'
+                      }`}
                     >
                       <div className="min-w-0 flex-1">
                         {renamingId === voice.id ? (
@@ -664,14 +684,14 @@ export function VoicePanel() {
                         )}
                       </div>
                       <button
-                        onClick={() => startRename(voice)}
+                        onClick={(e) => { e.stopPropagation(); startRename(voice) }}
                         title="重命名"
                         className="rounded p-1 text-text-muted hover:text-text hover:bg-card-hover"
                       >
                         <Pencil size={13} strokeWidth={1.75} />
                       </button>
                       <button
-                        onClick={() => void handleRemove(voice.id)}
+                        onClick={(e) => { e.stopPropagation(); void handleRemove(voice.id) }}
                         title="删除"
                         className="rounded p-1 text-text-muted hover:text-danger hover:bg-danger/10"
                       >
@@ -680,6 +700,12 @@ export function VoicePanel() {
                     </div>
                   )
                 })}
+              </div>
+            )}
+
+            {selectedVoice && (
+              <div className="mt-3 rounded-[var(--radius-sm)] border border-info/30 bg-info/5 px-3 py-2 text-[11px] leading-relaxed text-text-muted">
+                <span className="font-medium text-info">当前选中：</span> {selectedVoice.name}（测试合成将使用此音频）
               </div>
             )}
           </Card>
@@ -702,7 +728,9 @@ export function VoicePanel() {
           <span className="text-xs text-text-muted">
             {config.engine === 'genie'
               ? selectedModel ? `本地声库：${selectedModel.name}` : '请先选择一个 TTS 模型卡'
-              : '云端引擎：使用第一条参考音频合成'}
+              : selectedVoice
+                ? `云端引擎：使用「${selectedVoice.name}」合成`
+                : '云端引擎：未选中参考音频，将使用第一条合成'}
           </span>
           <Button variant="outline" onClick={() => void handleTest()} disabled={testing}>
             {testing ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} strokeWidth={2} />}
@@ -720,6 +748,20 @@ export function VoicePanel() {
           </div>
         )}
       </Card>
+
+      {/* 删除模型卡确认弹窗 */}
+      <ConfirmModal
+        open={!!deletingModel}
+        title="删除 TTS 模型"
+        message={`确定删除模型「${deletingModel?.name ?? ''}」吗？绑定该模型的角色卡将失去本地声库语音。`}
+        confirmText="删除"
+        danger
+        onConfirm={() => {
+          if (deletingModel) void handleDeleteModel(deletingModel.id)
+          setDeletingModel(null)
+        }}
+        onClose={() => setDeletingModel(null)}
+      />
 
       {/* 模型卡编辑器 Modal */}
       <Modal

@@ -10,10 +10,10 @@
 import { ipcMain, dialog } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
-import type { TTSConfig, TTSLanguage, VoiceReference, StandardEmotion, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../src/types'
+import type { TTSConfig, TTSLanguage, VoiceReference, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../src/types'
 import { paths, readJson, writeJson, mutateJson, deleteFile } from '../services/storage'
 import { saveSecret, readSecret, hasSecret } from '../services/crypto'
-import { genId, assertValidResourceId, listTTSModels, getTTSModel, createTTSModel, updateTTSModel, deleteTTSModel } from '../services/repository'
+import { genId, assertValidResourceId, listTTSModels, getTTSModel, createTTSModel, updateTTSModel, deleteTTSModel, listCharacterCards } from '../services/repository'
 import { synthesizeWithMiMo, bufferToBase64 } from '../services/ttsClient'
 import {
   getGenieConfig,
@@ -241,12 +241,24 @@ export function registerTtsIpc(): void {
     readJson<VoiceReference[]>(paths.voicesIndexFile, DEFAULT_VOICES),
   )
 
-  /** 删除指定参考音频（同时删除文件与索引条目） */
+  /**
+   * 删除指定参考音频（同时删除文件与索引条目）。
+   * 删除前校验角色卡引用：仍被绑定时拒绝删除，
+   * 否则绑定该音频的角色在聊天合成时会静默失败（仅报"参考音频不存在"）。
+   */
   ipcMain.handle('tts:remove-reference', async (_e, id: string) => {
     assertValidVoiceId(id)
     const list = await readJson<VoiceReference[]>(paths.voicesIndexFile, DEFAULT_VOICES)
     const voice = list.find((v) => v.id === id)
     if (!voice) return
+
+    // 校验角色卡引用：列出仍绑定此音频的角色卡名称，提示先解绑
+    const cards = await listCharacterCards()
+    const boundCards = cards.filter((c) => c.voiceId === id)
+    if (boundCards.length > 0) {
+      const names = boundCards.map((c) => c.name).join('、')
+      throw new Error(`该参考音频仍被角色卡「${names}」绑定，请先在角色卡中解绑后再删除`)
+    }
 
     // 删除音频文件
     await deleteFile(path.join(paths.voicesDir, voice.filePath)).catch(() => {})
@@ -285,7 +297,7 @@ export function registerTtsIpc(): void {
    * @param params.genieOverride 角色级 Genie 覆盖（绑定的 TTS 模型卡 id）
    * @returns wav 格式的 ArrayBuffer，调用失败抛出错误
    */
-  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: StandardEmotion | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }) => {
+  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }) => {
     const { text, voiceId, languageOverride, engine: engineOverride, genieOverride } = params ?? {}
     if (typeof text !== 'string' || !text.trim()) {
       throw new Error('合成文本不能为空')

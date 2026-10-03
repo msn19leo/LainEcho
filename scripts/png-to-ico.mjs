@@ -1,8 +1,9 @@
 /**
  * 将 build/icon.png 转换为标准多尺寸 Windows 图标 build/icon.ico。
  * 纯 Node 实现（zlib 解码/编码 + 自写 PNG 解析与合成），无任何第三方依赖。
- * 流程：解析 PNG → 还原 RGBA 像素 → 逐级缩放到多个尺寸 → 各自编码为 PNG →
- *       组装进 ICO 容器（每个尺寸一个目录项）。
+ * 流程：解析 PNG → 还原 RGBA 像素 → 每个目标尺寸从原图直接 Lanczos 缩放
+ *       （避免多级缩放的低通滤波累积发虚）→ 小尺寸做轻度 USM 锐化 →
+ *       各自编码为 PNG → 组装进 ICO 容器（每个尺寸一个目录项）。
  * 用法：node scripts/png-to-ico.mjs
  */
 import { inflateSync, deflateSync } from 'node:zlib'
@@ -10,8 +11,15 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** 需要输出的图标尺寸（Windows 图标标准规格） */
-const SIZES = [256, 128, 64, 48, 32, 16]
+/**
+ * 需要输出的图标尺寸。
+ * 覆盖 Windows 标准规格 + 125%/150% DPI 常用量子（20/24/40/96）：
+ * 缺失这些尺寸时 Windows 会拉伸邻近尺寸渲染，导致显示发糊。
+ */
+const SIZES = [256, 128, 96, 64, 48, 40, 32, 24, 20, 16]
+
+/** 小尺寸 USM 锐化强度（amount），尺寸越小缩放后越虚所以越强；未列出的尺寸不锐化 */
+const SHARPEN = { 16: 0.5, 20: 0.45, 24: 0.4, 32: 0.35, 40: 0.3, 48: 0.25, 64: 0.15 }
 
 // ---------------- PNG 解码 ----------------
 
@@ -146,9 +154,10 @@ function resampleAxis(src, dstLen, scale) {
     let sum = 0
     let wsum = 0
     for (let sx = start; sx <= end; sx++) {
-      if (sx < 0 || sx >= src.length) continue
+      // 边缘钳位而非丢弃样本，避免图标边框出现亮/暗边
+      const sc = sx < 0 ? 0 : sx >= src.length ? src.length - 1 : sx
       const w = lanczosKernel((center - sx) * Math.min(1 / scale, 1))
-      sum += src[sx] * w
+      sum += src[sc] * w
       wsum += w
     }
     out[x] = wsum > 0 ? sum / wsum : 0
@@ -210,6 +219,81 @@ function resize(src, size) {
     }
   }
   return { width: size, height: size, rgba }
+}
+
+/**
+ * 3x3 高斯模糊（可分离 [1,2,1]/4 卷积），在预乘 alpha 空间处理，
+ * 透明边缘不会渗入黑色。仅作为 USM 锐化的模糊基准使用。
+ * @param {{ width: number, height: number, rgba: Buffer }} img 输入图
+ * @returns {number[][]} 四通道（预乘 RGB + alpha）模糊结果
+ */
+function blur3x3(img) {
+  const { width, height, rgba } = img
+  const n = width * height
+  const ch = [0, 1, 2, 3].map((c) => {
+    const a = new Array(n)
+    for (let i = 0; i < n; i++) a[i] = rgba[i * 4 + c]
+    return a
+  })
+  for (let i = 0; i < n; i++) {
+    const a = ch[3][i] / 255
+    ch[0][i] *= a
+    ch[1][i] *= a
+    ch[2][i] *= a
+  }
+  // 水平 [1,2,1]/4
+  const horiz = ch.map((src) => {
+    const out = new Array(n)
+    for (let y = 0; y < height; y++) {
+      const base = y * width
+      for (let x = 0; x < width; x++) {
+        const l = src[base + (x > 0 ? x - 1 : 0)]
+        const r = src[base + (x < width - 1 ? x + 1 : width - 1)]
+        out[base + x] = (l + 2 * src[base + x] + r) / 4
+      }
+    }
+    return out
+  })
+  // 垂直 [1,2,1]/4
+  return horiz.map((src) => {
+    const out = new Array(n)
+    for (let y = 0; y < height; y++) {
+      const up = (y > 0 ? y - 1 : 0) * width
+      const mid = y * width
+      const dn = (y < height - 1 ? y + 1 : height - 1) * width
+      for (let x = 0; x < width; x++) {
+        out[mid + x] = (src[up + x] + 2 * src[mid + x] + src[dn + x]) / 4
+      }
+    }
+    return out
+  })
+}
+
+/**
+ * USM 锐化（Unsharp Mask）：out = 原图 + amount × (原图 - 模糊)。
+ * 图标缩小后边缘对比度下降、观感发虚，轻度锐化可显著找回清晰度。
+ * 在预乘空间计算，最后按新 alpha 还原，透明边缘无暗边。
+ * @param {{ width: number, height: number, rgba: Buffer }} img 输入图
+ * @param {number} amount 锐化强度（0.1~0.6 为合理范围）
+ * @returns {{ width: number, height: number, rgba: Buffer }}
+ */
+function unsharpMask(img, amount) {
+  const { width, height, rgba } = img
+  const blur = blur3x3(img)
+  const out = Buffer.alloc(width * height * 4)
+  for (let i = 0; i < width * height; i++) {
+    const a0 = rgba[i * 4 + 3]
+    const a = Math.max(0, Math.min(255, Math.round(a0 + amount * (a0 - blur[3][i]))))
+    out[i * 4 + 3] = a
+    if (a <= 0) continue
+    const inv = 255 / a
+    for (let c = 0; c < 3; c++) {
+      const o = (rgba[i * 4 + c] * a0) / 255
+      const v = o + amount * (o - blur[c][i])
+      out[i * 4 + c] = Math.max(0, Math.min(255, Math.round(v * inv)))
+    }
+  }
+  return { width, height, rgba: out }
 }
 
 // ---------------- PNG 编码 ----------------
@@ -313,14 +397,15 @@ const outPath = resolve(dirname(fileURLToPath(import.meta.url)), '../build/icon.
 
 const src = decodePng(readFileSync(inPath))
 
-// 逐级缩放：先缩到最大目标尺寸（256），再依次以「上一级结果」缩到更小尺寸，
-// 相比每次都从原始大图直接缩，过渡更平滑、小尺寸细节更好。
-const images = []
-let current = src
-for (const size of SIZES) {
-  current = resize(current, size)
-  images.push({ size, png: encodePng(current) })
-}
+// 每个目标尺寸都从原始大图直接缩放：多级链式缩放会让每次重采样的低通滤波
+// 逐级累积（16px 要经过 4~5 次缩放），小尺寸明显发虚；单次带抗锯齿的
+// Lanczos-3 缩小反而更锐利。小尺寸再叠加轻度 USM 锐化找回边缘对比。
+const images = SIZES.map((size) => {
+  let img = resize(src, size)
+  const amount = SHARPEN[size]
+  if (amount) img = unsharpMask(img, amount)
+  return { size, png: encodePng(img) }
+})
 
 const ico = encodeIco(images)
 writeFileSync(outPath, ico)

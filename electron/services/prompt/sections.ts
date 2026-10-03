@@ -8,8 +8,12 @@
  */
 import type { CharacterPersona, MemoryCategory, MemoryItem } from '../../../src/types'
 
-/** 情绪演出指令段：约束 AI 输出结构化 JSON dialogue 数组（每项必带 emotion），供解析驱动桌宠形象按节拍切换立绘 */
-export const EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背）】
+/**
+ * 输出格式段模板（情绪演出指令）：约束 AI 输出结构化 JSON dialogue 数组（每项必带 emotion），
+ * 供解析驱动桌宠形象按节拍切换立绘。listBlock/exampleBlock 按角色词表填充。
+ */
+function emotionTemplate(listBlock: string, exampleBlock: string): string {
+  return `【输出格式（最高优先，绝对不可违背）】
 你的【整条回复都必须且只能是】一个 JSON 对象，除此之外【一个字都不能多输出】——
 不要任何解释、序号、问候、开场白、后记，也不要 markdown 代码块包裹，直接输出 JSON 本体。
 
@@ -22,20 +26,49 @@ export const EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违�
 硬性规定：
 - 只有一个顶层键 "dialogue"，它是数组，通常 2~6 项，每项是一个情绪/语义节奏。
 - 每一项必须同时有 "text" 与 "emotion" 两个字段，缺一不可。"emotion" 不得缺省。
-- "emotion" 只能取下列 6 个之一：
-  neutral(平静) / happy(开心) / sad(难过) / angry(生气) / surprised(惊讶) / shy(害羞)
-  匹配不到时：担心/紧张→sad，亲近/撒娇→happy。
-- 心理活动、动作、环境、第三人称旁白等"不发声"的内容，必须写进 "text" 的（）内；台词与旁白可各占一项。
+${listBlock}
+- 心理活动、动作、环境、第三人称旁白等"不发声"的内容，必须写进 "text" 的（）内；台词与旁白可各占一项，也可以在同一项里先括号后台词（emotion 取台词的情绪）。
 - 情绪转折就另起一项写对应 emotion；同情绪连续的多项会被系统自动合并，不会重复切换。
 - 即使你想输出问候、解释或额外旁白，也都只能放进 "text"，绝不允许出现在 JSON 之外。
+- JSON 结构字符必须用半角符号：引号 " 、冒号 : 、逗号 , 、花括号 { }、方括号 [ ]。
+  严禁用全角符号（：”“ ，｛｝【】）替代，也严禁给 "text"/"emotion" 的值漏写引号；
+  台词文本内容内部不受此限制。
+- "dialogue" 数组的每一项必须是 {"text":"…","emotion":"…"} 对象，禁止把元素写成纯字符串，禁止输出数组以外的内容。
+- "text" 内如使用圆括号（）包裹旁白/动作描写，左右括号必须成对完整闭合，不得漏写右括号。
 
-示例（你唯一允许的输出形态，前后无任何多余字符）：
+${exampleBlock}`
+}
+
+/**
+ * 按角色情绪词表生成输出格式段（系统内唯一入口，palette 缺省 = 内置最小词表）。
+ * 值域块与示例块都来自词表：每词附中文释义；示例取非默认词轮转填充、括号旁白行固定用默认词。
+ * @param palette 角色绑定的情绪词表（缺省/未打标立绘集 = 内置最小词表，仅"平静"）
+ */
+export function buildEmotionPrompt(palette?: { entries: Array<{ name: string; gloss: string }>; defaultEmotion: string } | null): string {
+  const pal = palette && palette.entries.length > 0
+    ? palette
+    : { entries: [{ name: '平静', gloss: '从容放松' }], defaultEmotion: '平静' }
+  // 词值域行：每词附中文释义，帮助模型按语义选词；超过 4 词换行分组，避免单行过长
+  const items = pal.entries.map((e) => (e.gloss.trim() ? `${e.name}(${e.gloss.trim()})` : e.name))
+  const lines: string[] = []
+  for (let i = 0; i < items.length; i += 4) lines.push('  ' + items.slice(i, i + 4).join(' / '))
+  const defEntry = pal.entries.find((e) => e.name === pal.defaultEmotion)
+  const defLabel = defEntry ? pal.defaultEmotion : pal.entries[0]!.name
+  const listBlock = `- "emotion" 只能从本角色的情绪表中选取（共 ${pal.entries.length} 个）：
+${lines.join('\n')}
+  匹配不到时：使用 ${defLabel}${defEntry?.gloss.trim() ? `(${defEntry.gloss.trim()})` : ''}。`
+  // 示例情绪值替换：优先取 3 个非默认词（不足时循环复用），括号旁白行固定用默认词
+  const others = pal.entries.map((e) => e.name).filter((n) => n !== defLabel)
+  const pick = (i: number) => (others.length > 0 ? others[i % others.length]! : defLabel)
+  const exampleBlock = `示例（你唯一允许的输出形态，前后无任何多余字符）：
 {"dialogue":[
-  {"text":"……你终于来了。","emotion":"shy"},
-  {"text":"（心跳漏了一拍，站在原地）","emotion":"neutral"},
-  {"text":"我等了好久，还以为你不来了……","emotion":"sad"},
-  {"text":"不过、现在看到你，就都好了。","emotion":"happy"}
+  {"text":"……你终于来了。","emotion":"${pick(0)}"},
+  {"text":"（心跳漏了一拍，站在原地）","emotion":"${defLabel}"},
+  {"text":"（快步走到门口，却又停住脚步）这次、这次你要去哪里？","emotion":"${pick(1)}"},
+  {"text":"不过、现在看到你，就都好了。","emotion":"${pick(2)}"}
 ]}`
+  return emotionTemplate(listBlock, exampleBlock)
+}
 
 /**
  * 段落组织规范：约束 AI 用空行把回复分成若干语义段落，避免一段到底、缺乏呼吸感。
@@ -78,6 +111,20 @@ export const NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON �
   虽然嘴上在找借口，但手指却悄悄收紧了   错误（会被误读）
 - 括号内容仅供阅读与演出，绝不朗读；你的"台词"应简短、口语，是真正能用嘴唇说出来的话。
 - 【动作归属】（括号）动作的归属以消息归属为准：你发出的消息里的动作是你做的，对方消息里的动作是对方做的。回忆此前互动时不要因人称"你"而改变归属——例如你写过"戳了戳对方的手心"，事后回忆仍是你戳了对方，绝不是对方戳了你。
+- 【动作一致性】括号内的动作必须发生在"此刻"：先确认你们现在在哪里、正在做什么（走路/坐着/站着），动作只能使用场景中真实存在的物件，不得与当前状态矛盾。错误示范（✗ 禁止照抄）：你们正在海边散步，却写"（偷偷把小指勾进他的手指里，尾巴卷住椅子腿）"——走路时没有椅子；正确写法如"（走在海堤上，风吹得尾巴乱了，耳朵压得低低的）"。动作要贴合"你们此刻正在做的事"，不要套用与当前情境无关的固定动作模板。
+- 每项 "text" 的 "emotion" 字段即该节拍的立绘/表情；情绪转折时另起一项并写对应 emotion。`
+
+/**
+ * 台词模式规范（stripParenNarration 开启时替换 NARRATION_PROMPT 注入）：
+ * 禁止输出任何括号旁白与描写性内容，只输出真正说出口的台词。
+ * 声明覆盖【节拍/分段规范】中的括号示例，避免两段互相矛盾。
+ */
+export const DIALOGUE_ONLY_PROMPT = `【演出/旁白规范（台词模式，作用于上方 JSON 的 "text" 字段内部）】
+当前已开启「回答仅含台词」模式，本段与前文任何涉及括号的规定冲突时，以本段为准：
+- 【最高优先】任何心理活动、内心独白、动作、表情、环境/氛围、第三人称旁白，一律不要输出——无论是放进圆括号（（）或()）还是写成独立句子。
+- 你只能输出角色真正说出口的台词；"text" 里禁止出现任何形式的圆括号。
+- 上方【节拍/分段规范】中"台词与（括号旁白）可各自成为一项"及所有括号示例全部作废：分段只按台词的自然节奏与情绪转折进行。
+- 台词应自带足够的语气与信息量，让听者不需要动作描写也能理解情境。
 - 每项 "text" 的 "emotion" 字段即该节拍的立绘/表情；情绪转折时另起一项并写对应 emotion。`
 
 /**
@@ -88,6 +135,17 @@ export const NARRATION_PROMPT = `【演出/旁白规范（作用于上方 JSON �
  */
 export function normalizeMemoryPerspective(text: string): string {
   return text.split('用户').join('对方').split('角色').join('你')
+}
+
+/**
+ * 记忆里的角色名 → 「你」（第三人称档案体约定的注入侧回转）。
+ * 沉淀记忆以「{角色名}/用户」作第三人称主语；注入时把角色名换回「你」，配合上方
+ * 「用户→对方」归一化与分主题归属声明，让模型以角色本人视角无歧义地读取。
+ * 对旧约定（你/对方）的存量文本是空操作，不改变金样输出。
+ */
+function applyCardNameToYou(text: string, cardName: string | undefined): string {
+  const name = cardName?.trim()
+  return name ? text.split(name).join('你') : text
 }
 
 /**
@@ -192,13 +250,18 @@ export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要
  * @param profileDigest 用户画像压缩稿（M4 分层压缩产物；null/空 = 不注入）
  * @param proactiveHint 是否注入主动搭话说明（enableProactive 开启时为 true）
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入，金样输出不变）
+ * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：用 DIALOGUE_ONLY_PROMPT
+ *   替换 NARRATION_PROMPT 注入。缺省 false，金样输出不变。
+ * @param emotionPalette 角色绑定的情绪词表（缺省/null = 未启用词表，输出格式段维持金样原文）
  */
 export function buildSystemParts(
-  card: { persona?: Partial<CharacterPersona> | null; messageExample?: string } | null,
+  card: { name?: string; persona?: Partial<CharacterPersona> | null; messageExample?: string } | null,
   memories: MemoryItem[],
   profileDigest?: string | null,
   proactiveHint?: boolean,
   storyDirective?: string | null,
+  stripParenNarration?: boolean,
+  emotionPalette?: { entries: Array<{ name: string; gloss: string }>; defaultEmotion: string } | null,
 ): PromptSection[] {
   const sections: PromptSection[] = []
   let order = 0
@@ -207,22 +270,27 @@ export function buildSystemParts(
     sections.push({ id, order: order++, truncatable, text })
   }
 
-  // 画像层（分层压缩产物，常驻注入）
+  // 画像层（分层压缩产物，常驻注入）。画像存储为第三人称档案体（与记忆同款口径：用户/{角色名}），
+  // 注入前做与记忆一致的主客体归一（{角色名}→你、用户→对方），让模型以角色视角无歧义读取
   if (profileDigest?.trim()) {
-    push('memory.profile', `## 对方的画像（长期了解）\n${profileDigest.trim()}`, true)
+    const digest = normalizeMemoryPerspective(applyCardNameToYou(profileDigest.trim(), card?.name))
+    push('memory.profile', `## 对方的画像（长期了解）\n${digest}`, true)
   }
 
   // 记忆分主题注入（对方的信息 / 对方的长期经历 / 你与对方的约定），只注入非空主题段。
-  // 注入前做主客体归一化（用户→对方、角色→你），并在标题声明归属，避免模型把用户信息错当成自己的设定。
+  // 注入前做主客体归一化：第三人称档案体（{角色名}/用户）→ 角色视角（你/对方），
+  // 并在标题声明归属，避免模型把用户信息错当成自己的设定。
+  const cardName = card?.name
   for (const topic of MEMORY_TOPICS) {
     const lines = memories
       .filter((m) => m.category === topic.category)
-      .map((m, i) => `${i + 1}. ${normalizeMemoryPerspective(m.content)}`)
+      .map((m, i) => `${i + 1}. ${normalizeMemoryPerspective(applyCardNameToYou(m.content, cardName))}`)
     if (lines.length > 0) push(`memory.${topic.category}`, `## ${topic.title}：${topic.note}\n${lines.join('\n')}`, true)
   }
 
   // 输出格式约束提到最前面，确保"只输出 JSON"不被后续散文示例带偏
-  push('emotion', EMOTION_PROMPT, false)
+  // 词表启用时 emotion 值域/示例按角色词表生成；未启用时与金样逐字节一致
+  push('emotion', buildEmotionPrompt(emotionPalette), false)
   // 人设各段（存在锚点→…→补充设定），逐段独立成 Section 便于调试预览
   buildPersonaSections(card?.persona).forEach((text, i) => push(`persona.${i + 1}`, text, false))
   // 示例对话
@@ -234,7 +302,8 @@ export function buildSystemParts(
     )
   }
   push('format.paragraph', PARAGRAPH_PROMPT, false)
-  push('format.narration', NARRATION_PROMPT, false)
+  // 旁白规范：台词模式（回答仅含台词）下替换为禁括号版本，其余场景维持原文（金样逐字节一致）
+  push('format.narration', stripParenNarration ? DIALOGUE_ONLY_PROMPT : NARRATION_PROMPT, false)
   // 主动搭话说明（仅开启时注入；位于段落末尾，作为行为能力说明而非人设）
   if (proactiveHint) push('proactive', PROACTIVE_HINT_PROMPT, false)
   // 剧情导演指令（仅剧情演出轮次注入；让 AI 保持演出节奏与叙事边界）

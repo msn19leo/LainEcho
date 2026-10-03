@@ -1,15 +1,15 @@
 /**
  * 剧情引擎二期能力自检（零依赖，esbuild 打包后由 Node 执行）：
- *  1. schema 条件校验：字符串/子句/组合、不支持的写法必须报错（LingChat "hp >= 5 静默恒假"教训）；
+ *  1. schema 条件校验：字符串/子句/组合、不支持的写法必须报错（"hp >= 5 静默恒假"教训）；
  *  2. 求值器：真值 / == / != / >= / <= / > / < / && / ||；
  *  3. chapter_end 校验：branches / aiJudge 结构；
  *  4. 草稿校验：合法草稿通过、坏引用/坏事件报错。
  * 用法：npx tsx scripts/verify-story-engine.ts 或参照 run-prompt-golden.mjs 用 esbuild 打包执行
  */
-import { validateEvent, validateChapter } from '../electron/services/storyEngine/schema'
+import { validateEvent, validateChapter, validateMeta } from '../electron/services/storyEngine/schema'
 import { validateDraft, normalizeDraftYaml } from '../electron/services/storyEngine/draft'
 import { evalCondition } from '../electron/services/storyEngine/conditions'
-import { parseDialogueJson } from '../electron/services/emotion'
+import { parseDialogueJson, extractDialogueChunkDelta, extractStreamingJsonText, stripParenGroups, emotionAdherence } from '../electron/services/emotion'
 import { ensureSampleStories } from '../electron/services/storyEngine/samples'
 import { loadScript } from '../electron/services/storyEngine/loader'
 import { promises as fs } from 'fs'
@@ -104,15 +104,24 @@ expect('enterWhen：缺省视为真（不产出字段）', ewNone.errors.length 
 const ewBad = validateChapter({ name: 't', enterWhen: 'a >= 1 && b || c', events: [{ type: 'narration', text: 'hi' }] }, 't.yaml')
 expect('enterWhen：非法条件必须报错且前缀区分于事件 condition', ewBad.errors.some((e) => e.message.includes('章节 enterWhen')), ewBad.errors)
 
+// ---------- 3.7 AI 背景联动开关（story.yaml aiBackground，默认关闭） ----------
+
+const aiOn = validateMeta({ id: 'test-story', title: 't', startChapter: 'ch01', version: 1, aiBackground: true }, 't.yaml')
+expect('validateMeta：aiBackground: true 正确解析', aiOn.errors.length === 0 && aiOn.value?.aiBackground === true, aiOn.errors)
+const aiOff = validateMeta({ id: 'test-story', title: 't', startChapter: 'ch01', version: 1 }, 't.yaml')
+expect('validateMeta：缺省 aiBackground 视为关闭', aiOff.errors.length === 0 && aiOff.value?.aiBackground === false, aiOff.errors)
+const aiJunk = validateMeta({ id: 'test-story', title: 't', startChapter: 'ch01', version: 1, aiBackground: 'yes' }, 't.yaml')
+expect('validateMeta：aiBackground 非布尔视为关闭（不报错）', aiJunk.errors.length === 0 && aiJunk.value?.aiBackground === false, aiJunk.errors)
+
 // ---------- 3.6 dialogue 纯字符串数组变体解析（模型偶发简化输出，2026-09-20 线上案例） ----------
 
 const strArr = parseDialogueJson('{"dialogue": ["（点头）走吧，趁雨还没停。", "今天的风，好像比平时还要甜一点。"]}')
 expect(
-  'parse：dialogue 纯字符串数组 → 按字符串分段、情绪归 neutral',
+  'parse：dialogue 纯字符串数组 → 按字符串分段、情绪归默认（平静）',
   strArr.chunks.length === 2
     && strArr.chunks[0]?.text === '（点头）走吧，趁雨还没停。'
     && strArr.chunks[1]?.text === '今天的风，好像比平时还要甜一点。'
-    && strArr.chunks.every((c) => c.emotion === 'neutral')
+    && strArr.chunks.every((c) => c.emotion === '平静')
     && !strArr.text.includes('"dialogue"'),
   strArr,
 )
@@ -121,9 +130,183 @@ const mixedArr = parseDialogueJson('{"dialogue": ["好呀。", { "text": "（拉
 expect(
   'parse：dialogue 字符串与对象混排 → 各自正确解析',
   mixedArr.chunks.length === 2
-    && mixedArr.chunks[0]?.text === '好呀。' && mixedArr.chunks[0]?.emotion === 'neutral'
-    && mixedArr.chunks[1]?.text === '（拉住你的手）别松开哦。' && mixedArr.chunks[1]?.emotion === 'shy',
+    && mixedArr.chunks[0]?.text === '好呀。' && mixedArr.chunks[0]?.emotion === '平静'
+    && mixedArr.chunks[1]?.text === '（拉住你的手）别松开哦。' && mixedArr.chunks[1]?.emotion === '平静',
   mixedArr,
+)
+
+// ---------- 3.9 全角标点 JSON 修复（模型偶发把结构字符写成全角/裸值，2026-09-26 线上案例） ----------
+
+// 线上实拍形态：全角引号 + 全角冒号 + text/emotion 裸值 + 字段间缺逗号 + 缺最外层根花括号
+const fwRaw = '“dialogue”：[\n{\n“text”：(听到这个提议，鲸鱼耳朵嗖地一下竖了起来)\n“emotion”：shy\n},\n{\n“text”：尾、尾巴…要搭在你身上吗？\n“emotion”：sad\n}\n]'
+const fwParsed = parseDialogueJson(fwRaw)
+expect(
+  'parse：全角引号/冒号 + 裸值 + 缺逗号 + 缺根花括号 → 修复后正确解析',
+  fwParsed.chunks.length === 2
+    && fwParsed.chunks[0]?.text === '(听到这个提议，鲸鱼耳朵嗖地一下竖了起来)' && fwParsed.chunks[0]?.emotion === '平静'
+    && fwParsed.chunks[1]?.text === '尾、尾巴…要搭在你身上吗？' && fwParsed.chunks[1]?.emotion === '平静'
+    && !fwParsed.text.includes('dialogue'),
+  fwParsed,
+)
+
+// 修复只动结构字符：裸值台词里的中文冒号不得被污染
+const fwColon = parseDialogueJson('“dialogue”：[\n{\n“text”：提醒你哦：别熬夜。\n“emotion”：happy\n}\n]')
+expect(
+  'parse：全角修复不污染裸值台词内的中文冒号',
+  fwColon.chunks.length === 1 && fwColon.chunks[0]?.text === '提醒你哦：别熬夜。' && fwColon.chunks[0]?.emotion === '平静',
+  fwColon,
+)
+
+// 半角引号 + 全角冒号 + 裸值的混合形态（用户粘贴样例）
+const mixedPunct = parseDialogueJson('"dialogue"：[\n{\n"text"：（轻轻点头）\n"emotion"：neutral\n}\n]')
+expect(
+  'parse：半角引号 + 全角冒号 + 裸值 → 修复后正确解析',
+  mixedPunct.chunks.length === 1 && mixedPunct.chunks[0]?.text === '（轻轻点头）' && mixedPunct.chunks[0]?.emotion === '平静',
+  mixedPunct,
+)
+
+// 流式：全角标点下的语音块增量提取（半角/全角键名引号都识别，单项经修复重试解析）
+const fwStream = extractDialogueChunkDelta('“dialogue”：[\n{\n“text”：第一句\n“emotion”：shy\n}\n]', 0)
+expect(
+  'stream：全角标点的流式语音块提取',
+  fwStream.items.length === 1 && fwStream.items[0]?.text === '第一句' && fwStream.items[0]?.emotion === '平静',
+  fwStream,
+)
+
+// 新变体（2026-10-02 线上案例）：每个结构字符被全角引号逐个包裹（“{“text”:“X”}”）→
+// 结构贴邻引号清除后可解析，JSON 碎片不再泄漏到气泡与 TTS
+const wrappedRaw = '“{“dialogue”:”[\n“{“text”:“（听到这句话，鲸鱼耳朵倏地竖得笔直）”}”,\n“{“text”:“嗯…虽然只是‘平常’。”,”emotion”:“happy”}”\n]”'
+const wrappedParsed = parseDialogueJson(wrappedRaw)
+expect(
+  'parse：结构字符被全角引号逐个包裹 → 贴邻引号清除后正确解析',
+  wrappedParsed.chunks.length === 2
+    && wrappedParsed.chunks[0]?.text === '（听到这句话，鲸鱼耳朵倏地竖得笔直）'
+    && wrappedParsed.chunks[1]?.text === '嗯…虽然只是‘平常’。'
+    && wrappedParsed.chunks[1]?.emotion === '平静'
+    && !wrappedParsed.text.includes('dialogue'),
+  wrappedParsed,
+)
+const wrappedStream = extractDialogueChunkDelta('“{“dialogue”:”[\n“{“text”:“第一句”}”\n]”', 0)
+expect(
+  'stream：结构贴邻引号包裹的流式语音块提取',
+  wrappedStream.items.length === 1 && wrappedStream.items[0]?.text === '第一句',
+  wrappedStream,
+)
+
+// 2026-10-02 线上案例：模型漏写右括号（“text”:“（听到这句话，……轻轻晃动”），
+// 未闭合括号的纯旁白块曾绕过两道防线被 TTS 朗读。解析层补齐右括号 + 上游纯括号块过滤兜底
+const unclosedRaw = '{"dialogue":[{"text":"（听到这句话，原本高高竖起的鲸鱼耳朵瞬间软了下来，尾巴在身后疯狂地拍打了两下","emotion":"shy"}]}'
+const unclosedParsed = parseDialogueJson(unclosedRaw)
+expect(
+  'parse：text 值漏写右括号 → 解析时末尾补齐',
+  unclosedParsed.chunks.length === 1
+    && unclosedParsed.chunks[0]?.text?.endsWith('）') === true
+    && unclosedParsed.chunks[0]?.emotion === '平静', // 内置最小词表下 shy 归一化到默认词
+  unclosedParsed,
+)
+const unclosedStream = extractDialogueChunkDelta('{"dialogue":[{"text":"（悄悄把脸埋进围巾里"}]}', 0)
+expect(
+  'stream：漏写右括号的流式语音块提取同样补齐',
+  unclosedStream.items.length === 1 && unclosedStream.items[0]?.text?.endsWith('）') === true,
+  unclosedStream,
+)
+// 已闭合文本不受影响（不应被误补）
+const closedParsed = parseDialogueJson('{"dialogue":[{"text":"（点头）我知道了（微笑）","emotion":"平静"}]}')
+expect(
+  'parse：括号已闭合的文本原样保留不误补',
+  closedParsed.chunks.length === 1 && closedParsed.chunks[0]?.text === '（点头）我知道了（微笑）',
+  closedParsed,
+)
+
+// ---------- 3.9b 纯字符串数组变体 + 截断 JSON（2026-10-02 线上案例：JSON 源码进 TTS） ----------
+
+// A：纯字符串数组变体（元素无 {text, emotion} 包裹）的流式提取——此前零提取导致语音全押兜底
+const bareStream = extractDialogueChunkDelta('{"dialogue": ["（旁白描写）", "真的吗？那太好啦！"]}', 0)
+expect(
+  'stream：纯字符串数组变体按裸字符串元素提取（键名不被误当台词）',
+  bareStream.items.length === 2
+    && bareStream.items[0]?.text === '（旁白描写）' && bareStream.items[0]?.emotion === '平静'
+    && bareStream.items[1]?.text === '真的吗？那太好啦！',
+  bareStream,
+)
+// A：漏根花括号的裸数组同样按元素位置提取
+const bareNoRoot = extractDialogueChunkDelta('"dialogue": ["第一句", "第二句"]', 0)
+expect(
+  'stream：漏 root 花括号的裸数组元素提取（"dialogue" 键名不进气泡）',
+  bareNoRoot.items.length === 2
+    && bareNoRoot.items[0]?.text === '第一句' && bareNoRoot.items[1]?.text === '第二句',
+  bareNoRoot,
+)
+// A：字符串仍在书写中 → 零提取等待更多 token
+const bareWip = extractDialogueChunkDelta('{"dialogue": ["（', 0)
+expect('stream：书写中的裸字符串零提取（等待闭合）', bareWip.items.length === 0, bareWip)
+// A：裸字符串数组的流式上屏（含正在书写中的最后一个，保留打字感）
+const bareDisplay = extractStreamingJsonText('{"dialogue": ["（旁白描写）", "真的吗？那太好啦！"]}')
+expect('stream：纯字符串数组变体的流式上屏提取', bareDisplay === '（旁白描写）\n真的吗？那太好啦！', bareDisplay)
+const bareDisplayWip = extractStreamingJsonText('{"dialogue": ["真的')
+expect('stream：书写中的裸字符串实时上屏', bareDisplayWip === '真的', bareDisplayWip)
+
+// B：截断 JSON（`{"dialogue": ["（`）→ 补全抢救不出实质台词 → JSON 形态拒收返回空 → 触发上层自动重试
+const truncatedParse = parseDialogueJson('{"dialogue": ["（')
+expect(
+  'parse：截断 JSON 源码拒收（text 为空触发重试，绝不进气泡/TTS）',
+  truncatedParse.text === '' && truncatedParse.chunks.length === 0,
+  truncatedParse,
+)
+// B：截断在字符串值中间但前面已有完整台词 → prose 抢救出截断前内容
+const truncatedRescue = parseDialogueJson('{"dialogue": [{"text": "第一句台词", "emotion": "happy"}, {"text": "第二')
+expect(
+  'parse：截断 JSON 抢救出截断前的完整台词',
+  truncatedRescue.text.includes('第一句台词') && !truncatedRescue.text.includes('dialogue'),
+  truncatedRescue,
+)
+
+// P2a 情绪依从观测（2026-10-03）：parse 返回归一化前的原始 emotion 值 + 三态判定
+const adherenceParse = parseDialogueJson('{"dialogue":[{"text":"第一句","emotion":"happy"},{"text":"第二句"}]}')
+expect(
+  'parse：rawEmotions 收集归一化前的原始 emotion 值（缺省记空串）',
+  adherenceParse.rawEmotions.length === 2 && adherenceParse.rawEmotions[0] === 'happy' && adherenceParse.rawEmotions[1] === '',
+  adherenceParse,
+)
+const adherPalette = {
+  entries: [
+    { name: '开心', gloss: '明亮愉快', image: '' },
+    { name: '平静', gloss: '从容放松', image: '' },
+  ],
+  defaultEmotion: '平静',
+}
+expect(
+  'adherence：词表精确命中/别名接住/无效回落三态判定',
+  emotionAdherence('开心', adherPalette) === 'hit'
+    && emotionAdherence('HAPPY', adherPalette) === 'alias' // 大小写不敏感，happy→开心
+    && emotionAdherence('不存在的词', adherPalette) === 'miss'
+    && emotionAdherence('', adherPalette) === 'miss'
+    && emotionAdherence('开心') === 'miss', // 内置最小词表（仅平静）下开心不在词表 → 回落默认
+  null,
+)
+
+// 流式：全角 + 裸值的流式上屏提取（打字机显示不再外露 JSON 源码）
+const fwDisplay = extractStreamingJsonText('“dialogue”：[\n{\n“text”：第一句\n“emotion”：shy\n},\n{\n“text”：第二句')
+expect('stream：全角 + 裸值的流式上屏提取', fwDisplay === '第一句\n第二句', fwDisplay)
+
+// ---------- 3.10 台词模式括号剥除（「回答仅含台词」的解析层兜底） ----------
+
+expect(
+  'strip：全局剥除括号组（前缀 + 中缀 + 半角）',
+  stripParenGroups('（轻轻转头）你好呀。今天（心情）不错 (nice)') === '你好呀。今天不错',
+  stripParenGroups('（轻轻转头）你好呀。今天（心情）不错 (nice)'),
+)
+expect(
+  'strip：未闭合残组剥除（流式中段不会残留半个括号组）',
+  stripParenGroups('你好呀。（心跳加速') === '你好呀。',
+  stripParenGroups('你好呀。（心跳加速'),
+)
+const stripParsed = parseDialogueJson(stripParenGroups('{"dialogue":[{"text":"（转身）你来了。","emotion":"happy"},{"text":"（沉默）","emotion":"neutral"}]}'))
+expect(
+  'strip：纯括号项剥空后被解析过滤（不出空语音块）',
+  stripParsed.chunks.length === 1
+    && stripParsed.chunks[0]?.text === '你来了。' && stripParsed.chunks[0]?.emotion === '平静',
+  stripParsed,
 )
 
 // ---------- 4. 草稿校验 ----------
@@ -230,13 +413,18 @@ chapters:
       - type: chapter_end
 `
 const emoBefore = validateDraft(EMOTION_DRAFT)
-expect('emotion：未归一化时确实报 emotion 校验错误', emoBefore.some((e) => e.message.includes('emotion')), emoBefore)
+// 词表方案（P0）：emotion 校验放宽为"非空字符串"——未归一化词不再硬拦，
+// 运行时归一化链（词表→软链→默认情绪）保证未知词有确定降级，比阻断导入更稳
+expect('emotion：未归一化词不再硬拦（词表方案，运行时降级兜底）', emoBefore.length === 0, emoBefore)
+const emoEmpty = validateDraft(EMOTION_DRAFT.replace('emotion: crying_happy', 'emotion: ""'))
+expect('emotion：空值仍报错（modify_character 必填）', emoEmpty.some((e) => e.message.includes('emotion')), emoEmpty)
 const emoErrors = validateDraft(normalizeDraftYaml(EMOTION_DRAFT))
 expect('emotion：crying_happy / smile / shocked 归一化后校验通过', emoErrors.length === 0, emoErrors)
 
 // ---------- 5. 示例剧本端到端（写入临时数据目录后走真实加载器，含章节引用完整性校验） ----------
 
 try {
+  // 测试的 electron 桩把 userData 指向临时目录（跑完即删），天然无安装标记 → 照常写入样本
   await ensureSampleStories()
   for (const id of ['starlight-night', 'rainy-cafe']) {
     const bundle = await loadScript(id)

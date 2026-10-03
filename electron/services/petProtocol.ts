@@ -89,6 +89,9 @@ export function registerPetProtocolHandler(): void {
       } else if (host === 'story-backgrounds') {
         // 剧情背景库（用户上传）：pet-res://story-backgrounds/{文件名}
         root = paths.storyBackgroundsDir
+      } else if (host === 'story-music') {
+        // 剧情音乐库（用户上传）：pet-res://story-music/{文件名}
+        root = paths.storyMusicsDir
       } else {
         return new Response('Unknown host', { status: 404 })
       }

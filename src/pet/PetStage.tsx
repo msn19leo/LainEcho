@@ -15,8 +15,8 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, CharacterModelOverride, RenderMode, StandardEmotion, PetCardPayload } from '../types'
-import { DEFAULT_EMOTION } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, RenderMode, PetCardPayload, SpritePaletteEntry } from '../types'
+import { BUILTIN_DEFAULT_EMOTION, paletteFromSprite, resolvePaletteImage } from '../types'
 import { useCharacterStore } from '../store/characterStore'
 import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
 import { LipSyncController } from './lipSync'
@@ -31,8 +31,8 @@ export interface PetStageHandle {
   speak: (audio: ArrayBuffer) => Promise<void>
   /** 停止播放语音并清零口型参数 */
   stopSpeak: () => void
-  /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动） */
-  setEmotion: (emotion: StandardEmotion) => void
+  /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动；词表方案下为自由情绪词） */
+  setEmotion: (emotion: string) => void
   /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后调用） */
   resize: () => void
 }
@@ -56,8 +56,6 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const currentModelIdRef = useRef<string | null>(null)
   /** 当前角色卡绑定的模型 id（null 表示未绑定，应使用全局选中模型） */
   const currentCardModelIdRef = useRef<string | null>(null)
-  /** 当前角色卡的模型设置覆盖（表情/待机动作），null 表示无覆盖，跟随全局 */
-  const cardModelOverrideRef = useRef<CharacterModelOverride | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   /** 当前形象渲染模式：'live2d'（动画）| 'sprite'（2D 静态立绘） */
@@ -70,14 +68,15 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const modeRef = useRef<RenderMode>('live2d')
   /** 角色卡显式设定的形象模式（null = 跟随全局当前形象），由 onCardChanged 维护 */
   const cardModeRef = useRef<RenderMode | null>(null)
-  /** 当前生效情绪（由 AI 回复情绪联动更新，默认 neutral） */
-  const currentEmotionRef = useRef<StandardEmotion>(DEFAULT_EMOTION)
+  /** 当前情绪词（词表方案下为自由词，由 AI 回复情绪联动更新） */
+  const currentEmotionRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
+  /** 当前立绘集词表的默认情绪词（空闲/重置态的默认展示跟随它；resolveSprite 时刷新） */
+  const paletteDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
+  /** 当前生效演出词表快照（演出词表双轨，模式分轨）：sprite 模式 = 立绘集词表（查图）；
+   *  live2d 模式 = Live2D 模型词表（查表情联动 expression）。由 refreshPalette 按模式刷新 */
+  const paletteEntriesRef = useRef<Array<{ name: string; gloss: string; expression?: string }>>([])
   /** 当前角色卡绑定的立绘集 id（立绘模式渲染用） */
   const spriteIdRef = useRef<string | null>(null)
-  /** 当前角色卡的情绪 → 立绘文件名 映射 */
-  const emotionMapRef = useRef<Partial<Record<StandardEmotion, string>> | null>(null)
-  /** 当前角色卡的情绪 → exp3 表情名 映射（Live2D 模式） */
-  const live2dExpressionMapRef = useRef<Partial<Record<StandardEmotion, string>> | null>(null)
   /** 全局当前立绘集 id（modelSettings.selectedSpriteId，角色卡未绑定立绘时回退用） */
   const selectedSpriteIdRef = useRef<string | null>(null)
   /** 桌面立绘展示状态：idle(情绪态) / speaking(说话) / thinking(思考) */
@@ -130,8 +129,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const expressionListRef = useRef<ExpressionMeta[]>([])
   /** 当前应用的表情参数（从 expressionListRef 中匹配选中表情得到） */
   const currentExpressionParamsRef = useRef<ExpressionParameter[]>([])
-  /** 表情修改前的参数基础值（每帧还原后再应用新表情，避免叠加残留） */
-  const expressionBaseValuesRef = useRef<Map<string, number>>(new Map())
+  /** 表情参数的当前显示值（P2b lerp 渐变层：跨帧插值，切换表情时向新目标平滑过渡） */
+  const exprCurrentRef = useRef<Map<string, number>>(new Map())
+  /** 表情参数的基线值（首次遇到该参数时记录的 coreModel 值；渐出终点 + Add/Multiply 叠加基准） */
+  const exprBaseRefMap = useRef<Map<string, number>>(new Map())
   /** 口型同步控制器：播放音频并驱动 ParamMouthOpen */
   const lipSyncRef = useRef<LipSyncController>(new LipSyncController())
 
@@ -153,7 +154,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       lipSyncRef.current.stop()
     },
     /** 按句更新情绪：写 emotion 并重应用立绘/表情 */
-    setEmotion: (emotion: StandardEmotion) => {
+    setEmotion: (emotion: string) => {
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
         applySprite()
@@ -235,23 +236,23 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     // 清空表情状态，防止旧模型的表情基础值残留到新模型
     expressionListRef.current = []
     currentExpressionParamsRef.current = []
-    expressionBaseValuesRef.current.clear()
+    exprCurrentRef.current.clear()
+    exprBaseRefMap.current.clear()
   }
 
   /**
    * 立绘模式：解析当前应显示的立绘图并设置 to sprite state。
-   * 规则：emotionMap[emotion] 优先，缺映射或缺文件时回退 neutral，再退回立绘集第一张。
+   * 规则（词表方案单链）：情绪查表 = 词表命中→软链→默认图；未打标集 = 内置最小词表（解析落首图）。
+   * 说话图为系统演出态：仅在情绪解析图等于默认图时让位。
    * 失败不再静默：打 warn 日志 + 显示 spriteNotice，短暂等待后自动重试一次（连续失败有上限）。
    * @param gen 本次解析的代数（applySprite 递增；过期代数的所有状态写入被丢弃）
    * @param spriteId 绑定的立绘集 id
-   * @param emotionMap 角色卡的情绪 → 文件名映射（可为 null）
-   * @param emotion 当前情绪（默认 neutral）
+   * @param emotion 当前情绪词（默认"平静"）
    */
   async function resolveSprite(
     gen: number,
     spriteId: string | null,
-    emotionMap: Partial<Record<StandardEmotion, string>> | null | undefined,
-    emotion: StandardEmotion = DEFAULT_EMOTION,
+    emotion: string = BUILTIN_DEFAULT_EMOTION,
     variant: 'idle' | 'speaking' | 'thinking' = 'idle',
   ) {
     if (!spriteId) {
@@ -268,18 +269,29 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         throw new Error(`立绘集不存在或没有图片（id=${spriteId}）`)
       }
       const has = (f: string | null | undefined) => !!f && spr.images.some((i) => i.filePath === f)
-      // 变体立绘优先：思考 > 说话(仅平静情绪时) > 情绪映射图
+      // 词表默认情绪词刷新 + 默认态跟随迁移：
+      // 当前情绪正处于旧默认词（或内置初始词）时，用户切换默认词后展示立即跟随新默认
+      const newDefault = paletteFromSprite(spr).defaultEmotion
+      if (currentEmotionRef.current === paletteDefaultRef.current || currentEmotionRef.current === BUILTIN_DEFAULT_EMOTION) {
+        currentEmotionRef.current = newDefault
+        emotion = newDefault // 查表同步用迁移后的词（emotion 参数来自调用方的 currentEmotionRef 快照）
+      }
+      paletteDefaultRef.current = newDefault
+      // 情绪查表（词表单链）：命中词条图 → 未命中落默认情绪图；未打标集（内置最小词表）= 首图
+      const emotionFile = resolvePaletteImage(spr, emotion)
+      // 说话图使用条件（用户定案）：正在说话且情绪=「平静」——平静是唯一让位给说话图的情绪；
+      // 默认情绪可设为其它词（如害羞），说话时显示害羞图而非说话图
+      const calmFile = resolvePaletteImage(spr, BUILTIN_DEFAULT_EMOTION)
+      // 变体立绘优先：思考 > 说话 > 情绪查表图
       let file: string | null = null
       if (variant === 'thinking' && has(spr.thinkingImage)) {
         file = spr.thinkingImage
-      } else if (variant === 'speaking' && emotion === DEFAULT_EMOTION && has(spr.speakingImage)) {
+      } else if (variant === 'speaking' && has(spr.speakingImage) && (emotionFile == null || (calmFile != null && emotionFile === calmFile))) {
         file = spr.speakingImage
       }
       if (!file) {
-        // 情绪映射优先级：角色卡传入的映射 > 立绘集自身的映射(spr.emotionMap) > 无映射
-        const sourceMap = emotionMap ?? spr.emotionMap ?? null
-        const want = pickEmotionAsset(sourceMap, emotion)
-        file = (want && spr.images.some((i) => i.filePath === want)) ? want : (spr.images[0]!.filePath)
+        // 词表图必填 + 内置最小词表=首图 → emotionFile 正常恒非空；首图仅在异常配置下作为最后防御
+        file = emotionFile ?? (has(spr.speakingImage) ? spr.speakingImage! : spr.images[0]!.filePath)
       }
       if (gen !== spriteGenRef.current) return
       spriteFailStreakRef.current = 0
@@ -296,7 +308,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (spriteFailStreakRef.current <= 3) {
         setTimeout(() => {
           if (gen !== spriteGenRef.current) return
-          void resolveSprite(gen, spriteId, emotionMap, emotion, variant)
+          void resolveSprite(gen, spriteId, emotion, variant)
         }, 800)
       }
     }
@@ -309,7 +321,6 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     void resolveSprite(
       spriteGenRef.current,
       getEffectiveSpriteId(),
-      spriteIdRef.current ? emotionMapRef.current : null,
       currentEmotionRef.current,
       displayStateRef.current,
     )
@@ -317,25 +328,25 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
   /**
    * 获取当前生效的表情名。优先级从高到低：
-   *   情绪映射(live2dExpressionMap[当前情绪]) → 角色卡覆盖 → 全局设置。
+   *   情绪词表联动（当前情绪词命中词表条目且配了 expression，且模型存在该表情）→ 全局设置。
    * 返回空串表示不应用表情。
    */
   function getEffectiveExpression(): string {
-    const override = cardModelOverrideRef.current
-    // 情绪联动：当前情绪配置了专属表情时优先使用
-    const emoExpr = pickEmotionAsset(live2dExpressionMapRef.current, currentEmotionRef.current)
-    if (emoExpr) return emoExpr
-    if (override && override.selectedExpression !== null) return override.selectedExpression
+    // P2b 情绪表情联动：AI 输出的情绪词（主进程已归一化到词表词）→ 词表条目.expression
+    const entry = paletteEntriesRef.current.find((e) => e.name === currentEmotionRef.current)
+    const emotionExpr = entry?.expression?.trim()
+    if (emotionExpr && expressionListRef.current.some((e) => e.name === emotionExpr)) {
+      return emotionExpr
+    }
+    // 未配表情 / 模型无该表情 / 词表未命中 → 回落全局静态表情
     return settingsRef.current.animation.selectedExpression
   }
 
   /**
-   * 获取当前生效的待机动作组：角色卡覆盖优先，否则跟随全局设置。
+   * 获取当前生效的待机动作组（跟随全局设置）。
    * 返回空串表示无指定动作组（随机选择）。
    */
   function getEffectiveIdleAnimation(): string {
-    const override = cardModelOverrideRef.current
-    if (override && override.idleAnimation !== null) return override.idleAnimation
     return settingsRef.current.animation.idleAnimation
   }
 
@@ -365,22 +376,53 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
    * 根据当前设置（expressionEnabled + 生效表情名）和已加载的表情列表，
    * 更新 currentExpressionParamsRef。每帧由 ticker 读取并应用到 coreModel。
    * 参考 airi 的 expression-controller.ts：不使用 SDK 的 Expression Manager，直接管理参数。
-   * 角色卡 modelOverride.selectedExpression 非 null 时覆盖全局 selectedExpression。
+   * P2b：表情名由 getEffectiveExpression 决定——情绪词表联动优先，回落全局静态表情。
    */
   function updateCurrentExpression() {
     const anim = settingsRef.current.animation
-    // 角色卡覆盖表情：若 override.selectedExpression 非 null，强制启用表情（即使全局 expressionEnabled=false）
-    const override = cardModelOverrideRef.current
-    const expressionEnabled = override?.selectedExpression !== null && override?.selectedExpression !== undefined
-      ? true
-      : anim.expressionEnabled
     const selectedExpression = getEffectiveExpression()
-    if (!expressionEnabled || !selectedExpression) {
+    if (!anim.expressionEnabled || !selectedExpression) {
       currentExpressionParamsRef.current = []
       return
     }
     const expr = expressionListRef.current.find((e) => e.name === selectedExpression)
     currentExpressionParamsRef.current = expr?.parameters ?? []
+  }
+
+  /**
+   * 刷新当前生效演出词表快照（演出词表双轨，模式分轨——与主进程 chatTurn 同口径）：
+   * sprite 模式 → 立绘集词表（getEffectiveSpriteId）；live2d 模式 → Live2D 模型词表（角色卡绑定 > 全局选中）。
+   * 默认情绪词一并刷新（空闲/重置态跟随当前模式词表）；词表为空 = 内置最小词表（仅"平静"）。
+   */
+  async function refreshPalette() {
+    try {
+      if (modeRef.current === 'live2d') {
+        const modelId = currentCardModelIdRef.current ?? settingsRef.current.selectedModelId ?? null
+        const palette = modelId ? await api.model.getPalette(modelId) : null
+        if (palette && palette.entries.length > 0) {
+          paletteEntriesRef.current = palette.entries
+          // 兜底词：平静（在表内）> 第一个词条（与主进程 getModelPalette 口径一致）
+          const names = new Set(palette.entries.map((e) => e.name))
+          paletteDefaultRef.current = names.has(BUILTIN_DEFAULT_EMOTION) ? BUILTIN_DEFAULT_EMOTION : palette.entries[0]!.name
+        } else {
+          paletteEntriesRef.current = []
+          paletteDefaultRef.current = BUILTIN_DEFAULT_EMOTION
+        }
+      } else {
+        const spriteId = getEffectiveSpriteId()
+        if (!spriteId) {
+          paletteEntriesRef.current = []
+          return
+        }
+        const list = await api.sprite.list()
+        const spr = list.find((s) => s.id === spriteId)
+        const palette = paletteFromSprite(spr)
+        paletteEntriesRef.current = palette.entries
+        paletteDefaultRef.current = palette.defaultEmotion
+      }
+    } catch {
+      paletteEntriesRef.current = []
+    }
   }
 
   /** 加载（或切换）指定模型；不传 modelId 时按优先级选择：角色卡绑定 > 全局选中 > 列表第一个 */
@@ -573,14 +615,15 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applyModelParameters(coreModel, params, mouseTrackingActive)
 
       // 2. 表情（在用户参数之后、眨眼之前应用，参考 airi 的表情应用顺序）
-      //    每帧先还原上一帧的表情参数基础值，再应用当前表情，避免叠加残留。
-      //    currentExpressionParamsRef 由 updateCurrentExpression 维护，已合并角色卡覆盖。
-      if (currentExpressionParamsRef.current.length > 0) {
-        applyExpression(coreModel, currentExpressionParamsRef.current, expressionBaseValuesRef.current)
-      } else if (expressionBaseValuesRef.current.size > 0) {
-        // 表情已关闭或未选中：还原之前被表情修改的参数
-        restoreExpressionBase(coreModel, expressionBaseValuesRef.current)
-      }
+      //    P2b lerp 渐变：applyExpression 内部对参数值做跨帧插值——切换表情时向新目标平滑过渡，
+      //    移出表情的参数向基线平滑还原，收敛后停止写入。alpha 按帧间隔折算保证不同 FPS 下速度一致。
+      applyExpression(
+        coreModel,
+        currentExpressionParamsRef.current,
+        exprCurrentRef.current,
+        exprBaseRefMap.current,
+        Math.min(1, delta * 0.18),
+      )
 
       // 3. 眨眼（读回 eyeOpen 值，乘以眨眼系数）
       if (animation.enableBlink) {
@@ -723,25 +766,21 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     void init()
 
     // 订阅始终注册（即使 core 缺失也会收到导入事件后重试）：
-    // 角色卡切换 → 换模型 + 应用表情/待机动作覆盖；模型列表变化 / Cubism Core 导入 → 重新初始化
+    // 角色卡切换 → 换模型；模型列表变化 / Cubism Core 导入 → 重新初始化
     unsubModel = api.pet.onCardChanged((payload: PetCardPayload) => {
-      const { cardId, modelId, modelOverride, renderMode, spriteId, emotionMap, live2dExpressionMap } = payload ?? {}
+      const { cardId, modelId, renderMode, spriteId } = payload ?? {}
       // 同步宠物窗的当前角色卡（内容框名牌/头部显示当前角色名）
       if (cardId) {
         useCharacterStore.setState({ currentCardId: cardId })
       }
-      // 记录角色卡的模型覆盖配置，触发表情参数刷新
-      cardModelOverrideRef.current = modelOverride ?? null
-      // 记录形象呈现相关配置（立绘/情绪映射/渲染模式），供渲染分发与情绪联动使用
+      // 记录形象呈现相关配置（立绘/渲染模式）；情绪演出由立绘集词表驱动（resolveSprite 内查表）
       spriteIdRef.current = spriteId ?? null
-      emotionMapRef.current = emotionMap ?? null
-      live2dExpressionMapRef.current = live2dExpressionMap ?? null
       // 角色卡显式设定的形象模式（null = 跟随全局当前形象）
       cardModeRef.current = renderMode ?? null
       currentCardModelIdRef.current = modelId ?? null
+      // 词表快照刷新（角色卡绑定的立绘集可能变化）+ 表情参数重算
+      void refreshPalette()
       updateCurrentExpression()
-      // 角色卡覆盖的空闲动作组变化时（模型未换场景）同步重定向库内置空闲槽
-      applyIdleGroupToModel()
       // 统一按当前有效模式与资源刷新桌面形象
       applyRenderState()
     })
@@ -785,8 +824,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       settingsLoadedRef.current = true
       const prevIdle = settingsRef.current.animation.idleAnimation
       settingsRef.current = settings
-      // 全局当前立绘集变化时记录，供立绘回退用
+      // 全局当前立绘集变化时记录，供立绘回退用；词表快照一并刷新（全局立绘集可能换）
       selectedSpriteIdRef.current = settings.selectedSpriteId ?? null
+      void refreshPalette()
       // FPS 变化时更新 ticker
       if (appRef.current) {
         appRef.current.ticker.maxFPS = settings.animation.maxFps === 0 ? 0 : settings.animation.maxFps
@@ -820,8 +860,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applySettings(settings)
     })
 
-    // 订阅 AI 回复情绪：立绘切图 / Live2D 切表情（情绪联动核心）
-    unsubEmotion = api.pet.onEmotion((emotion: StandardEmotion) => {
+    // 订阅 AI 回复情绪：立绘切图 / Live2D 切表情（情绪联动核心；词表方案下为自由情绪词）
+    unsubEmotion = api.pet.onEmotion((emotion: string) => {
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
         // 回复完成：退出思考态，回到情绪/空闲态
@@ -837,8 +877,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       console.log('[thinking] pet onThinking=%s mode=%s', thinking, modeRef.current)
       if (modeRef.current !== 'sprite') return
       if (thinking) {
-        // 新一轮输入：情绪归零（natural 平静），进入思考态
-        currentEmotionRef.current = DEFAULT_EMOTION
+        // 新一轮输入：情绪归到词表默认词（用户切换默认情绪后重置态跟随变化）
+        currentEmotionRef.current = paletteDefaultRef.current
         displayStateRef.current = 'thinking'
       } else if (displayStateRef.current === 'thinking') {
         displayStateRef.current = 'idle'
@@ -846,8 +886,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applySprite()
     })
 
-    // 订阅立绘集列表变化（导入/删除/切全局后重解析）
+    // 订阅立绘集列表变化（导入/删除/词表编辑后重解析 + 刷新词表快照）
     unsubSprites = api.sprite.onChanged(() => {
+      void refreshPalette()
       if (modeRef.current === 'sprite') applyRenderState()
     })
 
@@ -1042,16 +1083,6 @@ function patchCubismCoreCompatibility(mod: Record<string, unknown>): void {
   }
 }
 
-/**
- * 从情绪映射中取某情绪对应的资源名；缺失时回退 neutral。
- * 用于立绘模式选图与 Live2D 模式选表情。
- */
-function pickEmotionAsset(
-  map: Partial<Record<StandardEmotion, string>> | null | undefined,
-  emotion: StandardEmotion,
-): string {
-  return map?.[emotion] ?? map?.[DEFAULT_EMOTION] ?? ''
-}
 
 function zoomModel(model: Live2DModel | null, factor: number): number {
   if (!model) return 1
@@ -1384,60 +1415,62 @@ function applyModelParameters(core: CoreModelLike, p: ModelParameters, mouseTrac
 // ---------------- 表情参数应用 ----------------
 
 /**
- * 将 exp3.json 的表情参数应用到 Cubism Core（每帧调用）。
+ * 将 exp3.json 的表情参数应用到 Cubism Core（每帧调用，P2b lerp 渐变版）。
  * 参考 airi 的 expression-tools.ts：自行实现三种混合模式，不依赖 SDK 的 ExpressionManager。
  *
- * 防残留机制（修复切换/关闭表情时旧参数不消失的 bug）：
- * - 每帧应用表情前，先把上一帧被表情修改过的参数还原到基础值（baseValues）
- * - 然后重新记录当前帧的基础值（applyModelParameters 设定的值），再叠加表情
- * - 当表情被关闭或切换为不含某参数的新表情时，该参数自动还原
- *
- * 混合模式（对应 exp3.json 的 Blend 字段）：
- * - Add: 在基础值上叠加（addParameterValueById）
- * - Multiply: 与基础值相乘（multiplyParameterValueById）
- * - Overwrite: 直接覆盖（setParameterValueById）
- *
- * 注意：airi 有意忽略 FadeInTime / FadeOutTime，此处同样不实现淡入淡出。
+ * 渐变机制（替代 airi 忽略 FadeInTime 的做法）：
+ * - currentMap 记录每个表情参数的当前显示值，跨帧向目标值插值（alpha 按帧间隔折算，FPS 无关）
+ * - baseMap 记录参数基线（首次遇到该参数时的 coreModel 值）：渐入起点 / 渐出终点 / Add·Multiply 叠加基准
+ * - 切换表情：新参数从基线渐入；被移出的参数向基线渐出，收敛后从 map 清理（防残留）
+ * - 目标输出统一折算为「绝对参数值」再插值：Overwrite = p.Value；Add = 基线 + p.Value；Multiply = 基线 × p.Value，
+ *   写回一律 setParameterValueById——混合模式语义在目标计算中体现，插值对所有模式统一
+ * - |目标 - 当前| < 0.1 视为收敛，直接取目标值并停止漂移
  */
 function applyExpression(
   core: CoreModelLike,
   params: ExpressionParameter[],
-  baseValues: Map<string, number>,
+  currentMap: Map<string, number>,
+  baseMap: Map<string, number>,
+  alpha: number,
 ): void {
-  // 1. 还原上一帧被表情修改的参数到基础值
-  for (const [id, val] of baseValues) {
-    core.setParameterValueById?.(id, val)
-  }
-  baseValues.clear()
-
-  // 2. 记录当前帧的基础值，然后应用表情
+  const seen = new Set<string>()
+  // 1. 目标表情内的参数：渐入或保持
   for (const p of params) {
-    const base = core.getParameterValueById?.(p.Id) ?? 0
-    baseValues.set(p.Id, base)
-
+    seen.add(p.Id)
+    let base = baseMap.get(p.Id)
+    if (base === undefined) {
+      base = core.getParameterValueById?.(p.Id) ?? 0
+      baseMap.set(p.Id, base)
+    }
+    let target: number
     switch (p.Blend) {
       case 'Add':
-        core.addParameterValueById?.(p.Id, p.Value, 1)
+        target = base + p.Value
         break
       case 'Multiply':
-        core.multiplyParameterValueById?.(p.Id, p.Value, 1)
+        target = base * p.Value
         break
-      case 'Overwrite':
-        core.setParameterValueById?.(p.Id, p.Value)
-        break
+      default:
+        target = p.Value // Overwrite（及缺省）
     }
+    const cur = currentMap.get(p.Id) ?? base
+    const next = Math.abs(target - cur) < 0.1 ? target : cur + (target - cur) * alpha
+    currentMap.set(p.Id, next)
+    core.setParameterValueById?.(p.Id, next)
   }
-}
-
-/**
- * 还原所有被表情修改过的参数到基础值，并清空记录。
- * 在表情系统关闭或模型切换时调用，确保表情参数彻底清除。
- */
-function restoreExpressionBase(core: CoreModelLike, baseValues: Map<string, number>): void {
-  for (const [id, val] of baseValues) {
-    core.setParameterValueById?.(id, val)
+  // 2. 已不在目标表情中的参数：向基线渐出，收敛后清理（防残留）
+  for (const [id, cur] of [...currentMap]) {
+    if (seen.has(id)) continue
+    const base = baseMap.get(id) ?? 0
+    const next = Math.abs(base - cur) < 0.1 ? base : cur + (base - cur) * alpha
+    if (next === base) {
+      currentMap.delete(id)
+      baseMap.delete(id)
+    } else {
+      currentMap.set(id, next)
+    }
+    core.setParameterValueById?.(id, next)
   }
-  baseValues.clear()
 }
 
 // ---------------- 眨眼状态机 ----------------

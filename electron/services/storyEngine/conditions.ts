@@ -2,7 +2,7 @@
  * 剧本条件求值器（纯函数，零 Electron 依赖；引擎运行期使用）。
  *
  * 支持：子句（裸变量真值 / == / != / >= / <= / > / <）与 all（全部满足）/ any（任一满足）组合。
- * LingChat "hp >= 5 静默恒假"教训的运行期防线：数值比较遇到非数值时恒为 false，
+ * "hp >= 5 静默恒假"教训的运行期防线：数值比较遇到非数值时恒为 false，
  * 但必须留下警告日志（schema 导入期校验已尽量拦截，此处兜底变量在运行期才出现的场景）。
  */
 import type { StoryCondition, StoryConditionClause, StoryConditionGroup } from '../../../src/types'

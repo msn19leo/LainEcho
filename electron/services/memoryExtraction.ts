@@ -11,7 +11,8 @@ import type { ChatMessage, MemoryCategory, MemoryItem } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
 import { embedTexts, type EmbeddingConfig } from './memory/embeddingService'
 import { resolveEmbeddingConfig, syncMemoryVectors } from './memory/memoryVectors'
-import { addPendingMemory, getSettings, listMemories } from './repository'
+import { addPendingMemory, getCharacterCard, getSettings, listMemories, updateMemory } from './repository'
+import { removeMemoryVectors } from './memory/memoryVectors'
 import { windowManager } from '../windows/windowManager'
 
 /** 每次沉淀抽取的最近对话条数 */
@@ -33,21 +34,36 @@ const EXTRACT_MAX_TOKENS = 2048
 /** 记录每个会话最近一次沉淀时间（内存态，重启即失效） */
 const lastExtractAt = new Map<string, number>()
 
-/** 抽取 prompt：独立上下文，绝不混入 EMOTION_PROMPT 的 JSON dialogue 约束 */
-const EXTRACT_SYSTEM_PROMPT =
-  '你是一个严格的对话记忆提取助手。从「对方(用户)」与「你(角色)」的对话中，' +
-  '只提取「真正长期重要」的新信息，忽略寒暄、日常随口一说、能从上下文自然获得的临时信息、以及明显重复的内容。' +
-  '只输出 JSON 本体（不要 markdown 代码块、不要任何解释）：{"memories":[{"category":"user_info","content":"..."}]}\n' +
-  '- category 只能是：\n' +
-  '  user_info = 对方个人信息（姓名/年龄/职业/喜好/雷点/习惯/身份等）\n' +
-  '  long_term = 长期经历（重要事件、剧情进展、值得记住的时刻）\n' +
-  '  promises = 约定与承诺（明确达成的约定、时间地点、答应做的事）\n' +
-  '- 重要性门槛（满足任一才提取）：明确给出的个人信息；具体且有长期价值的约定；会影响后续互动的重要事件。\n' +
-  '  不提取：客套话、单纯的情绪宣泄、正在被当前对话解决的一次性事项、过于琐碎的日常。\n' +
-  '- 表述视角必须统一：用户一律称「对方」，角色一律称「你」；严禁出现「用户/角色」等标签词作主语。\n' +
-  '  例：写「对方喜欢喝椰奶」而非「用户喜欢喝椰奶」；写「你答应明天陪对方去书店」而非「角色答应...」。\n' +
-  '  每条尽量只包含一个主语视角、一句话讲清，不超过 40 字。\n' +
-  '- 最多返回 6 条；优先保留最具体、最重要者。仅当确实无任何价值时返回 {"memories":[]}。'
+/**
+ * 抽取 prompt：独立上下文，绝不混入 EMOTION_PROMPT 的 JSON dialogue 约束。
+ *
+ * 表述视角（方案 A，第三人称档案体）：角色一律用其角色名，用户一律称「用户」。
+ * 记录是「档案」而非角色日记，第三人称对人（记忆列表阅读）与模型（注入后归一化
+ * 转回你/对方视角）都无歧义，避免出现 你/对方/角色 多种称呼混排。
+ */
+function buildExtractSystemPrompt(cardName: string): string {
+  return (
+    '你是一个严格的对话记忆提取助手。从「用户」与「' +
+    cardName +
+    '」的对话中，' +
+    '只提取「真正长期重要」的新信息，忽略寒暄、日常随口一说、能从上下文自然获得的临时信息、以及明显重复的内容。' +
+    '只输出 JSON 本体（不要 markdown 代码块、不要任何解释）：{"memories":[{"category":"user_info","content":"..."}]}\n' +
+    '- category 只能是：\n' +
+    '  user_info = 用户个人信息（姓名/年龄/职业/喜好/雷点/习惯/身份等）\n' +
+    '  long_term = 长期经历（重要事件、剧情进展、值得记住的时刻）\n' +
+    '  promises = 约定与承诺（明确达成的约定、时间地点、答应做的事）\n' +
+    '- 重要性门槛（满足任一才提取）：明确给出的个人信息；具体且有长期价值的约定；会影响后续互动的重要事件。\n' +
+    '  不提取：客套话、单纯的情绪宣泄、正在被当前对话解决的一次性事项、过于琐碎的日常。\n' +
+    '- 表述视角必须统一为第三人称档案体：用户一律称「用户」；角色一律用「' +
+    cardName +
+    '」这个角色名指代；严禁使用「我/你/对方/角色/AI」等任何人称代词或标签词作主语。\n' +
+    '  例：写「用户喜欢喝椰奶」而非「对方喜欢喝椰奶」；写「' +
+    cardName +
+    '答应陪用户去看流星雨」而非「你答应…」或「角色答应…」。\n' +
+    '  每条尽量只包含一个主语视角、一句话讲清，不超过 40 字。\n' +
+    '- 最多返回 6 条；优先保留最具体、最重要者。仅当确实无任何价值时返回 {"memories":[]}。'
+  )
+}
 
 /** 抽取结果中的单条记忆 */
 interface ExtractedMemory {
@@ -55,8 +71,8 @@ interface ExtractedMemory {
   content: string
 }
 
-/** 判断新记忆是否与现有记忆重复（完全相同或互相包含即视为重复） */
-function isDuplicate(content: string, existing: string[]): boolean {
+/** 判断新记忆是否与现有记忆重复（完全相同或互相包含即视为重复）。剧情沉淀管线（storyMemory）复用 */
+export function isDuplicate(content: string, existing: string[]): boolean {
   const c = content.trim()
   return existing.some((e) => {
     const et = e.trim()
@@ -76,9 +92,9 @@ function cosine(a: Float32Array, b: Float32Array): number {
  * 语义去重：把字符串去重后的候选与同角色已有记忆（含待确认候选）批量嵌入比对，
  * cos ≥ 阈值（memoryDedupThreshold，默认 0.92）即视为语义重复剔除。
  * 嵌入不可用/失败时原样返回（保留字符串去重结果，不阻塞沉淀）。
- * @returns 通过语义去重的候选子集
+ * @returns 通过语义去重的候选子集。剧情沉淀管线（storyMemory）复用
  */
-async function semanticDedup(
+export async function semanticDedup(
   fresh: Array<{ category: MemoryCategory; content: string }>,
   existingScoped: MemoryItem[],
   cfg: EmbeddingConfig,
@@ -102,17 +118,71 @@ async function semanticDedup(
 }
 
 /**
- * 人称视角归一化：统一为「对方=用户、你=角色」，清除混入的「用户/角色/AI」标签。
- * 避免沉淀出的记忆一会"你"一会"对方"一会"角色"，读感混乱。
+ * 人称视角归一化（第三人称档案体）：统一为「用户=用户方、{角色名}=角色」，
+ * 清除模型可能混入的「我/你/对方/角色/AI」。角色名缺失时退化为「角色」标签。
+ * 避免沉淀出的记忆一会"你"一会"对方"一会"角色"，读感混乱。剧情沉淀管线（storyMemory）复用
  */
-function normalizePerspective(content: string): string {
+export function normalizePerspective(content: string, cardName: string): string {
   let c = content.replace(/\s+/g, ' ').trim()
-  // 句中的孤立"角色/AI"→"你"（角色主语）；孤立"用户"→"对方"（用户主语）
-  c = c.replace(/(角色|AI)(?=[，。！？；：、）\s]|$)/g, '你')
-  c = c.replace(/(用户)(?=[，。！？；：、）\s]|$)/g, '对方')
+  // 用户方称呼归一：对方 → 用户
+  c = c.split('对方').join('用户')
+  // 角色方称呼归一：角色/AI/你/我 → 角色名（无角色名时保留「角色」标签）
+  const name = cardName.trim() || '角色'
+  c = name === '角色' ? c : c.split('角色').join(name).split('AI').join(name)
+  c = c.split('你').join(name).split('我').join(name)
   // 压缩多余空格与连续标点
   c = c.replace(/\s+([，。！？；：、])/g, '$1').replace(/,+/g, '，')
   return c.trim()
+}
+
+/**
+ * 存量记忆一次性迁移到第三人称档案体（幂等，启动时执行一次）：
+ * 旧约定是「你=角色、对方=用户」，且存在「角色」标签漏网，同一列表三种称呼混排。
+ * 迁移把所有带归属角色的记忆统一为「{角色名}/用户」；全局记忆（无归属）角色侧退化为「角色」。
+ * 归一化对已迁移文本是空操作（不再含人称代词），重复执行无副作用。
+ */
+export async function migrateMemoryPerspectives(): Promise<void> {
+  try {
+    const all = await listMemories()
+    const nameCache = new Map<string, string>()
+    let migrated = 0
+    const rewrittenIds: string[] = []
+    for (const m of all) {
+      // 角色名本身含人称字的卡片跳过，避免替换后文本不稳定（非幂等）
+      let name: string
+      if (m.characterCardId) {
+        const cached = nameCache.get(m.characterCardId)
+        if (cached !== undefined) {
+          name = cached
+        } else {
+          const card = await getCharacterCard(m.characterCardId)
+          name = card?.name?.trim() || '角色'
+          if (/你|我|角色|AI/.test(name)) {
+            nameCache.set(m.characterCardId, '\u0000skip')
+            continue
+          }
+          nameCache.set(m.characterCardId, name)
+        }
+        if (name === '\u0000skip') continue
+      } else {
+        name = '角色'
+      }
+      const next = normalizePerspective(m.content, name)
+      if (next !== m.content.trim() && next.length >= MIN_CONTENT_LEN) {
+        await updateMemory(m.id, { content: next })
+        rewrittenIds.push(m.id)
+        migrated++
+      }
+    }
+    if (migrated > 0) {
+      // 改写文本后旧向量失效：删除待补偿重嵌（嵌入未配置时删除后不再补，检索自动降级字符串匹配）
+      await removeMemoryVectors(rewrittenIds).catch(() => {})
+      console.log('[memory] 记忆人称迁移（第三人称档案体）：更新 %d 条', migrated)
+      windowManager.broadcast('memory:changed')
+    }
+  } catch (err) {
+    console.warn('[memory] 记忆人称迁移失败（跳过，不影响使用）：', err instanceof Error ? err.message : err)
+  }
 }
 
 /**
@@ -133,17 +203,21 @@ export async function extractMemoriesFromSession(params: {
   // 对话过短（不足 3 轮问答）时跳过，避免反复发起注定为空的抽取
   if (messages.length < EXTRACT_MIN_MESSAGES) return
 
+  // 角色卡名：第三人称档案体的角色侧称呼（卡片已删除则退化为「角色」标签）
+  const card = await getCharacterCard(cardId)
+  const cardName = card?.name?.trim() || '角色'
+
   // 同会话冷却：5 分钟内不重复抽取
   const now = Date.now()
   const last = lastExtractAt.get(sessionId) ?? 0
   if (now - last < EXTRACT_COOLDOWN_MS) return
   lastExtractAt.set(sessionId, now)
 
-  // 取最近一段对话的纯净文本（跳过 UI 元数据）；用「对方/你」标注，与 prompt 视角一致
+  // 取最近一段对话的纯净文本（跳过 UI 元数据）；用「用户/{角色名}」标注，与 prompt 第三人称视角一致
   const recent = messages.slice(-EXTRACT_RECENT_MESSAGES)
   const dialogueText = recent
     .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => `${m.role === 'user' ? '对方' : '你'}: ${m.content}`)
+    .map((m) => `${m.role === 'user' ? '用户' : cardName}: ${m.content}`)
     .join('\n')
     .trim()
   if (!dialogueText) return
@@ -151,7 +225,7 @@ export async function extractMemoriesFromSession(params: {
   try {
     const raw = await sendChatCompletion(
       [
-        { role: 'system', content: EXTRACT_SYSTEM_PROMPT },
+        { role: 'system', content: buildExtractSystemPrompt(cardName) },
         { role: 'user', content: `以下是对话：\n${dialogueText}\n\n请提取记忆：` },
       ],
       {
@@ -182,7 +256,7 @@ export async function extractMemoriesFromSession(params: {
     let fresh: Array<{ category: MemoryCategory; content: string }> = []
     for (const m of parsed) {
       if (fresh.length >= MAX_PER_BATCH) break
-      const content = normalizePerspective(m.content)
+      const content = normalizePerspective(m.content, cardName)
       if (content.length < MIN_CONTENT_LEN) continue
       if (isDuplicate(content, existing)) continue
       if (isDuplicate(content, seenInBatch)) continue

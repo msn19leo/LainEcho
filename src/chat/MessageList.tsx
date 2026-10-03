@@ -8,10 +8,11 @@
  *   - 消息出现使用 popSlideUp 弹性入场（scale 0.96 + y 12，0.4s 弹性曲线），逐条轻微错落。
  *   - 滚动优化（T3）：新消息/流式更新仅在用户接近底部时自动滚到底，且用瞬时滚动替代
  *     smooth，避免每个 token 都做一次平滑滚动造成卡顿。
- *   - 流式气泡抽成独立组件（StreamingBubble）单独订阅 streamingContent，流式更新时
- *     不再触发整个 MessageList 的 messages.map 重渲染。
+ *   - 末条 AI 由常驻槽位（LastAiSlot）接管：roundActive 期间定型行不再由 map 渲染，
+ *     直播（流式/跟读）与定型两个阶段在同一槽位内切换，不经历「卸载 → 重挂载」，
+ *     从根上消除回答收尾时入场动画重播造成的气泡闪烁。
  */
-import { Fragment, useEffect, useRef, type RefObject } from 'react'
+import { Fragment, useEffect, useRef, useState, type RefObject } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
@@ -21,24 +22,23 @@ import { typingSpeedToMs, useSettingsStore } from '../store/settingsStore'
 import { Typewriter } from '../components/Typewriter'
 import { cn, formatTime, splitSentences } from '../lib/utils'
 import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
-import type { DialogueChunk } from '../types'
+import type { ChatMessage, DialogueChunk } from '../types'
 import { popSlideUp, springElastic } from '../lib/motion'
 
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
 const NEAR_BOTTOM_THRESHOLD = 80
 
 export function MessageList() {
-  // 逐字速度由独立的 StreamingBubble 组件内部读取（见函数 StreamingBubble）
+  // 逐字速度由独立的 LastAiSlot 组件内部读取（见函数 LastAiSlot）
   const messages = useSessionStore((s) => s.messages)
-  // 顶层订阅 streamingContent：用于"流式结束但文字仍在逐字揭示"时隐藏定型 AI、保留揭示气泡
+  // 顶层订阅直播源：仅用于 roundActive 上升沿判定（本轮是否开始过）
   const streamingContent = useSessionStore((s) => s.streamingContent)
   const streaming = useSessionStore((s) => s.streaming)
   const streamError = useSessionStore((s) => s.streamError)
+  const currentSessionId = useSessionStore((s) => s.currentSessionId)
   const currentCardName = useCurrentCardName()
-  const followReading = useChatReadingStore((s) => s.followReading)
   const readingActive = useChatReadingStore((s) => s.readingActive)
-  // 跟读文本（宠物窗 displayedText 镜像）：非空说明本轮已有前置旁白/跟读内容上屏，
-  // 用于"语音尚未开始（合成中）"的空档期隐藏定型 AI，避免与跟读气泡重复显示
+  // 跟读文本（宠物窗 displayedText 镜像）：非空说明本轮已有前置旁白/跟读内容上屏
   const readingText = useChatReadingStore((s) => s.text)
   const listRef = useRef<HTMLDivElement>(null)
   /** 内容区外层（观测其实际高度以在打字机/流式增长时自动滚到底） */
@@ -52,6 +52,23 @@ export function MessageList() {
     }
     return -1
   })()
+
+  /**
+   * 本轮活跃标记：自本视图内第一轮流式/直播内容出现起为 true，
+   * 期间末条 AI 消息交给 LastAiSlot 接管（map 跳过）；
+   * 切换会话时重置（渲染期间调整，避免重置落后一帧）。
+   */
+  const [roundSession, setRoundSession] = useState(currentSessionId)
+  const [roundActive, setRoundActive] = useState(false)
+  if (roundSession !== currentSessionId) {
+    setRoundSession(currentSessionId)
+    setRoundActive(false)
+  }
+  useEffect(() => {
+    if (streaming || readingActive || readingText.length > 0 || streamingContent.length > 0) {
+      setRoundActive(true)
+    }
+  }, [streaming, readingActive, readingText, streamingContent])
 
   // 监听滚动：用户上翻看历史时不强制拉回底部
   const onScroll = () => {
@@ -94,13 +111,9 @@ export function MessageList() {
       {/* 内容区：外层用于 ResizeObserver 观测内容高度以自动滚动 */}
       <div ref={contentRef} className="space-y-4">
       {messages.map((msg, i) => {
-        // 隐藏末条定型 AI 的判定（须确有内容可显示，才由跟读/流式气泡接管，避免误藏上一条已落定回答）：
-        //  - 跟读：语音正在朗读（readingActive）或已有前置旁白（readingText 非空，语音尚未开始）时隐藏；
-        //    朗读结束即恢复定型消息，不依赖 streamingContent（跟读气泡显示 readingText），
-        //    避免"朗读结束空档"误隐藏。
-        //  - 流式（非跟读）：streamingContent 尚有内容（揭示未完）时隐藏。
-        if (!streaming && ((followReading && (readingActive || readingText.length > 0)) || (!followReading && streamingContent.length > 0)) && msg.role === 'assistant' && i === lastAssistantIndex) {
-          console.log('[sync] chat 隐藏末条AI 下标=%d 原因(followReading=%s,readingActive=%s,sc=%d)', i, followReading, readingActive, streamingContent.length)
+        // roundActive 期间（非流式生成中），末条 AI 定型行由 LastAiSlot 接管：map 跳过，
+        // 槽位在原气泡位置渲染直播（打字机）或定型排版，交接不重挂载、不重播入场动画
+        if (roundActive && !streaming && msg.role === 'assistant' && i === lastAssistantIndex) {
           return null
         }
         const isUser = msg.role === 'user'
@@ -116,6 +129,8 @@ export function MessageList() {
           <motion.div
             key={i}
             {...popSlideUp}
+            // roundActive 期间末条 AI 从槽位移交回 map（新一轮流式开始）时跳过入场动画，避免交接闪烁
+            initial={roundActive && i === lastAssistantIndex ? false : undefined}
             transition={{ ...popSlideUp.transition, delay: Math.min(i * 0.04, 0.32) }}
             className={cn('flex', isUser ? 'justify-end' : 'justify-start')}
           >
@@ -147,11 +162,12 @@ export function MessageList() {
         )
       })}
 
-      {/* 流式/跟读气泡显示：跟读在语音正在朗读（readingActive）或已有前置旁白（readingText 非空，
-          语音尚未开始，旁白先行上屏）时出现；非跟读在 streamingContent 尚有内容时出现 */}
-      {streaming || (!followReading && streamingContent.length > 0) || (followReading && (readingActive || readingText.length > 0)) ? (
-        <StreamingBubble
+      {/* 末条 AI 常驻槽位：roundActive 期间接管直播（流式/跟读打字机）与定型渲染，
+          交接在组件内部完成，不重挂载、不重播入场动画 */}
+      {roundActive ? (
+        <LastAiSlot
           name={currentCardName || 'AI'}
+          message={lastAssistantIndex >= 0 ? (messages[lastAssistantIndex] as ChatMessage) : undefined}
           listRef={listRef}
           nearBottomRef={nearBottomRef}
         />
@@ -197,21 +213,28 @@ export function MessageList() {
 }
 
 /**
- * 流式气泡（T3）：独立组件单独订阅 streamingContent。
- * 这样流式 token 逐帧刷新只重渲染本气泡，不会触发 MessageList 里整条 messages.map 重渲染。
- * 同时在内容增长时驱动父级列表滚动（仅在接近底部时瞬时滚到底）。
+ * 末条 AI 常驻槽位：roundActive 期间接管末条 AI 消息的显示。
+ *
+ * - 直播阶段：跟读显示 readingText 打字机（宠物窗随语音段段追加的镜像），非跟读显示
+ *   streamingContent 打字机；行为与原 StreamingBubble 一致。
+ * - 定型阶段：流式结束且直播源排空后，同一位置直接渲染定型排版（AssistantSentences），
+ *   无重挂载、无入场动画重播——这是消除"回答收尾气泡闪烁"的关键。
+ * - 定型阶段持续到本轮视图结束（切换会话重置），期间该行由 map 跳过，不重复渲染。
  */
-function StreamingBubble({
+function LastAiSlot({
   name,
+  message,
   listRef,
   nearBottomRef,
 }: {
   name: string
+  /** 接管的末条 AI 消息（定型阶段渲染其内容；中止等场景可能尚未落盘 → undefined） */
+  message: ChatMessage | undefined
   listRef: RefObject<HTMLDivElement | null>
   nearBottomRef: RefObject<boolean>
 }) {
-  const streamingContent = useSessionStore((s) => s.streamingContent)
   const streaming = useSessionStore((s) => s.streaming)
+  const streamingContent = useSessionStore((s) => s.streamingContent)
   // 语音跟读文本与模式：跟读时与宠物窗完全一致地显示段落文本
   const followReading = useChatReadingStore((s) => s.followReading)
   const readingText = useChatReadingStore((s) => s.text)
@@ -221,7 +244,7 @@ function StreamingBubble({
   const typeSpeed = typingSpeedToMs(textSpeed)
 
   // 即时模式（textSpeed=0 → typeSpeed<=0）：Typewriter 全量直显、不触发 onDone 清空 streamingContent，
-  // 会导致定型消息被持续隐藏、气泡文字停在流式气泡里。流式一结束即清空，让完整消息上屏。
+  // 会导致定型消息被持续隐藏、气泡文字停在流式气泡里。流式一结束即清空，切换到定型渲染。
   useEffect(() => {
     if (!streaming && streamingContent.length > 0 && typeSpeed <= 0) {
       useSessionStore.setState({ streamingContent: '' })
@@ -235,6 +258,32 @@ function StreamingBubble({
       el.scrollTop = el.scrollHeight
     }
   }, [streamingContent, readingText, listRef, nearBottomRef])
+
+  // 定型判定：流式已结束且直播源已排空。注意跟读块间 readingActive 会瞬时回落，
+  // 但 readingText 仍非空 → 仍算直播阶段，不会误判定型。
+  const finalized =
+    !streaming &&
+    (followReading
+      ? !readingActive && readingText.length === 0
+      : streamingContent.length === 0)
+
+  if (finalized) {
+    // 中止/失败等场景消息可能尚未落盘：无可渲染内容，直接隐藏（与原"气泡隐藏"语义一致）
+    if (!message) return null
+    return (
+      <div className="flex justify-start">
+        <div className="max-w-[80%] text-left">
+          <div className="mb-1 flex items-center gap-2 px-1 text-xs text-text-muted">
+            <span>{name}</span>
+            {message.timestamp && <span>{formatTime(message.timestamp)}</span>}
+          </div>
+          <div className="glass selectable whitespace-pre-wrap break-words rounded-[var(--radius-lg)] rounded-bl-[var(--radius-md)] px-4 py-2.5 text-sm leading-relaxed text-text">
+            <AssistantSentences content={normalizeParagraphs(message.content)} chunks={message.chunks} />
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <motion.div {...popSlideUp} className="flex justify-start">

@@ -8,10 +8,11 @@
 import { promises as fs } from 'fs'
 import path from 'path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import type { CharacterCard, StoryEvent, StoryImportReport } from '../../../src/types'
+import type { CharacterCard, EmotionPaletteRef, StoryEvent, StoryImportReport } from '../../../src/types'
+import { builtinPalette } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
 import { readApiKey } from '../crypto'
-import { getCharacterCard, getSettings } from '../repository'
+import { getCharacterCard, getSettings, getSpritePalette, paletteHash } from '../repository'
 import { paths } from '../storage'
 import { validateChapter, validateMeta, type SchemaIssue } from './schema'
 
@@ -108,32 +109,37 @@ function normalizeChapterName(draft: string): string {
   return out.join('\n')
 }
 
-/** 标准 6 情绪（与 schema STANDARD_EMOTIONS 一致） */
-const STANDARD_EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy'] as const
-type StandardEmotion = (typeof STANDARD_EMOTIONS)[number]
+/** 情绪类别（猜测/别名的中间语义）：再由词表映射到具体词，落空则归默认词 */
+type EmotionCategory = 'happy' | 'sad' | 'angry' | 'surprised' | 'shy' | 'neutral'
 
-/** LLM 常见的非标准情绪写法 → 标准情绪（修复管线用；先精确匹配，未命中再按关键词猜测，兜底 neutral） */
-const EMOTION_ALIASES: Record<string, StandardEmotion> = {
+/** LLM 常见的非标准情绪写法 → 情绪类别（修复管线用；先精确匹配，未命中再按关键词猜测） */
+const EMOTION_ALIASES: Record<string, EmotionCategory> = {
   // happy（含"喜极而泣"类复合词）
   smile: 'happy', smiling: 'happy', laugh: 'happy', laughing: 'happy', giggle: 'happy', joy: 'happy', joyful: 'happy',
   glad: 'happy', cheerful: 'happy', excited: 'happy', excitedly: 'happy', warm: 'happy', gentle: 'happy', softly: 'happy',
   tender: 'happy', moved: 'happy', touched: 'happy', relieved: 'happy', sweet: 'happy', crying_happy: 'happy',
   happy_crying: 'happy', tearful_smile: 'happy', happy_tears: 'happy',
+  开心: 'happy', 高兴: 'happy', 快乐: 'happy', 愉悦: 'happy',
   // sad
   cry: 'sad', crying: 'sad', tears: 'sad', tearful: 'sad', upset: 'sad', down: 'sad', blue: 'sad', lonely: 'sad',
   depressed: 'sad', gloomy: 'sad', sorrow: 'sad', sorrowful: 'sad', hurt: 'sad', disappointed: 'sad',
+  难过: 'sad', 悲伤: 'sad', 委屈: 'sad',
   // angry
   mad: 'angry', furious: 'angry', annoyed: 'angry', pouty: 'angry', grumpy: 'angry',
+  生气: 'angry', 愤怒: 'angry',
   // surprised
   shock: 'surprised', shocked: 'surprised', startled: 'surprised', astonished: 'surprised', amazed: 'surprised', wow: 'surprised',
+  惊讶: 'surprised', 震惊: 'surprised',
   // shy
   blush: 'shy', blushing: 'shy', embarrassed: 'shy', bashful: 'shy', flustered: 'shy',
+  害羞: 'shy', 脸红: 'shy',
   // neutral
   calm: 'neutral', serious: 'neutral', blank: 'neutral', normal: 'neutral', none: 'neutral', flat: 'neutral', default: 'neutral',
+  平静: 'neutral',
 }
 
 /** 关键词猜测（别名表未命中时）：复合词按意图优先级匹配（如 crying_happy 归 happy） */
-function guessEmotion(raw: string): StandardEmotion {
+function guessEmotionCategory(raw: string): EmotionCategory {
   const s = raw.toLowerCase()
   if (/happy|smile|laugh|joy|glad|warm|moved|touch/.test(s)) return 'happy'
   if (/sad|cry|tear|sorrow|down|blue|lonely/.test(s)) return 'sad'
@@ -143,8 +149,19 @@ function guessEmotion(raw: string): StandardEmotion {
   return 'neutral'
 }
 
-/** 修复非标准 emotion 值（LLM 常自创 crying_happy / smile 等）→ 归一化到标准 6 情绪 */
-function normalizeEmotions(draft: string): string {
+/** 情绪类别 → 内置标准中文词（修复的最终落点候选；词表含该词才用，否则归词表默认词） */
+const CATEGORY_WORD: Record<EmotionCategory, string> = {
+  happy: '开心', sad: '难过', angry: '生气', surprised: '惊讶', shy: '害羞', neutral: '平静',
+}
+
+/**
+ * 修复非标准 emotion 值（LLM 常自创 crying_happy / smile 等）→ 归一化到绑定词表：
+ * 词表精确命中 → 别名/猜测出的类别词在词表内 → 词表默认词。
+ * @param draft 草稿 yaml 文本
+ * @param palette 词表视图（缺省 = 内置最小词表，仅"平静"）
+ */
+function normalizeEmotions(draft: string, palette: EmotionPaletteRef): string {
+  const words = new Set(palette.entries.map((e) => e.name))
   const out: string[] = []
   for (const line of draft.split('\n')) {
     const m = /^(\s*emotion:\s*)(.+?)\s*$/.exec(line)
@@ -153,11 +170,13 @@ function normalizeEmotions(draft: string): string {
       continue
     }
     const raw = m[2]!.replace(/^["']|["']$/g, '').trim()
-    if ((STANDARD_EMOTIONS as readonly string[]).includes(raw)) {
+    if (words.has(raw)) {
       out.push(line)
       continue
     }
-    const mapped = EMOTION_ALIASES[raw.toLowerCase()] ?? guessEmotion(raw)
+    // 修复链：别名表/关键词猜测 → 情绪类别 → 类别标准词（在词表内才用）→ 词表默认词
+    const category = EMOTION_ALIASES[raw.toLowerCase()] ?? guessEmotionCategory(raw)
+    const mapped = words.has(CATEGORY_WORD[category]) ? CATEGORY_WORD[category] : palette.defaultEmotion
     out.push(`${m[1]}"${mapped}"`)
     console.warn('[story] 草稿 emotion 修复：「%s」→「%s」', raw, mapped)
   }
@@ -165,8 +184,8 @@ function normalizeEmotions(draft: string): string {
 }
 
 /** 草稿修复管线：行内紧凑映射 → 章节缺 name → 非标准 emotion（生成物常见笔误，先修再校验） */
-export function normalizeDraftYaml(draft: string): string {
-  return normalizeEmotions(normalizeChapterName(normalizeCompactMappings(draft)))
+export function normalizeDraftYaml(draft: string, palette?: EmotionPaletteRef): string {
+  return normalizeEmotions(normalizeChapterName(normalizeCompactMappings(draft)), palette ?? builtinPalette())
 }
 
 /** 压缩角色卡人设为生成提示词可用的简介（存在字段才输出） */
@@ -186,8 +205,20 @@ function describeCard(card: CharacterCard): string {
 }
 
 /** 组装生成提示词（事件 schema 全部以块状示例钉版——行内紧凑写法是非法 YAML，严禁模仿） */
-function buildGeneratePrompt(premise: string, card: CharacterCard | null): string {
+function buildGeneratePrompt(premise: string, card: CharacterCard | null, palette: EmotionPaletteRef): string {
   const cardBlock = card ? `\n【参考角色】\n剧本主角按下面的角色卡人设编写（台词风格与关系背景要贴合）：\n${describeCard(card)}\n` : ''
+  // 情绪值域：按绑定立绘集词表生成（每词附释义；超 4 词分组换行）
+  const items = palette.entries.map((e) => (e.gloss.trim() ? `${e.name}(${e.gloss.trim()})` : e.name))
+  const wordLines: string[] = []
+  for (let i = 0; i < items.length; i += 4) wordLines.push('   ' + items.slice(i, i + 4).join(' / '))
+  const defEntry = palette.entries.find((e) => e.name === palette.defaultEmotion)
+  const defLabel = defEntry ? palette.defaultEmotion : palette.entries[0]!.name
+  const emotionBlock = `6. emotion 字段只能取本剧本绑定立绘集词表中的词（共 ${palette.entries.length} 个）：
+${wordLines.join('\n')}
+   禁止自创情绪词（如 crying_happy、smile、excited 都是非法的）；想表达更细腻的情绪就用词表中最接近的词加括号描写。`
+  // 示例情绪值：取非默认词轮转，缺省（最小词表）全部用默认词
+  const others = palette.entries.map((e) => e.name).filter((n) => n !== defLabel)
+  const pick = (i: number) => (others.length > 0 ? others[i % others.length]! : defLabel)
   return `你是 galgame 剧本作者。为 LainEcho 剧情演出系统撰写一部完整的短篇剧本，输出一个 YAML 文档。
 ${cardBlock}
 【创作梗概】
@@ -207,8 +238,7 @@ ${premise}
      file: bgm.mp3
      loop: true
 5. text / prompt / summary 的值里如果出现英文冒号加空格，必须给整个值加英文双引号。
-6. emotion 字段只能取六个标准情绪之一：neutral / happy / sad / angry / surprised / shy。
-   禁止自创情绪词（如 crying_happy、smile、excited 都是非法的）；想表达"喜极而泣"用 happy 加括号描写。
+${emotionBlock}
 
 【事件类型（只能用以下 12 种；所有事件都可带 condition: "条件"）】
 - type: background
@@ -219,7 +249,7 @@ ${premise}
 - type: music
   stop: true
 - type: modify_character
-  emotion: happy
+  emotion: "${defLabel}"
 - type: narration
   text: 旁白文本（无语音，铺氛围）
 - type: player
@@ -227,7 +257,7 @@ ${premise}
 - type: dialogue
   character: MAIN
   text: 预设台词
-  emotion: shy
+  emotion: "${pick(0)}"
 - type: ai_dialogue
   prompt: 导演指令（角色自由回复）
 - type: free_dialogue
@@ -281,10 +311,12 @@ export interface DraftGenerateResult {
 }
 
 /**
- * 生成剧本草稿：梗概（+可选参考角色卡）→ LLM 非流式产出 → 回传草稿文本。
+ * 生成剧本草稿：梗概（+可选参考角色卡 +可选情绪词表来源立绘集）→ LLM 非流式产出 → 回传草稿文本。
  * 生成即做 schema 校验并把报告一并返回（草稿可编辑后重新导入再校验）。
+ * 指定 spriteSetId 时：生成 prompt 的 emotion 值域按该集词表生成，且草稿 yaml 顶层注入
+ * spriteSetId + vocabHash —— 导入即完成剧本与词表的绑定闭环。
  */
-export async function generateStoryDraft(params: { premise: string; cardId?: string | null }): Promise<DraftGenerateResult> {
+export async function generateStoryDraft(params: { premise: string; cardId?: string | null; spriteSetId?: string | null }): Promise<DraftGenerateResult> {
   const premise = params.premise?.trim() ?? ''
   if (!premise) return { ok: false, errors: [{ file: '', message: '请先填写剧本梗概' }] }
   try {
@@ -292,10 +324,12 @@ export async function generateStoryDraft(params: { premise: string; cardId?: str
     const apiKey = await readApiKey()
     if (!apiKey) return { ok: false, errors: [], error: '未配置 API Key，请先在「设置 → AI API 配置」中填写' }
     const card = params.cardId ? await getCharacterCard(params.cardId).catch(() => null) : null
+    // 创作词表：按所选立绘集（缺省 = 内置最小词表，仅"平静"）
+    const palette = await getSpritePalette(params.spriteSetId ?? null)
     const raw = await sendChatCompletion(
       [
         { role: 'system', content: '你是资深的 galgame 剧本作者，严格按用户给出的格式契约输出 YAML 剧本，不输出任何多余内容。' },
-        { role: 'user', content: buildGeneratePrompt(premise, card) },
+        { role: 'user', content: buildGeneratePrompt(premise, card, palette) },
       ],
       {
         model: settings.model,
@@ -307,13 +341,19 @@ export async function generateStoryDraft(params: { premise: string; cardId?: str
         maxTokensOverride: Math.max(settings.maxTokens ?? 0, 8192),
       },
     )
-    const draft = normalizeDraftYaml(stripToFenceFreeYaml(raw))
+    let draft = normalizeDraftYaml(stripToFenceFreeYaml(raw), palette)
     if (!draft) return { ok: false, errors: [], error: '模型返回为空，请调整梗概后重试' }
+    // 绑定注入：草稿顶层写入 spriteSetId + vocabHash，导入后 story.yaml 直接带上（闭环）
+    const spriteSetId = params.spriteSetId?.trim() || ''
+    if (spriteSetId) {
+      const vocabHash = paletteHash(palette)
+      draft = `spriteSetId: ${spriteSetId}\n${vocabHash ? `vocabHash: ${vocabHash}\n` : ''}${draft}`
+    }
     // 生成即校验：错误随草稿一并回显（用户可编辑修正后再导入）
     const errors = validateDraft(draft)
     return { ok: true, draft, errors }
   } catch (err) {
-    console.warn('[story] 剧本草稿生成失败：', err instanceof Error ? err.message : err)
+    console.warn('[story] 剧本草稿生成失败：', err instanceof Error ? err.message : String(err))
     return { ok: false, errors: [], error: err instanceof Error ? err.message : String(err) }
   }
 }

@@ -25,13 +25,13 @@ import {
 import {
   adoptProfileDraft,
   consolidateProfile,
-  deleteChronicleEntry,
   deletePersonaDigest,
   getProfile,
+  listProfileOverview,
   maybeAutoConsolidate,
   resolveConsolidator,
   setPersonaDigest,
-  updateChronicleEntry,
+  setPersonaEnabled,
 } from '../services/memory/profile'
 import { windowManager } from '../windows/windowManager'
 
@@ -51,10 +51,10 @@ export function registerMemoryIpc(): void {
       return item
     },
   )
-  ipcMain.handle('memory:update', async (_e, id: string, patch: { content?: string; category?: MemoryCategory }) => {
+  ipcMain.handle('memory:update', async (_e, id: string, patch: { content?: string; category?: MemoryCategory; enabled?: boolean }) => {
     await updateMemory(id, patch)
     windowManager.broadcast('memory:changed')
-    // 内容被编辑 → 原向量失效，重嵌（fire-and-forget）
+    // 内容被编辑 → 原向量失效，重嵌（fire-and-forget）；开关切换不动内容，无需重嵌
     if (patch.content !== undefined) {
       void listMemories().then((items) => syncMemoryVectors(items.filter((m) => m.id === id)))
     }
@@ -94,20 +94,29 @@ export function registerMemoryIpc(): void {
   /** 测试嵌入配置连通性（地址/模型/独立 Key），成功返回向量维度 */
   ipcMain.handle('memory:test-embedding', () => testEmbedding())
 
-  // ---------------- 画像 / 编年史（分层压缩） ----------------
+  // ---------------- 画像（分层压缩） ----------------
 
   ipcMain.handle('memory:get-profile', async (_e, params: { cardId?: string | null }) => {
     return getProfile(params?.cardId ?? '')
   })
 
-  /** 触发整理：画像草稿落盘待采纳，编年史直接生效；未配置 API 时返回可读错误 */
+  /** 档案总览（画像 tab「全局」查看态）：所有已生成画像的档案 */
+  ipcMain.handle('memory:get-profile-overview', () => listProfileOverview())
+
+  /** 触发画像整理（聚合「用户信息」类记忆为草稿，待采纳）；未配置 API 时返回可读错误 */
   ipcMain.handle('memory:consolidate-profile', async (_e, params: { cardId?: string | null }) => {
     const cardId = params?.cardId ?? ''
     const llm = await resolveConsolidator()
-    if (!llm) return { ok: false, draft: null, chronicleAdded: 0, error: '未配置 API（baseURL/model/Key），无法整理画像' }
+    if (!llm) return { ok: false, draft: null, error: '未配置 API（baseURL/model/Key），无法整理画像' }
     const result = await consolidateProfile(cardId, llm)
-    if (result.draft || result.chronicleAdded > 0) windowManager.broadcast('memory:changed')
+    if (result.draft) windowManager.broadcast('memory:changed')
     return result
+  })
+
+  /** 切换画像注入开关（false = 暂停常驻注入，画像保留） */
+  ipcMain.handle('memory:set-profile-enabled', async (_e, params: { cardId?: string | null; enabled: boolean }) => {
+    await setPersonaEnabled(params?.cardId ?? '', params?.enabled !== false)
+    windowManager.broadcast('memory:changed')
   })
 
   /** 采纳/放弃画像草稿（采纳后常驻注入 system prompt） */
@@ -130,21 +139,6 @@ export function registerMemoryIpc(): void {
   /** 删除已生效画像（来源记忆恢复"未吸收"，可重新整理生成） */
   ipcMain.handle('memory:delete-profile-digest', async (_e, params: { cardId?: string | null }) => {
     await deletePersonaDigest(params?.cardId ?? '')
-    windowManager.broadcast('memory:changed')
-  })
-
-  /** 编辑单条编年史条目 */
-  ipcMain.handle(
-    'memory:update-chronicle-entry',
-    async (_e, params: { cardId?: string | null; entryId: string; text: string }) => {
-      await updateChronicleEntry(params?.cardId ?? '', params?.entryId ?? '', params?.text ?? '')
-      windowManager.broadcast('memory:changed')
-    },
-  )
-
-  /** 删除单条编年史条目（原始记忆保持不变，仅移除摘要） */
-  ipcMain.handle('memory:delete-chronicle-entry', async (_e, params: { cardId?: string | null; entryId: string }) => {
-    await deleteChronicleEntry(params?.cardId ?? '', params?.entryId ?? '')
     windowManager.broadcast('memory:changed')
   })
 }

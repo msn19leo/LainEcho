@@ -38,11 +38,8 @@ function syncPetCard(cardId: string | null) {
   api.app.setPetCard({
     cardId,
     modelId: card?.modelId ?? null,
-    modelOverride: card?.modelOverride ?? null,
     renderMode: card?.renderMode ?? null,
     spriteId: card?.spriteId ?? null,
-    emotionMap: card?.emotionMap ?? null,
-    live2dExpressionMap: card?.live2dExpressionMap ?? null,
   })
 }
 
@@ -205,7 +202,7 @@ export function ChatWindow() {
           </button>
 
           <div className="min-w-0 flex-1 text-center">
-            <span className="truncate text-sm font-medium text-text">
+            <span className="block truncate text-sm font-medium text-text" title={currentSession?.title}>
               {currentSession?.title ?? '新会话'}
             </span>
           </div>

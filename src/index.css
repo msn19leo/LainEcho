@@ -267,18 +267,6 @@ textarea {
   caret-color: var(--color-text);
 }
 
-/* 原生 <select> 下拉弹层跟随应用主题：Windows Chromium 的弹层可能跟随系统原生主题
- * 而非页面 color-scheme（暗色页面弹层仍白底、选项看不清），显式给 option 上色修正 */
-select option,
-select optgroup {
-  background-color: var(--bg-panel);
-  color: var(--text-primary);
-}
-select option:checked {
-  background-color: color-mix(in oklab, var(--primary-500) 30%, var(--bg-panel));
-  color: var(--text-primary);
-}
-
 /* 拖动窗口的无边框区域（自定义标题栏） */
 .app-drag {
   -webkit-app-region: drag;

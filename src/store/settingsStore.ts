@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   contextWindowTokens: 32768,
   enableAutoCompact: true,
   enableMemoryExtraction: true,
+  // 回答仅含台词：普通聊天不生成也不显示（）内的描写（默认关闭 = 保留现状）
+  stripParenNarration: false,
   // 记忆向量检索：默认关闭（需配置嵌入 API 地址/模型/Key 后开启）
   memoryRetrievalEnabled: false,
   embeddingBaseURL: '',
@@ -65,6 +67,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           contextWindowTokens: data.contextWindowTokens,
           enableAutoCompact: data.enableAutoCompact,
           enableMemoryExtraction: data.enableMemoryExtraction,
+          stripParenNarration: data.stripParenNarration,
           memoryRetrievalEnabled: data.memoryRetrievalEnabled,
           embeddingBaseURL: data.embeddingBaseURL,
           embeddingModel: data.embeddingModel,

@@ -8,7 +8,7 @@ import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWi
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
 import { createStoryWindow } from './storyWindow'
-import type { ModelSettings, PetCardPayload, StandardEmotion, TTSLanguage } from '../../src/types'
+import type { ModelSettings, PetCardPayload, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -23,6 +23,9 @@ class WindowManager {
   private pendingVoiceMode: { voiceEnabled: boolean } | null = null
   /** 最近一次广播的语音模式（窗口就绪后补发用） */
   private lastVoiceMode: { voiceEnabled: boolean } | null = null
+  /** 最近一次上报的朗读状态（聊天窗就绪后补发用：窗晚开时补齐跟读进度，避免落定全文直接上屏） */
+  private lastReadingText = ''
+  private lastReadingActive = false
   /** 当前正在进行 AI 流式回复的会话 id（无则 null）。用于窗口重载/新建后就绪时补发，
    *  让重开/热更的窗口能"认领"进行中的会话，避免漏掉该轮的 stream-user/done 而看起来"生成失败" */
   private activeStreamingSession: string | null = null
@@ -32,7 +35,7 @@ class WindowManager {
     text: string
     voiceId: string | null
     languageOverride: TTSLanguage | null
-    chunks?: Array<{ text: string; emotion: StandardEmotion }>
+    chunks?: Array<{ text: string; emotion: string }>
     follow: boolean
     engine?: 'genie' | 'mimo'
     genieOverride?: import('../../src/types').CharacterGenieOverride | null
@@ -171,7 +174,7 @@ class WindowManager {
       text: string
       voiceId: string | null
       languageOverride: TTSLanguage | null
-      chunks?: Array<{ text: string; emotion: StandardEmotion }>
+      chunks?: Array<{ text: string; emotion: string }>
       follow: boolean
       engine?: 'genie' | 'mimo'
       genieOverride?: import('../../src/types').CharacterGenieOverride | null
@@ -265,6 +268,7 @@ class WindowManager {
 
   /** 宠物窗朗读到某段文本时转发给聊天窗，让其随语音段段显示（null 表示清空） */
   notifyReadingText(text: string): void {
+    this.lastReadingText = text ?? ''
     if (this.chat && !this.chat.isDestroyed()) {
       this.chat.webContents.send('chat:reading-text', text)
     }
@@ -273,13 +277,25 @@ class WindowManager {
   /** 桌宠窗朗读是否进行中 → 转发给聊天窗控制光标 */
   notifyReadingActive(active: boolean): void {
     console.log('[sync] pet阅读Active→chat', active)
+    this.lastReadingActive = active === true
     if (this.chat && !this.chat.isDestroyed()) {
       this.chat.webContents.send('chat:reading-active', active)
     }
   }
 
-  /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘 */
-  notifyEmotion(emotion: StandardEmotion): void {
+  /** 聊天窗 renderer 就绪后补发最近一次朗读状态（文本 + 进行中标记）。
+   *  聊天窗晚于朗读开始才被唤出/创建时，此前的 reading-text/active 报告都已丢失，
+   *  不补发会导致落定全文绕过跟读门直接上屏（与桌宠窗不同步，2026-09-29 线上案例）。
+   *  注意必须在 resendVoiceMode 之后调用：onVoiceMode 处理器会清空朗读文本。 */
+  resendReadingState(target: 'chat'): void {
+    const win = this.chat
+    if (!win || win.isDestroyed()) return
+    win.webContents.send('chat:reading-text', this.lastReadingText)
+    win.webContents.send('chat:reading-active', this.lastReadingActive)
+  }
+
+  /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘（词表方案下为自由情绪词） */
+  notifyEmotion(emotion: string): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:emotion', emotion)
     }

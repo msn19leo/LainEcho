@@ -65,6 +65,16 @@ function toGenieLang(lang: string): string {
   return lang === 'ja' ? 'jp' : lang
 }
 
+/**
+ * 检测参考音频文本自身的语言：含日文假名 → 'ja'，否则 → 'zh'。
+ * set_reference_audio 的 language 决定 prompt 文本用哪种 G2P 编码成条件音素，
+ * 应标记参考音频的真实语言（与合成语言无关）——错标会导致条件音素与实际音频错乱，
+ * 显著提高模型复诵参考音频（复读）的概率，也是跨语言克隆的正确性前提。
+ */
+function detectRefAudioLang(text: string): 'ja' | 'zh' {
+  return /[\u3040-\u309F\u30A0-\u30FF]/.test(text) ? 'ja' : 'zh'
+}
+
 /** 当前已加载的角色（避免重复加载） */
 let loadedCharacter = ''
 
@@ -232,13 +242,29 @@ async function resolveDefaultReferenceAudio(onnxModelDir: string): Promise<{ pat
   }
 }
 
-/** 加载角色（POST /load_character），角色名/语言变化时才重新加载；可选设置参考音频 */
+/** 加载角色（POST /load_character），角色名/语言变化时才重新加载；可选设置参考音频。
+ *  关键：服务端 load_character 对已在内存的同名角色会直接跳过（语言只在首次加载时生效，
+ *  见 Genie ModelManager.load_character 的 character_to_model 早退分支），
+ *  因此每次重载前必须先 /unload_character 复位，否则切换语言后服务端仍按旧语言合成。 */
 async function ensureCharacterLoaded(params: { characterName: string; onnxModelDir: string; refAudioPath?: string; refAudioText?: string }, base: string, lang: string): Promise<void> {
   const name = params.characterName.trim()
   if (!name) throw new Error('未配置角色名（characterName）')
   if (!params.onnxModelDir) throw new Error('未配置角色 onnx 模型目录（onnxModelDir）')
   const gLang = toGenieLang(lang)
   if (loadedCharacter === `${name}|${gLang}`) return
+
+  // 先卸载同名角色再加载：让切换语言真正生效。
+  // unload 对未加载的角色是安全空操作；端点不存在/网络异常时吞掉，退化为旧行为。
+  try {
+    await net.fetch(`${base}/unload_character`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ character_name: name }),
+      signal: AbortSignal.timeout(30000),
+    })
+  } catch {
+    /* ignore */
+  }
 
   // load_character：角色名用明文
   const loadResp = await net.fetch(`${base}/load_character`, {
@@ -251,7 +277,9 @@ async function ensureCharacterLoaded(params: { characterName: string; onnxModelD
     throw new Error(`加载角色失败 (HTTP ${loadResp.status})`)
   }
 
-  // 可选参考音频（用于情绪/语气素材；未配置则跳过，用声库默认）
+  // 可选参考音频（用于情绪/语气素材；未配置则跳过，用声库默认）。
+  // language 传参考音频文本自身的语言（自动检测），而非当前合成语言：
+  // prompt 文本必须按与音频一致的语言编码条件音素，错标会诱发复读参考音频。
   if (params.refAudioPath && params.refAudioText) {
     const refResp = await net.fetch(`${base}/set_reference_audio`, {
       method: 'POST',
@@ -260,7 +288,7 @@ async function ensureCharacterLoaded(params: { characterName: string; onnxModelD
         character_name: name,
         audio_path: params.refAudioPath,
         audio_text: params.refAudioText,
-        language: gLang,
+        language: toGenieLang(detectRefAudioLang(params.refAudioText)),
       }),
       signal: AbortSignal.timeout(60000),
     })
@@ -311,6 +339,39 @@ function wrapToWav(chunks: Uint8Array[], sampleRate = 32000): ArrayBuffer | null
   return ab
 }
 
+/** 大写字母的中文谐音读法表（字母名近似音）：
+ *  Genie 中文 G2P 会删除所有英文字母（ChineseG2P 的 pattern_eng 把 [a-zA-Z]+ 整段移除），
+ *  AI/GPU 等缩写会被静默跳过；合成前把缩写转成谐音汉字即可让 Genie 按普通话读出。 */
+const LETTER_ZH: Record<string, string> = {
+  A: '欸', B: '必', C: '西', D: '地', E: '伊', F: '艾付', G: '吉',
+  H: '诶曲', I: '艾', J: '杰', K: '开', L: '艾勒', M: '艾姆', N: '恩',
+  O: '欧', P: '批', Q: '扣', R: '啊儿', S: '艾丝', T: '提', U: '优',
+  V: '维', W: '达不溜', X: '艾克斯', Y: '歪', Z: '贼',
+}
+
+/** 缩写匹配规则（仅大写）：纯大写缩写 2-5 连（AI/GPU/USB）、字母数字混排（3D/2K、A4/X1/1080P）。
+ *  单字母与超过 5 连的大写串、普通英文单词不处理（维持 Genie 默认跳过；逐字母拼读单词反而怪异） */
+const ABBR_PATTERN = /\b(?:[A-Z]{2,5}|\d{1,4}[A-Z]|[A-Z]\d)\b/g
+
+/**
+ * 把缩写展开为逐字母中文谐音（数字保留原样，交给 Genie 的数字归一化转汉字）。
+ * @param abbr 匹配到的缩写串（如 "GPU"、"3D"）
+ * @returns 谐音汉字串；含未收录字符时返回原串（交给 Genie 按现状处理）
+ */
+function expandAbbrToZh(abbr: string): string {
+  let out = ''
+  for (const ch of abbr) {
+    if (LETTER_ZH[ch]) {
+      out += LETTER_ZH[ch]
+    } else if (/[0-9]/.test(ch)) {
+      out += ch
+    } else {
+      return abbr
+    }
+  }
+  return out
+}
+
 /**
  * 中文文本预处理：规避 Genie 中文 G2P（ChineseG2P）在 _merge_continuous_three_tones_2 中的越界崩溃。
  *
@@ -337,6 +398,11 @@ function sanitizeGenieText(text: string): string | null {
     return null
   }
   //
+  // 0.5) 英文缩写转中文谐音：Genie 中文 G2P 会删除所有英文字母（pattern_eng + pattern_filter），
+  //      AI/GPU 等缩写会被静默跳过；提前转成谐音汉字让 Genie 按普通话读出。
+  //      仅处理大写缩写与字母数字混排（3D/1080P），普通英文单词维持跳过（逐字母拼读反而怪异）。
+  t = t.replace(ABBR_PATTERN, (m) => expandAbbrToZh(m))
+  //
   // 崩溃机理：Genie 的 _merge_continuous_three_tones_2 对 jieba 分词的每个 token 做
   // lazy_pinyin FINALS_TONE3，再合并连续三声时访问 sub_finals_list[i-1][-1][-1]。
   // 若某 token 返回空韵母（无拼音）就会越界。触发源有两类：
@@ -354,23 +420,109 @@ function sanitizeGenieText(text: string): string | null {
   //    这些本会被 Genie pattern_filter 删除，但在那之前已在分词阶段导致 lazy_pinyin 返回空。
   //    注意：保留顿号 、（Genie 会映射为停顿逗号）。
   t = t.replace(/[（）()【】\[\]「」『』《》〈〉“”"''———~～￥%&*@#+=/\|^_`{}]/g, '')
-  // 3) 剔除空韵母语气字（无拼音，实测「嗯」「呣」触发三声合并越界）
-  t = t.replace(/[嗯呣]/g, '')
+  // 3) 空韵母语气字归一（「嗯」「呣」无拼音，实测触发三声合并越界）：
+  //    替换为近义可发声字「唔」（wú，韵母正常不触发崩溃），保住"闷闷的一声应答"的演出节拍，
+  //    而非静默删字（删字会让「……嗯。」这类纯语气块只剩标点、必然空音频）。
+  t = t.split('嗯').join('唔').split('呣').join('唔')
   // 4) 其余字符原样保留；Genie 会用 pattern_filter 清理剩余非常规符号
   return t
 }
+
+/** 判断安全化后的文本是否含可发声内容（去掉停顿标点与空白后仍有字符） */
+function hasSpeakableContent(text: string): boolean {
+  return text.replace(/[，。！？…、；：,.!?;:\s]/g, '').length > 0
+}
+
+/** 中文模式客户端合并分句的目标段长（字符）：段内文本越长，相对参考音频条件的占比越高，复读概率越低 */
+const MERGE_TARGET_LEN = 32
+/** 单段长度上限（字符）：单句超过此长度时独立成段，避免单段推理过长 */
+const MERGE_MAX_LEN = 48
+
 /**
- * 调用 Genie /tts 合成并把裸 PCM/RIFF 封装为 WAV。
- * @param splitSentence 是否让服务端按语种分句拼接。中文用 true 更稳定；
- *       日语建议 false（Genie 日语分句脆弱，易返回空音频，用 false）。
+ * 按停顿标点把安全化文本切句（标点保留在句尾），供合并分句使用。
  */
-async function genieFetchWav(base: string, name: string, text: string, splitSentence = true): Promise<ArrayBuffer | null> {
+function splitByPunctuation(text: string): string[] {
+  return text
+    .split(/(?<=[，。！？…、；：])/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}
+
+/**
+ * 把句子贪心合并为接近目标长度的段：
+ * 相邻句累加到 MERGE_TARGET_LEN 即封段；单句超过 MERGE_MAX_LEN 时独立成段；
+ * 合并后无可发声内容的段（如孤立的"……"）会被过滤，避免必然空音频的请求。
+ */
+function mergeSentences(sentences: string[]): string[] {
+  const segs: string[] = []
+  let cur = ''
+  for (const s of sentences) {
+    if (s.length > MERGE_MAX_LEN) {
+      if (cur) {
+        segs.push(cur)
+        cur = ''
+      }
+      segs.push(s)
+      continue
+    }
+    if (cur && cur.length + s.length > MERGE_MAX_LEN) {
+      segs.push(cur)
+      cur = s
+    } else {
+      cur += s
+      if (cur.length >= MERGE_TARGET_LEN) {
+        segs.push(cur)
+        cur = ''
+      }
+    }
+  }
+  if (cur) segs.push(cur)
+  return segs.filter((s) => hasSpeakableContent(s))
+}
+
+/** 估计纯停顿块的静音时长（秒）：基础一拍 + 每个省略号加一拍，封顶 1.5s */
+function estimatePauseSeconds(text: string): number {
+  const ellipses = (text.match(/…/g) ?? []).length
+  const pauses = (text.match(/[，。！？、；：]/g) ?? []).length
+  return Math.min(1.5, 0.3 + 0.25 * ellipses + 0.1 * pauses)
+}
+
+/** 生成指定时长的静音 WAV（32kHz 单声道 int16，与 Genie /tts 输出格式一致） */
+function buildSilenceWav(seconds: number): ArrayBuffer {
+  const sampleRate = 32000
+  const numSamples = Math.max(1, Math.round(seconds * sampleRate))
+  const pcm = Buffer.alloc(numSamples * 2) // int16 静音 = 全 0
+  const wav = Buffer.alloc(44 + pcm.byteLength)
+  wav.write('RIFF', 0)
+  wav.writeUInt32LE(36 + pcm.byteLength, 4)
+  wav.write('WAVE', 8)
+  wav.write('fmt ', 12)
+  wav.writeUInt32LE(16, 16)
+  wav.writeUInt16LE(1, 20)
+  wav.writeUInt16LE(1, 22)
+  wav.writeUInt32LE(sampleRate, 24)
+  wav.writeUInt32LE(sampleRate * 2, 28)
+  wav.writeUInt16LE(2, 32)
+  wav.writeUInt16LE(16, 34)
+  wav.write('data', 36)
+  wav.writeUInt32LE(pcm.byteLength, 40)
+  pcm.copy(wav, 44)
+  return wav.buffer.slice(wav.byteOffset, wav.byteOffset + wav.byteLength)
+}
+/**
+ * 请求 Genie /tts 合成一段文本，返回原始音频字节（裸 int16 PCM，也可能已是 RIFF/WAV）。
+ * split_sentence 固定 false：分段策略由客户端控制（见 mergeSentences）——
+ * 服务端 TextSplitter 会把文本切得过碎，每句都注入一次完整参考音频条件，
+ * "短文本泡在长条件里"会显著放大复诵参考音频（复读）的概率。
+ * @returns 原始音频字节；请求失败/空响应返回 null（调用方负责重试与报错）
+ */
+async function genieFetchRaw(base: string, name: string, text: string): Promise<Uint8Array | null> {
   // 【诊断】确认实际发送给 Genie 的合成文本（判断是否因 stripBrackets 剥太薄而诱发复诵参考音频文本）
   console.log('[genie] tts text=%j', String(text).slice(0,120))
   const resp = await net.fetch(`${base}/tts`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ character_name: name, text, split_sentence: splitSentence }),
+    body: JSON.stringify({ character_name: name, text, split_sentence: false }),
     // 长句在核显/排队时推理可能超过 2 分钟，放宽到 3 分钟（超时后上层会重载角色重试一次）
     signal: AbortSignal.timeout(180000),
   })
@@ -383,7 +535,49 @@ async function genieFetchWav(base: string, name: string, text: string, splitSent
     if (done) break
     if (value) chunks.push(value)
   }
-  return wrapToWav(chunks)
+  const total = chunks.reduce((n, c) => n + c.length, 0)
+  if (total === 0) return null
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const c of chunks) {
+    out.set(c, off)
+    off += c.length
+  }
+  return out
+}
+
+/**
+ * 把 /tts 返回的原始字节规范化为裸 int16 PCM：
+ * RIFF/WAV 则定位 data 块提取 PCM，否则按裸 PCM 原样返回（Genie 官方默认输出格式）。
+ * @returns PCM 字节；无有效数据返回 null
+ */
+function rawToPcm(raw: Uint8Array): Buffer | null {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+  if (buf.length === 0) return null
+  if (buf.subarray(0, 4).toString('ascii') === 'RIFF') {
+    // 诊断：Genie 官方输出固定 32kHz/16bit/单声道；参数异常时剥头按 32k/16bit 拼接可能出现变速/噪声。
+    // 注意 fmt 块偏移按标准布局读取（与 parseWavDuration 同款简化），仅用于诊断告警。
+    const channels = buf.readUInt16LE(22)
+    const sampleRate = buf.readUInt32LE(24)
+    const bits = buf.readUInt16LE(34)
+    if (bits !== 16 || channels !== 1 || sampleRate !== 32000) {
+      console.warn('[genie] /tts 返回 RIFF 参数非预期（ch=%d rate=%d bits=%d），拼接结果可能异常', channels, sampleRate, bits)
+    }
+    // 定位 data chunk
+    let off = 12
+    while (off + 8 <= buf.length) {
+      const id = buf.subarray(off, off + 4).toString('ascii')
+      const size = buf.readUInt32LE(off + 4)
+      if (id === 'data') {
+        const dataOff = off + 8
+        const len = Math.min(size, buf.length - dataOff)
+        return len > 0 ? buf.subarray(dataOff, dataOff + len) : null
+      }
+      off += 8 + size + (size % 2)
+    }
+    return null
+  }
+  return buf
 }
 
 /**
@@ -619,44 +813,72 @@ async function synthesizeGenieInner(params: {
     console.log('[genie] 日语模式：文本已含日文，跳过翻译')
   }
 
-  // 文本预处理（整组剔除（）心理/动作内容）规避 G2P 越界崩溃，再单次合成（保证参考音频只播一遍、不重复）
+  // 文本预处理（整组剔除（）心理/动作内容）规避 G2P 越界崩溃；随后按语言分段合成
   const safeText = sanitizeGenieText(synthText)
   if (!safeText) {
     // 整段都在括号里（纯心理/动作/场景，无可朗读台词）
     throw new Error('该段内容均为心理/动作描写（括号内），没有可朗读的台词')
   }
-  // 合成（失败自动重试一次）：服务端推理偶发失败（semantic_tokens None 崩溃 / 请求超时），
-  // 重载角色可复位服务端状态，重试能显著提升成功率；重试仍失败才向上报错。
-  let wav: ArrayBuffer | null = null
-  let lastErr: unknown = null
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (attempt > 1) {
-      // 重试前强制重载角色（复位服务端推理状态），稍等片刻给 worker 恢复时间
-      loadedCharacter = ''
-      try {
-        await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
-      } catch (err) {
+  // 纯停顿块短路（如「……」「！？」——语气字已归一为「唔」，一般不会再落到这里）：
+  // 无可发声内容时调用 /tts 必然返回空音频，且重载角色重试也无法改变结果。
+  // 直接返回一段短静音保留"停顿"演出节拍，不发起请求、不重载、不打错误。
+  if (!hasSpeakableContent(safeText)) {
+    const seconds = estimatePauseSeconds(safeText)
+    console.log('[genie] 无可发声内容（纯停顿块），返回 %.2fs 静音节拍：%s', seconds, safeText)
+    return buildSilenceWav(seconds)
+  }
+  // 分段策略：中文模式由客户端按标点切句并贪心合并为目标段长（30-48 字），逐段合成后拼接——
+  // 服务端 split_sentence=true 同样是逐句独立推理，但句子切得太碎：每句都注入一次完整参考音频
+  // 条件，"短文本泡在长条件里"的比例失衡会显著放大模型复诵参考音频（复读）的概率；
+  // 合并后注入次数与文本占比同时改善。日文模式维持整段一次合成（split=false）不变。
+  const segments = lang !== 'ja' ? mergeSentences(splitByPunctuation(safeText)) : [safeText]
+  if (segments.length === 0) {
+    // 理论上不可达（整体无可发声内容已被上游短路拦截），防御性回退整段合成
+    segments.push(safeText)
+  }
+
+  // 逐段合成（每段失败自动重试一次：重载角色可复位服务端推理状态），全部成功后拼接 PCM。
+  // 任一段重试后仍失败 → 放弃整段并向上报错（上层兜底：文本顶上跟读气泡），避免缺段语音。
+  const pcms: Buffer[] = []
+  for (const seg of segments) {
+    let pcm: Buffer | null = null
+    let segErr: unknown = null
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (attempt > 1) {
+        // 重试前强制重载角色（复位服务端推理状态），稍等片刻给 worker 恢复时间
         loadedCharacter = ''
-        throw err
+        try {
+          await ensureCharacterLoaded({ characterName: name, onnxModelDir, refAudioPath: effRefPath || undefined, refAudioText: effRefText || undefined }, base, lang)
+        } catch (err) {
+          loadedCharacter = ''
+          throw err
+        }
+      }
+      try {
+        const raw = await genieFetchRaw(base, name, seg)
+        pcm = raw ? rawToPcm(raw) : null
+      } catch (err) {
+        segErr = err
+        pcm = null
+        console.warn('[genie] 合成请求异常（第 %d 次）：%s', attempt, err instanceof Error ? err.message : String(err))
+      }
+      if (pcm) break
+      loadedCharacter = '' // 服务端推理状态可能已被污染，强制下次重载角色
+      if (attempt === 1) {
+        console.warn('[genie] 段合成%s，重载角色后自动重试一次', segErr ? '请求异常' : '为空音频')
+        await new Promise((r) => setTimeout(r, 800))
       }
     }
-    try {
-      wav = await genieFetchWav(base, name, safeText, lang !== 'ja')
-    } catch (err) {
-      lastErr = err
-      wav = null
-      console.warn('[genie] 合成请求异常（第 %d 次）：%s', attempt, err instanceof Error ? err.message : String(err))
+    if (!pcm) {
+      if (segErr) throw segErr instanceof Error ? segErr : new Error(String(segErr))
+      throw new Error(`GenieTTS 生成为空音频（段：${seg.slice(0, 30)}${seg.length > 30 ? '…' : ''}）`)
     }
-    if (wav) break
-    loadedCharacter = '' // 服务端推理状态可能已被污染，强制下次重载角色
-    if (attempt === 1) {
-      console.warn('[genie] 合成%s，重载角色后自动重试一次', lastErr ? '请求异常' : '为空音频')
-      await new Promise((r) => setTimeout(r, 800))
-    }
+    pcms.push(pcm)
   }
+  // 拼接各段 PCM（32kHz 单声道 int16）封装为 WAV；段尾标点的停顿由 Genie 生成，无需额外静音
+  const wav = wrapToWav(pcms)
   if (!wav) {
-    if (lastErr) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
-    throw new Error(`GenieTTS 生成为空音频（文本经安全化后仍无法合成，可疑片段：${safeText.slice(0, 30)}` + (safeText.length > 30 ? '…' : '') + '）')
+    throw new Error('GenieTTS 拼接分段音频失败（无有效 PCM 数据）')
   }
   return wav
 }

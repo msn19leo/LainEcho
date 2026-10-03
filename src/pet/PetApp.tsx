@@ -24,7 +24,7 @@ import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStor
 import { useCharacterStore } from '../store/characterStore'
 import { initSettingsSync } from '../store/settingsStore'
 import { usePetReadingStore } from './petReadingStore'
-import { DEFAULT_EMOTION, type ContextStats, type StandardEmotion } from '../types'
+import { BUILTIN_DEFAULT_EMOTION, type ContextStats } from '../types'
 import { stripBrackets } from '../lib/utils'
 
 /** 桌宠窗口宽度固定（与主进程 PET_WIDTH 保持一致）。
@@ -211,9 +211,9 @@ export default function PetApp() {
   // 旧串行架构间隔 = 合成时间 + 播放时间；新架构间隔 ≈ max(合成时间, 播放时间)。
 
   /** 待合成的文本队列（入队顺序 = 播放顺序；index 为合成分段索引，null 表示单段整条） */
-  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: StandardEmotion; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null }>>([])
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: string; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null }>>([])
   /** 已合成待播放的音频队列（附带块文本与情绪：跟读时用块文本逐字显示、切立绘用情绪） */
-  const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer; index: number | null; emotion: StandardEmotion; text: string }>>([])
+  const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer; index: number | null; emotion: string; text: string }>>([])
   /** 合成锁：同时只合成一段，避免 MiMo API 并发请求 */
   const isSynthesizingRef = useRef(false)
   /** 播放锁：同时只播放一段音频，避免叠加 */
@@ -231,6 +231,24 @@ export default function PetApp() {
     textQueueRef.current = []
     audioQueueRef.current = []
     usePetReadingStore.getState().setPlaying(false)
+  }
+
+  /**
+   * 朗读收尾检查：仅当「本轮生成已结束（streaming=false）且合成/播放队列全部排空」时
+   * 才结束朗读流程（setActive(false)+clearText()，跟读气泡让位给定型消息）。
+   * 边生成边读下，块与块之间存在排水间隙（LLM 仍在生成下一段 / 下一段合成中）：
+   * 若在间隙里清场，跟读气泡会被清空、已朗读段落丢失、隐藏门释放后再重新隐藏——
+   * 表现为气泡闪空、两窗显示不同步、整段读完才见到全文（2026-09-29 线上案例）。
+   */
+  const maybeFinalizeReading = () => {
+    if (textQueueRef.current.length > 0 || audioQueueRef.current.length > 0) return
+    if (isSynthesizingRef.current || isPlayingRef.current) return
+    if (useSessionStore.getState().streaming) return
+    const st = usePetReadingStore.getState()
+    if (!st.active && !st.playing && !st.displayedText) return
+    st.setPlaying(false)
+    st.setActive(false)
+    st.clearText()
   }
 
   /**
@@ -270,15 +288,12 @@ export default function PetApp() {
       if (next.index !== null) stageRef.current?.setEmotion(next.emotion)
     } finally {
       isSynthesizingRef.current = false
-      // 继续合成下一段（预合成），不等播放
+      // 继续合成下一段（预合成），不等播放；队列暂空时仅做收尾检查——
+      // 生成未结束（还有后续语音块）时保持跟读状态与已读文本，不再在块间清场（见 maybeFinalizeReading）
       if (textQueueRef.current.length > 0) {
         void synthesizeLoop()
-      } else if (audioQueueRef.current.length === 0 && !isPlayingRef.current) {
-        // 无待合成、无待播音频（可能前序全部合成失败）：立即收尾朗读状态，让定型消息正常上屏。
-        // 清空 displayedText 同 playLoop 收尾，避开 zustand subscribe 回调内重入
-        usePetReadingStore.getState().setPlaying(false)
-        usePetReadingStore.getState().setActive(false)
-        usePetReadingStore.getState().clearText()
+      } else {
+        maybeFinalizeReading()
       }
     }
   }
@@ -308,19 +323,23 @@ export default function PetApp() {
       console.error('[pet] TTS 播放失败', err)
     } finally {
       isPlayingRef.current = false
-      // 继续播放下一段（如果队列中还有）
+      // 继续播放下一段（如果队列中还有）；队列暂空时仅做收尾检查——
+      // 生成未结束（后续语音块在路上）时保持跟读状态与已读文本，块间清场会导致
+      // 跟读气泡清空/两窗不同步（见 maybeFinalizeReading 注释）
       if (audioQueueRef.current.length > 0) {
         void playLoop()
-      } else if (!isSynthesizingRef.current && textQueueRef.current.length === 0) {
-        // 全部段落播完：结束朗读流程与播放状态（气泡让位给定型消息）。
-        // 注意：清空 displayedText 必须在订阅回调之外执行（zustand setState 在 subscribe 回调内
-        // 重入会无限循环），故在 setActive(false) 之后、同一调用栈内完成收尾
-        usePetReadingStore.getState().setPlaying(false)
-        usePetReadingStore.getState().setActive(false)
-        usePetReadingStore.getState().clearText()
+      } else {
+        maybeFinalizeReading()
       }
     }
   }
+
+  // 生成结束（stream-done → streaming 翻假）时补一次朗读收尾检查：
+  // 最后一段语音常在流式结束后仍在合成/播放，播放循环里的收尾检查会因 streaming=true 跳过，
+  // 若没有这里补触发，跟读气泡与隐藏门会一直挂着，定型消息无法上屏。
+  useEffect(() => useSessionStore.subscribe((s, prev) => {
+    if (prev.streaming && !s.streaming) maybeFinalizeReading()
+  }), [])
 
   // 订阅"说话"事件：聊天窗口流式完成后触发，按主进程拆好的合成分段（dialogue 逐项）段级合成播放
   useEffect(() => {
@@ -337,9 +356,9 @@ export default function PetApp() {
         // 开头旁白前置流（ai:stream-narration）先于首个 speak 到达，此处清空会丢已上屏的旁白
         usePetReadingStore.getState().setActive(true)
       }
-      const list = chunks && chunks.length > 0 ? chunks : [{ text: text.trim(), emotion: DEFAULT_EMOTION }]
+      const list = chunks && chunks.length > 0 ? chunks : [{ text: text.trim(), emotion: BUILTIN_DEFAULT_EMOTION }]
       const items = list
-        .map((c) => ({ text: (c.text ?? '').trim(), emotion: c.emotion ?? DEFAULT_EMOTION }))
+        .map((c) => ({ text: (c.text ?? '').trim(), emotion: c.emotion ?? BUILTIN_DEFAULT_EMOTION }))
         .filter((c) => c.text.length > 0)
         .map((c, i) => ({
           text: c.text,

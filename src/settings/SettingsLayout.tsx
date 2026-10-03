@@ -191,7 +191,7 @@ function NavButton({
 
 function HomeView({ onSelect }: { onSelect: (id: ModuleId) => void }) {
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="mx-auto max-w-5xl p-6">
       <h1 className="text-[28px] font-bold tracking-tight text-text">设置</h1>
       <p className="mt-1 text-[13px] text-text-2">管理角色、模型、API 与数据</p>
 
@@ -244,7 +244,7 @@ function SettingsCard({
 function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
   const mod = MODULES.find((m) => m.id === id)
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="mx-auto max-w-5xl p-6">
       <div className="mb-6 flex items-center gap-3">
         <button
           onClick={onBack}

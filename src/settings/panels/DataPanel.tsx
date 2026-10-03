@@ -6,7 +6,8 @@ import { FolderOpen, MessageSquare, Pencil, RotateCcw, Search } from 'lucide-rea
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
 import type { SessionIndexItem } from '../../types'
-import { Button, Card, ConfirmModal, Empty, Input, Loading, Modal, Select } from '../../components/ui'
+import { Button, Card, ConfirmModal, Empty, Input, Loading, Modal } from '../../components/ui'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import { formatRelativeTime, formatTimeFull, truncate } from '../../lib/utils'
 
@@ -165,14 +166,15 @@ export function DataPanel() {
             className="pl-8"
           />
         </div>
-        <Select value={filterCard} onChange={(e) => setFilterCard(e.target.value)}>
-          <option value="">全部角色卡</option>
-          {cards.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </Select>
+        <SelectMenu
+          value={filterCard}
+          onChange={setFilterCard}
+          options={[
+            { value: '', label: '全部角色卡' },
+            ...cards.map((c) => ({ value: c.id, label: c.name })),
+          ]}
+          className="min-w-0"
+        />
       </div>
 
       <div className="text-xs text-text-muted">
@@ -188,9 +190,18 @@ export function DataPanel() {
         <div className="space-y-2">
           {filtered.map((s) => (
             <Card key={s.id} className="flex items-center gap-3 py-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
-                <MessageSquare size={15} strokeWidth={1.75} color="var(--primary-400)" />
-              </div>
+              <button
+                type="button"
+                title="打开会话"
+                onClick={() => void api.app.openChatWithSession(s.id)}
+                className="group flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-elevated)] transition-colors hover:border-accent/40 hover:bg-accent/25"
+              >
+                <MessageSquare
+                  size={15}
+                  strokeWidth={1.75}
+                  className="text-[var(--primary-400)] transition-colors group-hover:text-accent"
+                />
+              </button>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text">{truncate(s.title, 24)}</div>
                 <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-muted">

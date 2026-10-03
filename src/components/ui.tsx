@@ -1,5 +1,5 @@
 /**
- * 通用 UI 原语：Button / Input / Textarea / Select / Switch / Card / Modal
+ * 通用 UI 原语：Button / Input / Textarea / Switch / Card / Modal（下拉见 DropdownMenu.tsx 的 SelectMenu）
  * 统一 Cyber-Kawaii 风格：毛玻璃 + 品牌渐变 + 主色/粉色光晕。
  * 颜色全部走 Design Tokens（src/index.css），跟随 data-theme 切换。
  * 圆角严格对齐规范：输入框 12px、按钮 16px、卡片 24px。
@@ -9,7 +9,6 @@ import {
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type TextareaHTMLAttributes,
-  type SelectHTMLAttributes,
   useEffect,
   useState,
 } from 'react'
@@ -69,14 +68,6 @@ export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputEleme
 
 export function Textarea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return <textarea className={cn(inputClass, 'resize-y leading-relaxed', className)} {...rest} />
-}
-
-export function Select({ className, children, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <select className={cn(inputClass, 'cursor-pointer appearance-none', className)} {...rest}>
-      {children}
-    </select>
-  )
 }
 
 // ---------------- Switch ----------------

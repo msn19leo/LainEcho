@@ -1,7 +1,9 @@
 /**
- * 记忆体面板：按角色隔离 + 分主题（用户信息/长期经历/约定承诺）+ 待确认候选审核。
+ * 记忆体面板：按角色隔离 + 分主题（用户信息/长期经历/约定承诺）+ 待确认候选审核 + 用户画像。
  * - 已确认记忆：注入 system prompt（当前角色 + 全局背景），可新增/编辑/删除
- * - 待确认候选：会话自动沉淀产物，保留后入已确认（注入生效），删除则丢弃
+ * - 待确认候选：自动沉淀产物（会话沉淀 + 剧情沉淀，剧情候选带「剧情」标记），
+ *   保留前可行内编辑（剧情章节摘要通常需要用户顺稿），保留后入已确认（注入生效），删除则丢弃
+ * - 用户画像：「用户信息」类记忆的压缩稿，按角色整理与注入（全局查看态 = 所有角色画像总览，只读）
  * - 新增区的分类/归属下拉同时充当列表筛选（选择后即时过滤已确认记忆）
  *
  * 手动添加的轻量引导：
@@ -11,12 +13,13 @@
  *   注意「对方」「你」是合法人称（自动沉淀记忆即用这套），不在警告范围内。
  */
 import { useEffect, useState } from 'react'
-import { BrainCircuit, Check, Clock, RefreshCw, Search, Sparkles, Trash2 } from 'lucide-react'
+import { BrainCircuit, Check, Clock, RefreshCw, Search, Trash2 } from 'lucide-react'
 import { api } from '../../api'
 import { useMemoryStore } from '../../store/memoryStore'
 import { useCharacterStore } from '../../store/characterStore'
 import { useSettingsStore } from '../../store/settingsStore'
-import { Button, Card, Empty, Input, Loading, Select, Switch, Textarea } from '../../components/ui'
+import { Button, Card, Empty, Input, Loading, Switch, Textarea } from '../../components/ui'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import type { MemoryCategory, MemoryItem, MemoryProfile } from '../../types'
 
@@ -83,10 +86,13 @@ export function MemoryPanel() {
   const loadSettings = useSettingsStore((s) => s.load)
   const saveSettings = useSettingsStore((s) => s.save)
 
-  const [tab, setTab] = useState<'confirmed' | 'pending' | 'profile' | 'chronicle'>('confirmed')
+  const [tab, setTab] = useState<'confirmed' | 'pending' | 'profile'>('confirmed')
   // 分类/归属下拉：'all' = 不筛选（新增时回退默认 long_term / 全局）
   const [filterCat, setFilterCat] = useState<MemoryCategory | 'all'>('all')
   const [filterOwner, setFilterOwner] = useState<string>('all') // 'all' | 'global' | cardId
+  /** 档案归属（画像 tab 专用选择器）：'global' = 全局总览（只读），其余 = 角色卡 id。
+   *  与「已确认记忆」tab 的归属筛选下拉（filterOwner）完全独立——那边只管记忆列表过滤 */
+  const [profileOwner, setProfileOwner] = useState<string>('global')
   const [newContent, setNewContent] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editContent, setEditContent] = useState('')
@@ -98,17 +104,16 @@ export function MemoryPanel() {
   /** 搜索结果（null = 未在搜索态）；每项附带语义相似度分（本地过滤回退时无分） */
   const [searchResults, setSearchResults] = useState<Array<MemoryItem & { score?: number }> | null>(null)
   const [searching, setSearching] = useState(false)
-  /** 当前归属的画像/编年史档案（归属下拉决定：all/global = 全局） */
+  /** 画像 tab 当前归属的档案（档案归属选择器决定：global = 全局） */
   const [profile, setProfile] = useState<MemoryProfile | null>(null)
+  /** 画像总览（全局查看态）：所有角色的生效画像（key = 角色卡 id 或 '_global'） */
+  const [profileOverview, setProfileOverview] = useState<Array<{ key: string; personaDigest: string; personaUpdatedAt: number; personaEnabled?: boolean }>>([])
   const [consolidating, setConsolidating] = useState(false)
   const [reembedding, setReembedding] = useState(false)
   const [showFullDigest, setShowFullDigest] = useState(false)
   /** 画像编辑态：true 时生效画像卡片变为 Textarea 编辑框 */
   const [editingProfile, setEditingProfile] = useState(false)
   const [profileDraft, setProfileDraft] = useState('')
-  /** 编年史条目编辑态：正在编辑的条目 id + 草稿文本 */
-  const [editingChronicleId, setEditingChronicleId] = useState<string | null>(null)
-  const [chronicleDraft, setChronicleDraft] = useState('')
   /** 嵌入服务独立 Key：是否已配置（仅掩码回显）+ 输入框草稿 */
   const [hasEmbeddingKey, setHasEmbeddingKey] = useState(false)
   const [embeddingKeyInput, setEmbeddingKeyInput] = useState('')
@@ -122,22 +127,50 @@ export function MemoryPanel() {
     void api.settings.hasEmbeddingApiKey().then(setHasEmbeddingKey).catch(() => setHasEmbeddingKey(false))
   }, [load, loadPending, loadCards, settingsLoaded, loadSettings])
 
-  /** 画像归属键：与记忆归属下拉联动（all/global → 全局档案，其余 → 对应角色档案） */
-  const profileCardId = filterOwner === 'all' || filterOwner === 'global' ? '' : filterOwner
+  /** 画像 tab 归属键（global → '' = 全局档案）与显示名 */
+  const profileCardId = profileOwner === 'global' ? '' : profileOwner
+  const profileOwnerName = profileOwner === 'global' ? '全局' : (cards.find((c) => c.id === profileOwner)?.name ?? '未知角色')
+  /** 档案归属选择栏（画像 tab）：档案按角色各存一份；全局 = 所有角色画像总览（只读） */
+  const profileSelector = (
+    <div className="flex items-center gap-2">
+      <span className="shrink-0 text-xs text-text-muted">档案归属</span>
+      <SelectMenu
+        value={profileOwner}
+        onChange={(v) => {
+          setProfileOwner(v)
+          setEditingProfile(false)
+          setShowFullDigest(false)
+        }}
+        options={[{ value: 'global', label: '全局' }, ...cards.map((c) => ({ value: c.id, label: c.name }))]}
+        className="min-w-0 flex-1"
+      />
+    </div>
+  )
 
-  // 自动沉淀等外部变更 → 刷新列表与画像状态（如另一窗口触发了自动整理）
+  // 自动沉淀等外部变更 → 刷新列表与画像档案（如另一窗口触发了自动整理）
   useEffect(() => api.memory.onChanged(() => {
     void load()
     void loadPending()
     void api.memory.getProfile(profileCardId).then(setProfile).catch(() => setProfile(null))
+    void api.memory.getProfileOverview().then(setProfileOverview).catch(() => setProfileOverview([]))
   }), [load, loadPending, profileCardId])
 
+  // 画像 tab 归属变更 → 加载对应档案
   useEffect(() => {
     void api.memory.getProfile(profileCardId).then(setProfile).catch(() => setProfile(null))
-    // 切归属后清掉搜索态，避免跨角色残留
+  }, [profileCardId])
+
+  // 画像 tab 全局查看态 → 加载所有角色的生效画像总览（只读；整理/编辑请切到对应角色）
+  useEffect(() => {
+    if (profileOwner !== 'global') return
+    void api.memory.getProfileOverview().then(setProfileOverview).catch(() => setProfileOverview([]))
+  }, [profileOwner, cards])
+
+  // 切记忆归属筛选后清掉搜索态，避免跨角色残留
+  useEffect(() => {
     setSearchResults(null)
     setSearchQuery('')
-  }, [profileCardId])
+  }, [filterOwner])
 
   /** 语义搜索：向量命中按相似度排序展示；嵌入不可用/无命中时回退本地包含过滤 */
   const handleSearch = async () => {
@@ -162,7 +195,7 @@ export function MemoryPanel() {
     }
   }
 
-  /** 触发画像/编年史整理（画像落为草稿待采纳，编年史直接生效） */
+  /** 触发画像整理：聚合「用户信息」类记忆为画像草稿（采纳后才常驻注入） */
   const handleConsolidate = async () => {
     setConsolidating(true)
     try {
@@ -171,8 +204,6 @@ export function MemoryPanel() {
         toast(r.error ?? '整理失败', 'error')
       } else if (r.draft) {
         toast('画像草稿已生成，请确认后采纳')
-      } else if (r.chronicleAdded > 0) {
-        toast(`编年史已更新（新增 ${r.chronicleAdded} 条）`)
       } else {
         toast('没有需要整理的新记忆')
       }
@@ -210,32 +241,6 @@ export function MemoryPanel() {
     await api.memory.deleteProfileDigest(profileCardId)
     toast('画像已删除（来源记忆已恢复为未吸收）')
     setEditingProfile(false)
-    setProfile(await api.memory.getProfile(profileCardId))
-  }
-
-  /** 进入编年史条目编辑态 */
-  const startEditChronicle = (entryId: string, text: string) => {
-    setEditingChronicleId(entryId)
-    setChronicleDraft(text)
-  }
-
-  /** 保存编年史条目编辑 */
-  const handleSaveChronicle = async () => {
-    if (!editingChronicleId) return
-    try {
-      await api.memory.updateChronicleEntry(profileCardId, editingChronicleId, chronicleDraft)
-      toast('编年史已更新')
-      setEditingChronicleId(null)
-      setProfile(await api.memory.getProfile(profileCardId))
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '更新失败', 'error')
-    }
-  }
-
-  /** 删除单条编年史条目（原始记忆保持不变，仅移除摘要） */
-  const handleDeleteChronicle = async (entryId: string) => {
-    await api.memory.deleteChronicleEntry(profileCardId, entryId)
-    toast('编年史条目已删除')
     setProfile(await api.memory.getProfile(profileCardId))
   }
 
@@ -345,6 +350,27 @@ export function MemoryPanel() {
     else toast('删除失败', 'error')
   }
 
+  /** 切换单条记忆的注入开关（关 = 暂停注入，记忆保留不删除） */
+  const handleToggleMemory = async (item: MemoryItem) => {
+    const next = item.enabled === false
+    const ok = await update(item.id, { enabled: next })
+    if (ok) toast(next ? '已恢复注入' : '已暂停注入（记忆保留）')
+    else toast('切换失败', 'error')
+  }
+
+  /** 切换画像注入开关（key = 角色卡 id 或 '_global'；关 = 暂停常驻注入，画像保留） */
+  const handleToggleProfile = async (key: string, current: boolean) => {
+    const next = !current
+    try {
+      await api.memory.setProfileEnabled(key === '_global' ? '' : key, next)
+      toast(next ? '画像已恢复注入' : '画像已暂停注入（画像保留）')
+      setProfile(await api.memory.getProfile(profileCardId))
+      void api.memory.getProfileOverview().then(setProfileOverview).catch(() => setProfileOverview([]))
+    } catch {
+      toast('切换失败', 'error')
+    }
+  }
+
   const pendingCount = pendingItems.length
   const tabBtn = (active: boolean) =>
     `inline-flex items-center gap-1 rounded-[var(--radius-md)] border px-3 py-1.5 text-xs font-medium transition-colors ${
@@ -441,7 +467,7 @@ export function MemoryPanel() {
         </div>
       </div>
 
-      {/* Tab：已确认 / 待确认 / 用户画像 / 编年史 */}
+      {/* Tab：已确认 / 待确认 / 用户画像 */}
       <div className="flex flex-wrap gap-2">
         <button type="button" className={tabBtn(tab === 'confirmed')} onClick={() => setTab('confirmed')}>
           已确认记忆
@@ -456,12 +482,6 @@ export function MemoryPanel() {
           用户画像
           {profile?.pendingDigest?.trim() && (
             <span className="h-2 w-2 rounded-full bg-[var(--warning)]" title="有待采纳的画像草稿" />
-          )}
-        </button>
-        <button type="button" className={tabBtn(tab === 'chronicle')} onClick={() => setTab('chronicle')}>
-          编年史
-          {profile && profile.chronicle.length > 0 && (
-            <span className="rounded-full bg-[var(--accent-500)] px-1.5 text-[10px] font-semibold text-white">{profile.chronicle.length}</span>
           )}
         </button>
       </div>
@@ -512,19 +532,25 @@ export function MemoryPanel() {
               </p>
             )}
             <div className="flex items-center gap-2">
-              <Select value={filterCat} onChange={(e) => setFilterCat(e.target.value as MemoryCategory | 'all')} className="flex-1">
-                <option value="all">全部分类</option>
-                {CATEGORY_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}（{o.hint}）</option>
-                ))}
-              </Select>
-              <Select value={filterOwner} onChange={(e) => setFilterOwner(e.target.value)} className="flex-1">
-                <option value="all">全部记忆</option>
-                <option value="global">全局背景</option>
-                {cards.map((c) => (
-                  <option key={c.id} value={c.id}>{c.name}</option>
-                ))}
-              </Select>
+              <SelectMenu
+                value={filterCat}
+                onChange={(v) => setFilterCat(v as MemoryCategory | 'all')}
+                options={[
+                  { value: 'all', label: '全部分类' },
+                  ...CATEGORY_OPTIONS.map((o) => ({ value: o.value, label: `${o.label}（${o.hint}）` })),
+                ]}
+                className="flex-1"
+              />
+              <SelectMenu
+                value={filterOwner}
+                onChange={setFilterOwner}
+                options={[
+                  { value: 'all', label: '全部记忆' },
+                  { value: 'global', label: '全局背景' },
+                  ...cards.map((c) => ({ value: c.id, label: c.name })),
+                ]}
+                className="flex-1"
+              />
               <Button onClick={() => void handleAdd()} disabled={!newContent.trim()}>
                 添加
               </Button>
@@ -552,6 +578,7 @@ export function MemoryPanel() {
                   <div className="min-w-0 flex-1">
                     <div className="mb-1 flex items-center gap-1.5">
                       <span className={metaTag}>{categoryLabel(item.category)}</span>
+                      {item.enabled === false && <span className={metaTag}>已停用</span>}
                       <span className="text-[11px] text-text-muted">· {ownerLabel(cards, item.characterCardId)}</span>
                       {typeof item.score === 'number' && (
                         <span className="text-[11px] text-text-muted">· 相似度 {(item.score * 100).toFixed(0)}%</span>
@@ -572,15 +599,12 @@ export function MemoryPanel() {
                         />
                         {/* 分类下拉 + 保存/取消：全部约束在卡片内，不溢出 */}
                         <div className="flex items-center gap-2">
-                          <Select
+                          <SelectMenu
                             value={editCategory}
-                            onChange={(e) => setEditCategory(e.target.value as MemoryCategory)}
+                            onChange={(v) => setEditCategory(v as MemoryCategory)}
+                            options={CATEGORY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
                             className="min-w-0 flex-1"
-                          >
-                            {CATEGORY_OPTIONS.map((o) => (
-                              <option key={o.value} value={o.value}>{o.label}</option>
-                            ))}
-                          </Select>
+                          />
                           <div className="flex shrink-0 gap-1">
                             <Button size="sm" onClick={() => void handleEdit()}>保存</Button>
                             <Button variant="ghost" size="sm" onClick={() => setEditingId(null)}>取消</Button>
@@ -588,11 +612,17 @@ export function MemoryPanel() {
                         </div>
                       </div>
                     ) : (
-                      <div className="text-sm text-text selectable">{item.content}</div>
+                      /* 已停用的记忆弱化展示（内容保留，只是不注入） */
+                      <div className={`text-sm text-text selectable ${item.enabled === false ? 'opacity-50' : ''}`}>{item.content}</div>
                     )}
                   </div>
                   {editingId !== item.id && (
-                    <div className="flex shrink-0 gap-1">
+                    <div className="flex shrink-0 items-center gap-1">
+                      {/* 注入开关：关 = 暂停注入（记忆保留不删除） */}
+                      <Switch
+                        checked={item.enabled !== false}
+                        onChange={() => void handleToggleMemory(item)}
+                      />
                       <Button
                         variant="outline"
                         size="sm"
@@ -617,7 +647,8 @@ export function MemoryPanel() {
       ) : tab === 'pending' ? (
         <>
           <p className="text-xs leading-relaxed text-text-muted">
-            会话自动沉淀的记忆候选：保留后会注入对话，不需要的删除即可。关闭上方「自动沉淀记忆」后不再产生新候选。
+            自动沉淀的记忆候选：会话结束后从对话中提取，剧情完结后从演出经历中提取（带「剧情」标记）。
+            建议先「编辑」顺一遍稿再「保留」，保留后会注入对话，不需要的删除即可。
           </p>
           {pendingLoading ? (
             <Loading />
@@ -636,18 +667,57 @@ export function MemoryPanel() {
                   <div className="min-w-0 flex-1">
                     <div className="mb-1 flex items-center gap-1.5">
                       <span className={metaTag}>{categoryLabel(item.category)}</span>
+                      {item.origin === 'story' && <span className={metaTag}>剧情</span>}
                       <span className="text-[11px] text-text-muted">· {ownerLabel(cards, item.characterCardId)}</span>
                     </div>
-                    <div className="text-sm text-text selectable">{item.content}</div>
+                    {/* 行内编辑（与已确认页同用 editingId 态；剧情摘要较长用 Textarea） */}
+                    {editingId === item.id ? (
+                      <div className="mt-2 space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">
+                        <Textarea
+                          value={editContent}
+                          onChange={(e) => setEditContent(e.target.value)}
+                          autoFocus
+                          rows={4}
+                          placeholder="编辑记忆内容…"
+                        />
+                        <div className="flex items-center gap-2">
+                          <SelectMenu
+                            value={editCategory}
+                            onChange={(v) => setEditCategory(v as MemoryCategory)}
+                            options={CATEGORY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+                            className="min-w-0 flex-1"
+                          />
+                          <div className="flex shrink-0 gap-1">
+                            <Button size="sm" onClick={() => void handleEdit()}>保存</Button>
+                            <Button variant="ghost" size="sm" onClick={() => setEditingId(null)}>取消</Button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-text selectable">{item.content}</div>
+                    )}
                   </div>
-                  <div className="flex shrink-0 gap-1">
-                    <Button size="sm" onClick={() => void handleConfirm(item.id)}>
-                      <Check size={13} strokeWidth={2.25} /> 保留
-                    </Button>
-                    <Button variant="danger" size="sm" onClick={() => void handleRemove(item.id)}>
-                      <Trash2 size={13} strokeWidth={2.25} /> 删除
-                    </Button>
-                  </div>
+                  {editingId !== item.id && (
+                    <div className="flex shrink-0 gap-1">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setEditingId(item.id)
+                          setEditContent(item.content)
+                          setEditCategory(item.category)
+                        }}
+                      >
+                        编辑
+                      </Button>
+                      <Button size="sm" onClick={() => void handleConfirm(item.id)}>
+                        <Check size={13} strokeWidth={2.25} /> 保留
+                      </Button>
+                      <Button variant="danger" size="sm" onClick={() => void handleRemove(item.id)}>
+                        <Trash2 size={13} strokeWidth={2.25} /> 删除
+                      </Button>
+                    </div>
+                  )}
                 </Card>
               ))}
             </div>
@@ -655,140 +725,127 @@ export function MemoryPanel() {
         </>
       ) : tab === 'profile' ? (
         <>
-          {/* 用户画像：把「用户信息」类记忆压缩为一段常驻注入的画像稿（整理 → 采纳 → 生效） */}
+          {/* 用户画像：把「用户信息」类记忆压缩为一段常驻注入的画像稿（整理 → 采纳 → 生效）。
+              画像按角色隔离整理与注入（只注入当前对话角色的画像）；全局档案仅查看，不可整理 */}
+          {profileSelector}
           <div className="flex items-center justify-between">
             <p className="text-xs leading-relaxed text-text-muted">
-              画像由「用户信息」类记忆整理压缩而来，采纳后每一轮对话都会常驻注入（整理后需在此采纳）。
+              {profileOwner === 'global'
+                ? '画像按角色隔离整理与注入（每个角色看到的是 ta 眼中的你）：请选择具体角色卡进行整理；全局可查看所有角色的画像总览。'
+                : '画像由「用户信息」类记忆整理压缩而来，采纳后与该角色对话时每轮常驻注入（整理后需在此采纳）。'}
             </p>
-            <Button variant="outline" size="sm" onClick={() => void handleConsolidate()} disabled={consolidating}>
-              {consolidating ? '整理中…' : '整理画像'}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleConsolidate()}
+              disabled={consolidating || profileOwner === 'global'}
+              title={profileOwner === 'global' ? '画像按角色整理，请先选择具体角色卡' : undefined}
+            >
+              {consolidating ? '整理中…' : profileOwner === 'global' ? '整理用户画像' : `整理${profileOwnerName}的用户画像`}
             </Button>
           </div>
-          {profile?.pendingDigest?.trim() && (
-            <div className="space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface p-3">
-              <p className="text-xs font-medium text-text">待采纳的画像草稿（采纳后常驻注入）：</p>
-              <p className="text-xs leading-relaxed text-text-2 selectable">{profile.pendingDigest}</p>
-              <div className="flex gap-2">
-                <Button size="sm" onClick={() => void handleAdopt(true)}>
-                  <Check size={13} strokeWidth={2.25} /> 采纳
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => void handleAdopt(false)}>放弃</Button>
-              </div>
-            </div>
-          )}
-          {profile?.personaDigest?.trim() && !editingProfile && (
-            <Card className="py-3">
-              <div className="mb-1 flex items-center gap-1.5">
-                <span className={metaTag}>当前生效画像</span>
-                <span className="text-[11px] text-text-muted">
-                  · 更新于 {new Date(profile.personaUpdatedAt).toLocaleString('zh-CN')}
-                </span>
-              </div>
-              <p
-                className="cursor-pointer text-sm leading-relaxed text-text selectable"
-                onClick={() => setShowFullDigest((v) => !v)}
-              >
-                {showFullDigest || profile.personaDigest.length <= 120
-                  ? profile.personaDigest
-                  : `${profile.personaDigest.slice(0, 120)}…（点击展开/收起）`}
-              </p>
-              <div className="mt-2 flex shrink-0 gap-1">
-                <Button variant="outline" size="sm" onClick={startEditProfile}>
-                  编辑
-                </Button>
-                <Button variant="danger" size="sm" onClick={() => void handleDeleteProfile()}>
-                  删除
-                </Button>
-              </div>
-            </Card>
-          )}
-          {editingProfile && (
-            <div className="space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">
-              <Textarea
-                value={profileDraft}
-                onChange={(e) => setProfileDraft(e.target.value)}
-                autoFocus
-                rows={6}
-                placeholder="编辑画像全文…（清空保存 = 删除画像）"
-              />
-              <div className="flex gap-1">
-                <Button size="sm" onClick={() => void handleSaveProfile()}>保存</Button>
-                <Button variant="ghost" size="sm" onClick={() => setEditingProfile(false)}>取消</Button>
-              </div>
-            </div>
-          )}
-          {!profile?.personaDigest?.trim() && !editingProfile && (
-            <Empty text="尚无画像：点上方「整理画像」，把用户信息类记忆压缩为常驻画像稿" />
-          )}
-        </>
-      ) : (
-        <>
-          {/* 编年史：长期经历的滚动摘要条目（整理后直接生效，参与检索与兜底注入） */}
-          <div className="flex items-center justify-between">
-            <p className="text-xs leading-relaxed text-text-muted">
-              编年史由「长期经历」类记忆按时间脉络归纳而来，整理后直接生效（作为检索候选与兜底注入）。
-            </p>
-            <Button variant="outline" size="sm" onClick={() => void handleConsolidate()} disabled={consolidating}>
-              {consolidating ? '整理中…' : '整理编年史'}
-            </Button>
-          </div>
-          {profile && profile.chronicle.length > 0 ? (
-            <div className="space-y-2">
-              {[...profile.chronicle]
-                .sort((a, b) => b.createdAt - a.createdAt)
-                .map((entry) => (
-                  <Card key={entry.id} className="flex items-center gap-3 py-3">
-                    <span
-                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
-                      style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}
-                    >
-                      <Sparkles size={15} strokeWidth={1.75} color="var(--accent-500)" />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="mb-1 flex items-center gap-1.5">
-                        <span className={metaTag}>编年史</span>
-                        <span className="text-[11px] text-text-muted">· {new Date(entry.createdAt).toLocaleDateString('zh-CN')} 归纳</span>
-                      </div>
-                      {editingChronicleId === entry.id ? (
-                        <div className="mt-2 space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">
-                          <Textarea
-                            value={chronicleDraft}
-                            onChange={(e) => setChronicleDraft(e.target.value)}
-                            autoFocus
-                            rows={3}
-                            placeholder="编辑编年史条目…"
-                          />
-                          <div className="flex gap-1">
-                            <Button size="sm" onClick={() => void handleSaveChronicle()}>保存</Button>
-                            <Button variant="ghost" size="sm" onClick={() => setEditingChronicleId(null)}>取消</Button>
-                          </div>
+          {profileOwner === 'global' ? (
+            /* 全局查看态：所有角色的生效画像总览（整理/编辑请切到对应角色；注入开关可直接切） */
+            profileOverview.length > 0 ? (
+              <div className="space-y-2">
+                {profileOverview.map((item) => {
+                  const name = item.key === '_global' ? '全局' : (cards.find((c) => c.id === item.key)?.name ?? '已删除角色')
+                  const enabled = item.personaEnabled !== false
+                  return (
+                    <Card key={item.key} className="flex items-center gap-3 py-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex items-center gap-1.5">
+                          <span className={metaTag}>{name}</span>
+                          <span className={metaTag}>当前生效画像</span>
+                          {item.personaEnabled === false && <span className={metaTag}>已停用</span>}
+                          <span className="text-[11px] text-text-muted">
+                            · 更新于 {new Date(item.personaUpdatedAt).toLocaleString('zh-CN')} · 与该角色对话时每轮注入
+                          </span>
                         </div>
-                      ) : (
-                        <div className="text-sm leading-relaxed text-text selectable">{entry.text}</div>
-                      )}
-                    </div>
-                    {editingChronicleId !== entry.id && (
-                      <div className="flex shrink-0 gap-1">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => startEditChronicle(entry.id, entry.text)}
-                        >
-                          编辑
-                        </Button>
-                        <Button variant="danger" size="sm" onClick={() => void handleDeleteChronicle(entry.id)}>
-                          删除
-                        </Button>
+                        <p className={`text-sm leading-relaxed text-text selectable ${enabled ? '' : 'opacity-50'}`}>{item.personaDigest}</p>
                       </div>
-                    )}
-                  </Card>
-                ))}
-            </div>
+                      {/* 注入开关：关 = 暂停该画像的常驻注入（画像保留） */}
+                      <Switch checked={enabled} onChange={() => void handleToggleProfile(item.key, enabled)} />
+                    </Card>
+                  )
+                })}
+              </div>
+            ) : (
+              <Empty text="还没有任何角色生成画像：选择具体角色卡后点「整理」生成（画像按角色整理与注入）" />
+            )
           ) : (
-            <Empty text="暂无编年史：点上方「整理编年史」，把长期经历类记忆归纳为摘要条目" />
+            <>
+              {profile?.pendingDigest?.trim() && (
+                <div className="space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface p-3">
+                  <p className="text-xs font-medium text-text">待采纳的画像草稿（采纳后常驻注入）：</p>
+                  <p className="text-xs leading-relaxed text-text-2 selectable">{profile.pendingDigest}</p>
+                  <div className="flex gap-2">
+                    <Button size="sm" onClick={() => void handleAdopt(true)}>
+                      <Check size={13} strokeWidth={2.25} /> 采纳
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => void handleAdopt(false)}>放弃</Button>
+                  </div>
+                </div>
+              )}
+              {profile?.personaDigest?.trim() && !editingProfile && (
+                <Card className="flex items-center gap-3 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-1 flex items-center gap-1.5">
+                      <span className={metaTag}>{profileOwnerName}</span>
+                      <span className={metaTag}>当前生效画像</span>
+                      {profile.personaEnabled === false && <span className={metaTag}>已停用</span>}
+                      <span className="text-[11px] text-text-muted">
+                        · 更新于 {new Date(profile.personaUpdatedAt).toLocaleString('zh-CN')} · 与该角色对话时每轮注入
+                      </span>
+                    </div>
+                    <p
+                      className={`cursor-pointer text-sm leading-relaxed text-text selectable ${profile.personaEnabled === false ? 'opacity-50' : ''}`}
+                      onClick={() => setShowFullDigest((v) => !v)}
+                    >
+                      {showFullDigest || profile.personaDigest.length <= 120
+                        ? profile.personaDigest
+                        : `${profile.personaDigest.slice(0, 120)}…（点击展开/收起）`}
+                    </p>
+                    <div className="mt-2 flex shrink-0 items-center gap-1">
+                      {/* 注入开关：关 = 暂停常驻注入（画像保留，可随时恢复） */}
+                      <Switch
+                        checked={profile.personaEnabled !== false}
+                        onChange={() => void handleToggleProfile(profileOwner, profile.personaEnabled !== false)}
+                      />
+                      <Button variant="outline" size="sm" onClick={startEditProfile}>
+                        编辑
+                      </Button>
+                      <Button variant="danger" size="sm" onClick={() => void handleDeleteProfile()}>
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              )}
+              {editingProfile && (
+                <div className="space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">
+                  <Textarea
+                    value={profileDraft}
+                    onChange={(e) => setProfileDraft(e.target.value)}
+                    autoFocus
+                    rows={6}
+                    placeholder="编辑画像全文…（清空保存 = 删除画像）"
+                  />
+                  <div className="flex gap-1">
+                    <Button size="sm" onClick={() => void handleSaveProfile()}>保存</Button>
+                    <Button variant="ghost" size="sm" onClick={() => setEditingProfile(false)}>取消</Button>
+                  </div>
+                </div>
+              )}
+              {!profile?.personaDigest?.trim() && !editingProfile && (
+                <Empty
+                  text={`${profileOwnerName}暂无画像：整理会把该归属下已确认的「用户信息」类记忆压缩为画像稿（采纳后与该角色对话时常驻注入），生成的画像可在此编辑/删除`}
+                />
+              )}
+            </>
           )}
         </>
-      )}
+      ) : null}
     </div>
   )
 }

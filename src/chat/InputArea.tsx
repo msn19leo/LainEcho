@@ -67,19 +67,19 @@ export function InputArea() {
         {streaming ? (
           <button
             onClick={() => stop()}
-            className="inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 px-4 text-sm font-medium text-danger transition-colors hover:bg-danger/20"
+            title="停止"
+            className="inline-flex w-[44px] shrink-0 items-center justify-center self-stretch rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 text-danger transition-colors hover:bg-danger/20"
           >
-            <Square size={13} fill="currentColor" />
-            停止
+            <Square size={15} fill="currentColor" />
           </button>
         ) : (
           <button
             onClick={handleSend}
             disabled={!canSend}
-            className="bg-accent-gradient glow-primary inline-flex h-[40px] items-center gap-2 rounded-[var(--radius-md)] px-6 text-sm font-semibold text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+            title="发送"
+            className="bg-accent-gradient glow-primary inline-flex w-[44px] shrink-0 items-center justify-center self-stretch rounded-[var(--radius-md)] text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
           >
-            <Send size={15} strokeWidth={2} />
-            发送
+            <Send size={16} strokeWidth={2} />
           </button>
         )}
       </div>

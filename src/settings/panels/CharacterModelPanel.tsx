@@ -15,8 +15,9 @@ import {
   Smile,
 } from 'lucide-react'
 import { api } from '../../api'
-import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode, ExpressionMeta, CharacterSprite, StandardEmotion } from '../../types'
-import { EmotionMapEditor, emotionMapToEditor, editorToEmotionMap } from '../../components/EmotionMapEditor'
+import type { Live2DModelMeta, ModelAnimationSettings, BlinkMode, ExpressionMeta, CharacterSprite } from '../../types'
+import { SpritePaletteEditor } from '../../components/SpritePaletteEditor'
+import { ModelPaletteEditor } from '../../components/ModelPaletteEditor'
 import {
   AccordionItem,
   Button,
@@ -28,10 +29,10 @@ import {
   Loading,
   Modal,
   SegmentedControl,
-  Select,
   Slider,
   Switch,
 } from '../../components/ui'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import { cn, formatRelativeTime } from '../../lib/utils'
 import {
@@ -49,14 +50,10 @@ export function CharacterModelPanel() {
   const [sprites, setSprites] = useState<CharacterSprite[]>([])
   const [importingSprite, setImportingSprite] = useState(false)
   const [deletingSprite, setDeletingSprite] = useState<CharacterSprite | null>(null)
-  /** 正在编辑情绪映射的立绘集（非空 = 弹窗打开） */
+  /** 正在编辑情绪演出的立绘集（非空 = 弹窗打开）：词表 + 默认情绪 + 说话/思考立绘 */
   const [emotionEditing, setEmotionEditing] = useState<CharacterSprite | null>(null)
-  /** 情绪映射编辑草稿（空串 = 不配置） */
-  const [emotionDraft, setEmotionDraft] = useState<Record<StandardEmotion, string>>(emotionMapToEditor(null))
-  /** 说话立绘编辑草稿（空串 = 不配置） */
-  const [speakingDraft, setSpeakingDraft] = useState('')
-  /** 思考立绘编辑草稿（空串 = 不配置） */
-  const [thinkingDraft, setThinkingDraft] = useState('')
+  /** 正在编辑情绪词表的 Live2D 模型（非空 = 弹窗打开）：模型侧演出词表（词+释义+表情联动+默认情绪） */
+  const [paletteEditing, setPaletteEditing] = useState<Live2DModelMeta | null>(null)
   /** 可用的动作组列表（从模型 model3.json 读取） */
   const [motionGroups, setMotionGroups] = useState<string[]>([])
   /** 可用的表情列表（从选中模型的 exp3.json 读取） */
@@ -245,28 +242,17 @@ export function CharacterModelPanel() {
     }
   }
 
-  /** 打开立绘集的"情绪 → 立绘图"映射 + 说话/思考立绘 编辑弹窗 */
+  /** 打开立绘集的"情绪演出"编辑弹窗（词表 + 默认情绪 + 说话/思考立绘） */
   const openEmotionMap = (s: CharacterSprite) => {
     setEmotionEditing(s)
-    setEmotionDraft(emotionMapToEditor(s.emotionMap))
-    setSpeakingDraft(s.speakingImage ?? '')
-    setThinkingDraft(s.thinkingImage ?? '')
   }
 
-  /** 保存立绘集的展示资产（情绪映射 + 说话/思考立绘） */
-  const handleSaveEmotionMap = async () => {
-    if (!emotionEditing) return
-    try {
-      await api.sprite.update(emotionEditing.id, {
-        emotionMap: editorToEmotionMap(emotionDraft),
-        speakingImage: speakingDraft || null,
-        thinkingImage: thinkingDraft || null,
-      })
-      toast('已保存')
-      setEmotionEditing(null)
-      await loadSprites()
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '保存失败', 'error')
+  /** 词表保存成功：刷新列表并同步弹窗内的立绘集快照（避免编辑器草稿被旧数据覆盖） */
+  const handlePaletteSaved = async () => {
+    await loadSprites()
+    if (emotionEditing) {
+      const fresh = (await api.sprite.list()).find((s) => s.id === emotionEditing.id)
+      if (fresh) setEmotionEditing(fresh)
     }
   }
 
@@ -370,7 +356,12 @@ export function CharacterModelPanel() {
               >
                 Live2D 官网
               </a>{' '}
-              下载 Cubism SDK for Web，并选择其中的 <code className="rounded-[var(--radius-sm)] bg-surface-2 px-2">live2dcubismcore.min.js</code> 文件。
+              下载 Cubism SDK for Web（推荐 <code className="rounded-[var(--radius-sm)] bg-surface-2 px-1">CubismSdkForWeb-5-r.4</code>），解压后在{' '}
+              <code className="rounded-[var(--radius-sm)] bg-surface-2 px-1">Core/</code> 中选择其中的{' '}
+              <code className="rounded-[var(--radius-sm)] bg-surface-2 px-1">live2dcubismcore.min.js</code> 文件。
+            </p>
+            <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+              注意：不推荐 5-r.5 及更高版本，其携带的 Core 6 与内置渲染库不兼容，会导致模型无法显示。
             </p>
           </div>
           <Button variant={corePresent ? 'outline' : 'primary'} onClick={() => void handleImportCore()}>
@@ -421,6 +412,17 @@ export function CharacterModelPanel() {
                     {m.model3Path} · {formatRelativeTime(m.createdAt)} 导入
                   </div>
                 </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setPaletteEditing(m)
+                  }}
+                >
+                  <Smile size={13} strokeWidth={2} />
+                  情绪演出
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -575,15 +577,14 @@ export function CharacterModelPanel() {
             {/* 空闲动作 */}
             <div className="py-2.5">
               <div className="mb-2 text-[13px] font-medium text-text-2">空闲动作</div>
-              <Select
+              <SelectMenu
                 value={settings.animation.idleAnimation}
-                onChange={(e) => updateAnim('idleAnimation', e.target.value)}
-              >
-                <option value="">不应用动作</option>
-                {motionGroups.map((g) => (
-                  <option key={g} value={g}>{g}</option>
-                ))}
-              </Select>
+                onChange={(v) => updateAnim('idleAnimation', v)}
+                options={[
+                  { value: '', label: '不应用动作' },
+                  ...motionGroups.map((g) => ({ value: g, label: g })),
+                ]}
+              />
               {motionGroups.length === 0 && (
                 <p className="mt-1 text-xs text-text-muted">未检测到可用动作组，请先在 model3.json 声明或点击下方扫描</p>
               )}
@@ -622,17 +623,17 @@ export function CharacterModelPanel() {
               {settings.animation.expressionEnabled && (
                 <div className="mt-3">
                   <div className="mb-2 text-xs font-medium text-text-muted">选择表情</div>
-                  <Select
+                  <SelectMenu
                     value={settings.animation.selectedExpression}
-                    onChange={(e) => updateAnim('selectedExpression', e.target.value)}
-                  >
-                    <option value="">不应用表情</option>
-                    {expressions.map((expr) => (
-                      <option key={expr.name} value={expr.name}>
-                        {expr.name}（{expr.parameters.length} 个参数）
-                      </option>
-                    ))}
-                  </Select>
+                    onChange={(v) => updateAnim('selectedExpression', v)}
+                    options={[
+                      { value: '', label: '不应用表情' },
+                      ...expressions.map((expr) => ({
+                        value: expr.name,
+                        label: `${expr.name}（${expr.parameters.length} 个参数）`,
+                      })),
+                    ]}
+                  />
                   {expressions.length === 0 ? (
                     <p className="mt-1 text-xs text-text-muted">
                       当前模型未检测到可用的 exp3.json 表情文件
@@ -770,51 +771,40 @@ export function CharacterModelPanel() {
         onClose={() => setDeletingSprite(null)}
       />
 
-      {/* 情绪 → 立绘图 映射编辑弹窗 */}
+      {/* 情绪演出编辑弹窗：情绪词表（唯一情绪配置入口）+ 说话/思考立绘 */}
       <Modal
         open={!!emotionEditing}
         onClose={() => setEmotionEditing(null)}
-        title={`情绪映射 · ${emotionEditing?.name ?? ''}`}
-        width={420}
+        title={`情绪演出 · ${emotionEditing?.name ?? ''}`}
+        width={560}
         footer={
-          <>
-            <Button variant="ghost" onClick={() => setEmotionEditing(null)}>
-              取消
-            </Button>
-            <Button onClick={() => void handleSaveEmotionMap()}>保存</Button>
-          </>
+          <Button variant="ghost" onClick={() => setEmotionEditing(null)}>
+            关闭
+          </Button>
         }
       >
-        <EmotionMapEditor
-          title="情绪 → 立绘图映射"
-          hint="AI 回复带有该立绘集的情绪时，切换到对应立绘图。缺项回退 neutral / 立绘集首图。"
-          options={(emotionEditing?.images ?? []).map((i) => ({ value: i.filePath, label: i.filePath }))}
-          map={emotionDraft}
-          onChange={setEmotionDraft}
-          placeholder="不配置（回退 neutral/首图）"
-        />
+        {emotionEditing && <SpritePaletteEditor sprite={emotionEditing} onSaved={() => void handlePaletteSaved()} />}
+      </Modal>
 
-        {/* 说话 / 思考 立绘 */}
-        <Field label="说话立绘" hint="情绪为平静且正在说话时使用（口型场景）。">
-          <Select value={speakingDraft} onChange={(e) => setSpeakingDraft(e.target.value)}>
-            <option value="">不配置</option>
-            {(emotionEditing?.images ?? []).map((i) => (
-              <option key={i.filePath} value={i.filePath}>
-                {i.filePath}
-              </option>
-            ))}
-          </Select>
-        </Field>
-        <Field label="思考立绘" hint="AI 开始准备回答到输出文本前使用。">
-          <Select value={thinkingDraft} onChange={(e) => setThinkingDraft(e.target.value)}>
-            <option value="">不配置</option>
-            {(emotionEditing?.images ?? []).map((i) => (
-              <option key={i.filePath} value={i.filePath}>
-                {i.filePath}
-              </option>
-            ))}
-          </Select>
-        </Field>
+      {/* 模型情绪词表编辑弹窗（Live2D 模型卡入口）：词+释义+表情联动+默认情绪（与立绘集词表双轨对等） */}
+      <Modal
+        open={!!paletteEditing}
+        onClose={() => setPaletteEditing(null)}
+        title={`情绪演出 · ${paletteEditing?.name ?? ''}`}
+        width={560}
+        footer={
+          <Button variant="ghost" onClick={() => setPaletteEditing(null)}>
+            关闭
+          </Button>
+        }
+      >
+        {paletteEditing && (
+          <ModelPaletteEditor
+            model={paletteEditing}
+            onClose={() => setPaletteEditing(null)}
+            onSaved={() => undefined}
+          />
+        )}
       </Modal>
 
       {/* 重命名弹窗（Live2D 模型 / 2D 立绘集共用）：回车提交 */}

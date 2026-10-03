@@ -2,11 +2,12 @@
  * 通用设置面板：收纳不便归入其它模块的通用设置项。
  * - 文字显示速度（0-100 速度档）：控制聊天窗 / 桌宠气泡里文字的逐字显示快慢。
  * - 显示文字样本：用当前速度实时预览一段逐字打出的文字，带闪烁光标，打完后暂停 1 秒自动重播。
+ * - 回答仅含台词：普通聊天不生成也不显示（）内的心理/动作/环境描写（剧情模式与主动搭话旁白不受影响）。
  */
 import { useEffect, useRef, useState } from 'react'
-import { Type } from 'lucide-react'
+import { MessageSquareText, Type } from 'lucide-react'
 import { useSettingsStore, typingSpeedToMs } from '../../store/settingsStore'
-import { Card, Slider } from '../../components/ui'
+import { Card, Slider, Switch } from '../../components/ui'
 
 // 文字速度档位的默认值（与 settingsStore DEFAULT_SETTINGS.textSpeed 保持一致）
 const DEFAULT_TEXT_SPEED = 80
@@ -69,6 +70,7 @@ function TextSpeedSample({ speed }: { speed: number }) {
 
 export function GeneralPanel() {
   const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? DEFAULT_TEXT_SPEED)
+  const stripParenNarration = useSettingsStore((s) => s.settings.stripParenNarration)
   const save = useSettingsStore((s) => s.save)
 
   /** 保存文字显示速度（滑块实时生效） */
@@ -79,6 +81,22 @@ export function GeneralPanel() {
   return (
     <div className="space-y-4">
       {/* 面板顶部标题由 SettingsLayout 的 PanelView 统一渲染，此处只放内容 */}
+      <Card className="p-5">
+        <div className="space-y-4">
+          {/* 回答仅含台词 */}
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-text">回答仅含台词</div>
+              <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                开启后普通聊天不生成也不显示（）内的心理、动作、环境描写，AI 只输出真正说出口的台词；
+                历史记录同步剥离。剧情模式与主动搭话的开场旁白不受影响。下一轮回复生效
+              </div>
+            </div>
+            <Switch checked={stripParenNarration} onChange={(v) => void save({ stripParenNarration: v })} />
+          </div>
+        </div>
+      </Card>
+
       <Card className="p-5">
         <div className="space-y-4">
           {/* 文字显示速度 */}

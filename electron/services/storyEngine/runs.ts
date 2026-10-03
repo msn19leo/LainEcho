@@ -56,6 +56,7 @@ export async function createRun(params: {
       eventIndex: 0,
       vars: {},
       status: 'running',
+      background: null,
     },
     messages: [],
   }
@@ -93,6 +94,19 @@ export async function appendRunMessages(runId: string, extra: ChatMessage[]): Pr
   await mutateJson<StoryRun | null>(runFile(runId), null, (cur) => {
     if (!cur) return cur
     return { ...cur, messages: [...cur.messages, ...extra], updatedAt: Date.now() }
+  })
+}
+
+/**
+ * 写回剧情记忆沉淀游标（剧情记忆沉淀模块 storyMemory 用）。
+ * 只 mutate 该字段：引擎的 updateRunState 用内存 storyState 整体覆盖 storyState 字段，
+ * 游标放独立字段 + 独立写入，两条写路径互不踩踏。不触碰 updatedAt（记忆沉淀不算演出操作，不搅动存档列表排序）。
+ */
+export async function updateRunMemoryCursor(runId: string, cursor: number): Promise<void> {
+  assertValidRunId(runId)
+  await mutateJson<StoryRun | null>(runFile(runId), null, (cur) => {
+    if (!cur) return cur
+    return { ...cur, memoryCursor: cursor }
   })
 }
 

@@ -8,8 +8,8 @@
 import { dialog, ipcMain } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
-import type { Live2DModelMeta, ExpressionMeta, ExpressionParameter, ExpressionBlend, ModelScanResult } from '../../src/types'
-import { addModel, genId, listModels, removeModel, isCorePresent, updateModel } from '../services/repository'
+import type { Live2DModelMeta, ExpressionMeta, ExpressionParameter, ExpressionBlend, ModelScanResult, ModelPalette } from '../../src/types'
+import { addModel, genId, listModels, removeModel, isCorePresent, updateModel, deleteModelPalette, readModelPalette, updateModelPalette } from '../services/repository'
 import { paths, fileExists } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
@@ -271,7 +271,19 @@ export function registerModelIpc(): void {
 
   ipcMain.handle('model:remove', async (_e, modelId: string) => {
     await removeModel(modelId)
+    // 清理该模型的演出词表配置（Live2D 模型词表与模型生命周期绑定）
+    await deleteModelPalette(modelId)
     windowManager.notifyModelsChanged()
+  })
+
+  /** 读取模型演出词表（编辑器用，含 expression；未配置 = null） */
+  ipcMain.handle('model:get-palette', async (_e, modelId: string): Promise<ModelPalette | null> => {
+    return readModelPalette(modelId)
+  })
+
+  /** 保存模型演出词表（全量写回；词表空 = 删除配置，运行时落内置最小词表） */
+  ipcMain.handle('model:update-palette', async (_e, modelId: string, palette: ModelPalette): Promise<void> => {
+    await updateModelPalette(modelId, palette)
   })
 
   /** 重命名模型（仅展示名，不动磁盘目录）；广播刷新各处模型列表显示 */

@@ -13,7 +13,7 @@ import { getSettings, listConfirmedMemories, listMemories } from '../repository'
 import { embedQuery } from './embeddingService'
 import { searchVectors } from './vectorIndex'
 import { resolveEmbeddingConfig } from './memoryVectors'
-import { getActiveProfile, getRecentChronicleItems } from './profile'
+import { getActiveProfile } from './profile'
 
 /** 向量模式下 user_info/long_term 的注入上限（与旧 MAX_MEMORIES 同量级，防 prompt 膨胀） */
 export const RETRIEVAL_TOP_K = 8
@@ -56,14 +56,16 @@ export async function retrieveMemories(cardId: string, query: string, fallbackLi
 
     if (!configured) {
       const items = await listConfirmedMemories(cardId, fallbackLimit)
-      return { items: await withChronicleFallback(items, cardId), profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
+      return { items, profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
     }
     // configured 已保证 cfg 非空；类型收窄 + 兜底防御
     if (!cfg) throw new Error('嵌入配置不完整')
 
-    // 候选池：已确认 + 本角色/全局背景
+    // 候选池：已确认 + 未停用（enabled=false 为用户暂停注入）+ 本角色/全局背景
     const all = await listMemories()
-    const owned = all.filter((m) => m.confirmed && (m.characterCardId === cardId || m.characterCardId === null))
+    const owned = all.filter(
+      (m) => m.confirmed && m.enabled !== false && (m.characterCardId === cardId || m.characterCardId === null),
+    )
 
     // 约定类：数量少且时效关键，无条件全量注入
     const promises = owned.filter((m) => m.category === 'promises').slice(0, PROMISES_LIMIT)
@@ -93,12 +95,11 @@ export async function retrieveMemories(cardId: string, query: string, fallbackLi
     // 空结果兜底：语义过滤后一无所剩时回退最近条，避免"明明有记忆却注入为空"
     if (selected.length === 0 && promises.length === 0) {
       const items = await listConfirmedMemories(cardId, fallbackLimit)
-      return { items: await withChronicleFallback(items, cardId), profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
+      return { items, profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
     }
 
-    // 编年史条目（分层压缩产物）在两种模式下都补入最近几条，让被摘要的历史可见
     return {
-      items: await withChronicleFallback([...promises, ...selected], cardId),
+      items: [...promises, ...selected],
       profileDigest: profile?.personaDigest ?? null,
       mode: 'vector',
     }
@@ -107,20 +108,5 @@ export async function retrieveMemories(cardId: string, query: string, fallbackLi
     console.warn('[memory-retrieval] 检索失败，回退最近条注入：', err instanceof Error ? err.message : err)
     const items = await listConfirmedMemories(cardId, fallbackLimit).catch(() => [] as MemoryItem[])
     return { items, profileDigest: null, mode: 'recent' }
-  }
-}
-
-/**
- * 兜底注入时补上最近的编年史条目（分层压缩产物）：让降级模式也能看到被摘要的历史。
- * @param count 补入的编年史条数（最新优先）
- */
-async function withChronicleFallback(items: MemoryItem[], cardId: string, count = 3): Promise<MemoryItem[]> {
-  try {
-    const chronicle = await getRecentChronicleItems(cardId, count)
-    if (chronicle.length === 0) return items
-    const existing = new Set(items.map((m) => m.id))
-    return [...chronicle.filter((c) => !existing.has(c.id)), ...items]
-  } catch {
-    return items
   }
 }

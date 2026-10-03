@@ -8,29 +8,31 @@
  *    choices.actions / aiJudge 用 JSON 文本编辑
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronUp, Copy, FilePlus2, Save, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, Copy, FilePlus2, Save, Trash2, Wand2 } from 'lucide-react'
 import { api } from '../api'
+import { Button, Modal } from '../components/ui'
+import { SelectMenu } from '../components/DropdownMenu'
 import { WindowTitlebar } from '../components/WindowTitlebar'
 import { toast } from 'sonner'
-import type { EditorReadResult, StandardEmotion, StoryCondition, StoryEvent } from '../types'
-import { EVENT_DESCRIPTORS, STANDARD_EMOTION_OPTIONS, descriptorOf, type FieldDesc } from './eventDescriptors'
+import type { CharacterSprite, EditorReadResult, StoryCondition, StoryEvent } from '../types'
+import { EVENT_DESCRIPTORS, descriptorOf, type FieldDesc } from './eventDescriptors'
 import { cn } from '../lib/utils'
 
 /** 编辑器内存态（读入后的一切修改都落在 copy 上，点保存才写盘） */
 interface EditorData {
   scriptId: string
   editedVia: boolean
-  meta: { title: string; summary: string; startChapter: string; characterCardId: string | null }
+  meta: { title: string; summary: string; startChapter: string; characterCardId: string | null; aiBackground: boolean; spriteSetId: string | null }
   chapters: Array<{ file: string; name: string; enterWhen: StoryCondition | null; fallbackChapter: string | null; events: StoryEvent[] }>
   storyYaml: string
   chapterYamls: Record<string, string>
 }
 
 /** 事件类型的默认对象（新增事件 / 切换事件类型共用；与 eventDescriptors/schema 保持同步） */
-function eventDefaults(type: string): Record<string, unknown> {
+function eventDefaults(type: string, defaultEmotion = '平静'): Record<string, unknown> {
   const base: Record<string, unknown> = { type }
   if (type === 'narration' || type === 'player' || type === 'dialogue') base['text'] = ''
-  if (type === 'dialogue') base['emotion'] = 'neutral'
+  if (type === 'dialogue') base['emotion'] = defaultEmotion
   if (type === 'ai_dialogue') base['prompt'] = ''
   if (type === 'background') base['image'] = ''
   if (type === 'choices') base['options'] = [{ text: '选项一' }, { text: '选项二' }]
@@ -53,6 +55,121 @@ export function EditorApp() {
   const [view, setView] = useState<'form' | 'text'>('form')
   const [selChapter, setSelChapter] = useState(0)
   const [selEvent, setSelEvent] = useState<number | null>(null)
+  /** 素材清单（背景/音乐事件下拉选择用）：剧本内图片、剧本内音频、用户背景库、用户音乐库 */
+  const [assets, setAssets] = useState<{ images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }>({ images: [], musics: [], userBackgrounds: [], userMusics: [] })
+  /** 情绪词表（词表方案）：绑定立绘集的词表词 + 默认词；null = 未绑定（按内置最小词表"平静"处理） */
+  const [emotionOptions, setEmotionOptions] = useState<string[] | null>(null)
+  const [paletteDefault, setPaletteDefault] = useState<string | null>(null)
+  /** 立绘集清单（创作词表绑定下拉数据源；保留完整词表供切换改写向导计算映射） */
+  const [spriteListFull, setSpriteListFull] = useState<CharacterSprite[]>([])
+  /** 当前生效的 dialogue 默认情绪：词表默认词优先，未绑定退内置默认"平静" */
+  const defaultEmotion = paletteDefault ?? emotionOptions?.[0] ?? '平静'
+  /** 绑定切换改写向导：非空 = 待确认（改写事件情绪原文后切换绑定） */
+  const [rebindConfirm, setRebindConfirm] = useState<{ newId: string | null; affected: number; mappings: Array<{ from: string; to: string }>; toDefault: number } | null>(null)
+  /** 当前剧本的词表变化状态（来自 editor-read） */
+  const [paletteChanged, setPaletteChanged] = useState(false)
+  const [staleWords, setStaleWords] = useState<string[]>([])
+
+  /** 按立绘集 id 取词表视图（永不 null：未绑定/未打标 → 内置最小词表，仅"平静"） */
+  const paletteOf = useCallback((id: string | null): { entries: Array<{ name: string; gloss?: string }>; defaultEmotion: string } => {
+    if (id) {
+      const spr = spriteListFull.find((s) => s.id === id)
+      if (spr && spr.emotions.length > 0) {
+        return { entries: spr.emotions, defaultEmotion: spr.defaultEmotion || spr.emotions[0]?.name || '' }
+      }
+    }
+    return { entries: [{ name: '平静', gloss: '从容放松' }], defaultEmotion: '平静' }
+  }, [spriteListFull])
+
+  /**
+   * 计算绑定切换的改写计划（P1 决策：改写式，切换即重写事件情绪原文）。
+   * 映射规则：旧词在新词表 → 保持；其余 → 新词表默认情绪。
+   */
+  const planRewrite = useCallback((chapters: EditorData['chapters'], newPalette: ReturnType<typeof paletteOf>) => {
+    const newWords = new Set<string>(newPalette.entries.map((e) => e.name))
+    const newDefault = newPalette.defaultEmotion
+    const mappings = new Map<string, string>()
+    let affected = 0
+    let toDefault = 0
+    for (const ch of chapters) {
+      for (const ev of ch.events) {
+        const w = (ev as unknown as Record<string, unknown>)['emotion']
+        if (typeof w !== 'string' || !w.trim() || newWords.has(w)) continue
+        affected++
+        if (!mappings.has(w)) {
+          mappings.set(w, newDefault)
+          toDefault++
+        }
+      }
+    }
+    return { affected, mappings: [...mappings.entries()].map(([from, to]) => ({ from, to })), toDefault }
+  }, [])
+
+  /** 绑定下拉变更入口：无需改写时直接切换；有改写先弹确认向导 */
+  const beginRebind = (newId: string | null) => {
+    if (!data) return
+    const oldId = data.meta.spriteSetId
+    if ((newId ?? null) === (oldId ?? null)) return
+    const plan = planRewrite(data.chapters, paletteOf(newId))
+    if (plan.affected === 0) {
+      applyRebindLocal(newId, plan)
+      return
+    }
+    setRebindConfirm({ newId, ...plan })
+  }
+
+  /** 应用切换：改写事件情绪原文 + 更新绑定与下拉值域（不改写时 affected=0 走同一路径） */
+  const applyRebindLocal = (newId: string | null, plan: { affected: number; mappings: Array<{ from: string; to: string }>; toDefault: number }) => {
+    const map = new Map(plan.mappings.map((m) => [m.from, m.to]))
+    mutate((d) => {
+      d.meta.spriteSetId = newId
+      for (const ch of d.chapters) {
+        for (const ev of ch.events) {
+          const w = (ev as unknown as Record<string, unknown>)['emotion']
+          if (typeof w === 'string' && map.has(w)) (ev as unknown as Record<string, unknown>)['emotion'] = map.get(w)
+        }
+      }
+    })
+    // 本地同步词表下拉值域（保存后 editor-read 会以 vocabHash 重新校准）
+    const np = paletteOf(newId)
+    setEmotionOptions(np ? np.entries.map((e) => e.name) : null)
+    setPaletteDefault(np ? np.defaultEmotion : null)
+    setStaleWords([])
+    setPaletteChanged(false)
+    if (plan.affected > 0) {
+      toast.success(`已改写 ${plan.affected} 处情绪引用（自动映射 ${plan.affected - plan.toDefault}、落默认 ${plan.toDefault}）；保存后生效`)
+    }
+  }
+
+  /** 一键修复未知词（词表变化/导入剧本后）：不在当前值域的情绪引用 → 默认情绪 */
+  const fixStaleWords = () => {
+    if (!data) return
+    const valid = new Set<string>(emotionOptions ?? [defaultEmotion])
+    const def = defaultEmotion
+    let n = 0
+    mutate((d) => {
+      for (const ch of d.chapters) {
+        for (const ev of ch.events) {
+          const w = (ev as unknown as Record<string, unknown>)['emotion']
+          if (typeof w === 'string' && w.trim() && !valid.has(w)) {
+            ;(ev as unknown as Record<string, unknown>)['emotion'] = def
+            n++
+          }
+        }
+      }
+    })
+    setStaleWords([])
+    toast.success(`已修复 ${n} 处未知情绪引用（→ ${def}）；保存后生效`)
+  }
+
+  const fetchAssets = useCallback(async (id: string) => {
+    try {
+      const r = await api.story.editorAssets(id)
+      if (r.ok) setAssets({ images: r.images ?? [], musics: r.musics ?? [], userBackgrounds: r.userBackgrounds ?? [], userMusics: r.userMusics ?? [] })
+    } catch {
+      /* 素材清单拉取失败不阻塞编辑 */
+    }
+  }, [])
 
   const load = useCallback(async (id: string | null) => {
     if (!id) {
@@ -79,23 +196,35 @@ export function EditorApp() {
           summary: res.meta.summary,
           startChapter: res.meta.startChapter,
           characterCardId: res.meta.characterCardId,
+          aiBackground: res.meta.aiBackground,
+          spriteSetId: res.meta.spriteSetId,
         },
         chapters: res.chapters.map((c) => ({ file: c.file, name: c.name, enterWhen: c.enterWhen, fallbackChapter: c.fallbackChapter, events: c.events })),
         storyYaml: res.storyYaml ?? '',
         chapterYamls,
       })
+      setEmotionOptions(res.meta.emotionWords)
+      setPaletteDefault(res.meta.paletteDefault)
+      setPaletteChanged(res.meta.paletteChanged)
+      setStaleWords(res.meta.staleWords)
+      if (res.meta.paletteChanged) {
+        toast.warning('词表已变化：绑定立绘集的词表在保存后被编辑过，存在不在当前词表中的情绪引用')
+      }
       setSelChapter(0)
       setSelEvent(null)
       setDirty(false)
+      void fetchAssets(res.scriptId ?? id)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '剧本读取失败')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [fetchAssets])
 
   useEffect(() => {
     void api.story.editorCurrent().then((id) => load(id))
+    // 立绘集清单：创作词表绑定下拉数据源（编辑器与主窗共用 preload，可直接拉取）
+    void api.sprite.list().then((list) => setSpriteListFull(list)).catch(() => undefined)
     return api.story.onEditorReload(() => {
       void api.story.editorCurrent().then((id) => load(id))
     })
@@ -120,7 +249,7 @@ export function EditorApp() {
           ? {
               mode: 'form' as const,
               scriptId: data.scriptId,
-              meta: { title: data.meta.title, summary: data.meta.summary, startChapter: data.meta.startChapter, characterCardId: data.meta.characterCardId },
+              meta: { title: data.meta.title, summary: data.meta.summary, startChapter: data.meta.startChapter, characterCardId: data.meta.characterCardId, aiBackground: data.meta.aiBackground, spriteSetId: data.meta.spriteSetId },
               chapters: data.chapters.map((c) => ({ file: c.file, name: c.name, enterWhen: c.enterWhen, fallbackChapter: c.fallbackChapter, events: c.events })),
             }
           : {
@@ -176,7 +305,7 @@ export function EditorApp() {
   const addEvent = (type: string) => {
     if (!chapter) return
     mutate((d) => {
-      d.chapters[selChapter]!.events.push(eventDefaults(type) as StoryEvent)
+      d.chapters[selChapter]!.events.push(eventDefaults(type, defaultEmotion) as StoryEvent)
     })
     setSelEvent((d2) => (d2 === null ? 0 : d2 + 1))
   }
@@ -186,7 +315,7 @@ export function EditorApp() {
     if (!chapter || !newType) return
     mutate((d) => {
       const old = d.chapters[selChapter]!.events[idx] as unknown as Record<string, unknown>
-      const next = eventDefaults(newType)
+      const next = eventDefaults(newType, defaultEmotion)
       const hasTextField = descriptorOf(newType)?.fields.some((f) => f.key === 'text')
       if (hasTextField && typeof old['text'] === 'string' && old['text']) next['text'] = old['text']
       if (old['condition'] != null) next['condition'] = old['condition']
@@ -330,9 +459,51 @@ export function EditorApp() {
                   <textarea value={data.meta.summary} onChange={(e) => mutate((d) => { d.meta.summary = e.target.value })} placeholder="剧情简介（会显示在剧本库卡片上）" rows={3} className="w-full resize-y rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1.5 text-xs leading-relaxed outline-none" />
                   <label className="block text-[10px] text-text-2">
                     起始章节
-                    <select value={data.meta.startChapter} onChange={(e) => mutate((d) => { d.meta.startChapter = e.target.value })} className="mt-0.5 w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-1 py-1 text-xs outline-none">
-                      {data.chapters.map((c) => <option key={c.file} value={c.file}>{c.file}</option>)}
-                    </select>
+                    <SelectMenu
+                      value={data.meta.startChapter}
+                      onChange={(v) => mutate((d) => { d.meta.startChapter = v })}
+                      options={data.chapters.map((c) => ({ value: c.file, label: c.file }))}
+                      className="mt-0.5 w-full"
+                    />
+                  </label>
+                  <label className="block text-[10px] text-text-2">
+                    情绪词表来源（立绘集）
+                    <SelectMenu
+                      value={data.meta.spriteSetId ?? ''}
+                      onChange={(v) => beginRebind(v || null)}
+                      disabled={!formEditable}
+                      options={[
+                        { value: '', label: '未绑定（仅默认情绪）' },
+                        ...spriteListFull.map((s) => ({ value: s.id, label: s.name })),
+                      ]}
+                      className="mt-0.5 w-full"
+                    />
+                    <span className="mt-0.5 block text-[10px] text-text-muted">
+                      {emotionOptions && emotionOptions.length > 0
+                        ? `已启用词表（${emotionOptions.length} 词）：${emotionOptions.join(' / ')}`
+                        : '绑定已打标的立绘集后，情绪下拉按其词表生成'}
+                    </span>
+                    {staleWords.length > 0 && (
+                      <span className="mt-1 block rounded-[var(--radius-md)] border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-500">
+                        {paletteChanged ? '词表已变化，' : ''}有 {staleWords.length} 个未知情绪词不在当前值域：{staleWords.join(' / ')}（演出时降级到默认情绪）
+                        <button
+                          onClick={fixStaleWords}
+                          disabled={!formEditable}
+                          className="ml-1 inline-flex items-center gap-0.5 font-medium text-amber-400 underline underline-offset-2 disabled:opacity-40"
+                        >
+                          <Wand2 size={11} />一键修复
+                        </button>
+                      </span>
+                    )}
+                  </label>
+                  <label className="mt-1 flex items-center gap-1.5 text-[10px] text-text-2">
+                    <input
+                      type="checkbox"
+                      checked={data.meta.aiBackground}
+                      onChange={(e) => mutate((d) => { d.meta.aiBackground = e.target.checked })}
+                      disabled={!formEditable}
+                    />
+                    允许 AI 自行切换背景（默认关闭；开启后 AI 演出可能切换到清单内背景）
                   </label>
                 </div>
                 <div className="flex items-center justify-between px-3 py-1.5 text-xs font-semibold text-text-2">
@@ -394,24 +565,23 @@ export function EditorApp() {
                       </label>
                       <label className="block text-[10px] text-text-2">
                         备选章节 fallbackChapter（enterWhen 不满足时进入）
-                        <select value={chapter.fallbackChapter ?? ''} onChange={(e) => mutate((d) => { d.chapters[selChapter]!.fallbackChapter = e.target.value || null })} className="mt-0.5 w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-1 py-1 text-xs outline-none">
-                          <option value="">（无，直接跳过本章）</option>
-                          {chapterOptions.map((f) => <option key={f} value={f}>{f}</option>)}
-                        </select>
+                        <SelectMenu
+                          value={chapter.fallbackChapter ?? ''}
+                          onChange={(v) => mutate((d) => { d.chapters[selChapter]!.fallbackChapter = v || null })}
+                          options={[{ value: '', label: '（无，直接跳过本章）' }, ...chapterOptions.map((f) => ({ value: f, label: f }))]}
+                          className="mt-0.5 w-full"
+                        />
                       </label>
                     </div>
 
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-xs font-semibold text-text-2">事件（{chapter.events.length}）</span>
-                      <select
+                      <SelectMenu
                         value=""
-                        onChange={(e) => { if (e.target.value) addEvent(e.target.value) }}
+                        onChange={(v) => { if (v) addEvent(v) }}
                         disabled={!formEditable}
-                        className="rounded-[var(--radius-md)] border border-border bg-bg-panel px-1 py-1 text-xs outline-none"
-                      >
-                        <option value="">+ 添加事件…</option>
-                        {EVENT_DESCRIPTORS.map((d) => <option key={d.type} value={d.type}>{d.label}</option>)}
-                      </select>
+                        options={[{ value: '', label: '+ 添加事件…' }, ...EVENT_DESCRIPTORS.map((d) => ({ value: d.type, label: d.label }))]}
+                      />
                     </div>
 
                     <div className="mb-3 space-y-1">
@@ -433,8 +603,11 @@ export function EditorApp() {
                       <EventForm
                         key={`${selChapter}-${selEvent}`}
                         event={chapter.events[selEvent]!}
+                        emotionOptions={emotionOptions}
+                        paletteDefault={paletteDefault}
                         chapterOptions={chapterOptions}
                         editable={formEditable}
+                        assets={assets}
                         onChange={(patch) => updateEvent(selEvent, patch)}
                         onTypeChange={(newType) => changeEventType(selEvent, newType)}
                       />
@@ -446,15 +619,55 @@ export function EditorApp() {
           )}
         </>
       )}
+      {/* 绑定切换改写向导（P1 决策：改写式）：确认后重写事件情绪原文并切换绑定 */}
+      <Modal
+        open={!!rebindConfirm}
+        onClose={() => setRebindConfirm(null)}
+        title="切换情绪词表来源"
+        width={480}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRebindConfirm(null)}>取消</Button>
+            <Button onClick={() => rebindConfirm && applyRebindLocal(rebindConfirm.newId, rebindConfirm)}>确认改写</Button>
+          </>
+        }
+      >
+        {rebindConfirm && (
+          <div className="space-y-3 text-xs leading-relaxed text-text-2">
+            <p>
+              切换词表来源将<b className="text-text">直接改写</b>事件中的情绪引用（保存后生效）：
+              共 <b className="text-text">{rebindConfirm.affected}</b> 处需要处理，
+              其中自动映射 {rebindConfirm.affected - rebindConfirm.toDefault} 处、落默认情绪 {rebindConfirm.toDefault} 处。
+            </p>
+            <div className="max-h-52 overflow-y-auto rounded-[var(--radius-md)] border border-border p-2">
+              {rebindConfirm.mappings.map((m) => (
+                <div key={m.from} className="flex items-center gap-2 py-0.5 font-mono text-[11px]">
+                  <span className="text-text-2">{m.from}</span>
+                  <span className="text-text-muted">→</span>
+                  <span className={m.from === m.to ? 'text-text-2' : 'text-primary-400'}>{m.to}</span>
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] text-text-muted">
+              映射规则：同名保留 → 其余改写为新词表默认情绪。未绑定时按内置最小词表（仅"平静"）处理。
+            </p>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }
 
 /** 事件表单：顶部类型切换 + 通用字段按描述表渲染；choices/chapter_end/set_var 有专用编辑区；condition 通用 */
-function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: {
+function EventForm({ event, chapterOptions, editable, assets, emotionOptions, paletteDefault, onChange, onTypeChange }: {
   event: StoryEvent
   chapterOptions: string[]
   editable: boolean
+  assets: { images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }
+  /** 情绪下拉选项：剧本绑定立绘集的词表词；null = 未绑定（按内置最小词表处理） */
+  emotionOptions: string[] | null
+  /** 词表默认情绪词（未绑定为 null） */
+  paletteDefault: string | null
   onChange: (patch: Partial<StoryEvent>) => void
   onTypeChange: (newType: string) => void
 }) {
@@ -470,31 +683,34 @@ function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: 
       <div className="mb-2 flex items-center gap-2">
         <span className="text-xs font-semibold">{desc?.label ?? event.type} 表单</span>
         {/* 事件类型切换：以新类型默认对象重建（尽量保留 text 与 condition） */}
-        <select
+        <SelectMenu
           value={event.type}
-          onChange={(e) => onTypeChange(e.target.value)}
+          onChange={onTypeChange}
           disabled={!editable}
-          title="切换事件类型（保留文本与条件）"
-          className="ml-auto rounded-[var(--radius-md)] border border-border bg-bg-panel px-1.5 py-0.5 text-xs outline-none"
-        >
-          {EVENT_DESCRIPTORS.map((d) => <option key={d.type} value={d.type}>{d.label}</option>)}
-        </select>
+          options={EVENT_DESCRIPTORS.map((d) => ({ value: d.type, label: d.label }))}
+          className="ml-auto"
+        />
         <span className="font-mono text-[10px] text-text-2">#{event.type}</span>
       </div>
       <div className="space-y-2.5">
         {desc?.fields.map((f) => (
-          <FieldInput key={f.key} field={f} value={anyE[f.key]} editable={editable} onChange={(v) => onChange({ [f.key]: v } as Partial<StoryEvent>)} />
+          <FieldInput key={f.key} field={f} value={anyE[f.key]} editable={editable} assets={assets} emotionOptions={emotionOptions} paletteDefault={paletteDefault} onChange={(v) => onChange({ [f.key]: v } as Partial<StoryEvent>)} />
         ))}
 
         {/* set_var：value 类型自由（数字/字符串/布尔）+ 运算符 */}
         {event.type === 'set_var' && (
           <label className="block text-[10px] text-text-2">
             运算符
-            <select value={String(anyE['op'] ?? '=')} onChange={(e) => onChange({ op: e.target.value as '=' | '+=' | '-=' })} className="mt-0.5 block w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1 text-sm outline-none">
-              <option value="=">=（赋值）</option>
-              <option value="+=">+=（增加）</option>
-              <option value="-=">-=（减少）</option>
-            </select>
+            <SelectMenu
+              value={String(anyE['op'] ?? '=')}
+              onChange={(v) => onChange({ op: v as '=' | '+=' | '-=' })}
+              options={[
+                { value: '=', label: '=（赋值）' },
+                { value: '+=', label: '+=（增加）' },
+                { value: '-=', label: '-=（减少）' },
+              ]}
+              className="mt-0.5 block w-full"
+            />
           </label>
         )}
 
@@ -546,16 +762,16 @@ function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: 
                                 placeholder="变量名"
                                 className="w-24 rounded-[var(--radius-sm)] border border-border bg-bg-panel px-1 py-0.5 font-mono outline-none"
                               />
-                              <select
+                              <SelectMenu
                                 value={String(a['op'] ?? '+=')}
-                                onChange={(e) => setOption(i, { ...o, actions: actions.map((x, j) => (j === ai ? { ...x, op: e.target.value } : x)) })}
+                                onChange={(v) => setOption(i, { ...o, actions: actions.map((x, j) => (j === ai ? { ...x, op: v } : x)) })}
                                 disabled={!editable}
-                                className="rounded-[var(--radius-sm)] border border-border bg-bg-panel px-0.5 py-0.5 font-mono outline-none"
-                              >
-                                <option value="=">=</option>
-                                <option value="+=">+=</option>
-                                <option value="-=">-=</option>
-                              </select>
+                                options={[
+                                  { value: '=', label: '=' },
+                                  { value: '+=', label: '+=' },
+                                  { value: '-=', label: '-=' },
+                                ]}
+                              />
                               <input
                                 value={String(a['value'] ?? '')}
                                 onChange={(e) => {
@@ -622,10 +838,12 @@ function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: 
           <div className="space-y-2.5">
             <label className="block text-[10px] text-text-2">
               缺省下一章（所有分支都不满足时；空 = 完结）
-              <select value={String(anyE['nextChapter'] ?? '')} onChange={(e) => onChange({ nextChapter: e.target.value || undefined } as unknown as Partial<StoryEvent>)} className="mt-0.5 block w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1 text-sm outline-none">
-                <option value="">（完结）</option>
-                {chapterOptions.map((f) => <option key={f} value={f}>{f}</option>)}
-              </select>
+              <SelectMenu
+                value={String(anyE['nextChapter'] ?? '')}
+                onChange={(v) => onChange({ nextChapter: v || undefined } as unknown as Partial<StoryEvent>)}
+                options={[{ value: '', label: '（完结）' }, ...chapterOptions.map((f) => ({ value: f, label: f }))]}
+                className="mt-0.5 block w-full"
+              />
             </label>
             <div>
               <p className="mb-1 text-[10px] text-text-2">静态分支（按序首个 when 满足者生效）</p>
@@ -642,17 +860,15 @@ function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: 
                     disabled={!editable}
                     className="min-w-0 flex-1 rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1 font-mono text-xs outline-none"
                   />
-                  <select
+                  <SelectMenu
                     value={String(b['nextChapter'] ?? '')}
-                    onChange={(e) => {
-                      const next = arr.map((x, j) => (j === i ? { ...x, nextChapter: e.target.value } : x))
+                    onChange={(v) => {
+                      const next = arr.map((x, j) => (j === i ? { ...x, nextChapter: v } : x))
                       onChange({ branches: next } as unknown as Partial<StoryEvent>)
                     }}
                     disabled={!editable}
-                    className="rounded-[var(--radius-md)] border border-border bg-bg-panel px-1 py-1 text-xs outline-none"
-                  >
-                    {chapterOptions.map((f) => <option key={f} value={f}>{f}</option>)}
-                  </select>
+                    options={chapterOptions.map((f) => ({ value: f, label: f }))}
+                  />
                   <button
                     onClick={() => onChange({ branches: arr.filter((_, j) => j !== i) } as unknown as Partial<StoryEvent>)}
                     disabled={!editable}
@@ -709,8 +925,45 @@ function EventForm({ event, chapterOptions, editable, onChange, onTypeChange }: 
   )
 }
 
-function FieldInput({ field, value, editable, onChange }: { field: FieldDesc; value: unknown; editable: boolean; onChange: (v: unknown) => void }) {
+function FieldInput({ field, value, editable, assets, emotionOptions, paletteDefault, onChange }: {
+  field: FieldDesc
+  value: unknown
+  editable: boolean
+  assets?: { images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }
+  /** 情绪下拉选项：剧本绑定立绘集的词表词；undefined/null = 未绑定（按内置最小词表处理） */
+  emotionOptions?: string[] | null
+  /** 词表默认情绪词 */
+  paletteDefault?: string | null
+  onChange: (v: unknown) => void
+}) {
   const cls = 'mt-0.5 w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1 text-sm outline-none'
+  // 背景/音乐：素材清单下拉（datalist，可选可手填）——背景含剧本内图片与背景库 user: 引用；音乐含剧本内音频与音乐库 user: 引用
+  if (field.kind === 'background' || field.kind === 'music') {
+    const listId = `asset-list-${field.key}`
+    const opts =
+      field.kind === 'background'
+        ? [
+            ...(assets?.images ?? []).map((p) => ({ value: p, label: '剧本内图片' })),
+            ...(assets?.userBackgrounds ?? []).map((n) => ({ value: `user:${n}`, label: '背景库' })),
+          ]
+        : [
+            ...(assets?.musics ?? []).map((p) => ({ value: p, label: '剧本内音频' })),
+            ...(assets?.userMusics ?? []).map((n) => ({ value: `user:${n}`, label: '音乐库' })),
+          ]
+    return (
+      <label className="block text-[10px] text-text-2">
+        {field.label}{field.required && ' *'}
+        <input list={listId} value={String(value ?? '')} onChange={(e) => onChange(e.target.value)} disabled={!editable} placeholder={field.placeholder} className={cls} />
+        <datalist id={listId}>
+          {opts.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </datalist>
+      </label>
+    )
+  }
   if (field.kind === 'boolean') {
     return (
       <label className="flex items-center gap-1.5 text-[10px] text-text-2">
@@ -720,12 +973,22 @@ function FieldInput({ field, value, editable, onChange }: { field: FieldDesc; va
     )
   }
   if (field.kind === 'emotion') {
+    // 情绪值域 = 绑定词表（默认词排首）；未绑定为内置最小词表（仅"平静"）
+    const emoOpts = (emotionOptions && emotionOptions.length > 0
+      ? (paletteDefault
+          ? [paletteDefault, ...emotionOptions.filter((w) => w !== paletteDefault)]
+          : emotionOptions)
+      : [paletteDefault ?? '平静'])
     return (
       <label className="block text-[10px] text-text-2">
         {field.label}
-        <select value={String(value ?? 'neutral')} onChange={(e) => onChange(e.target.value as StandardEmotion)} disabled={!editable} className={cls}>
-          {STANDARD_EMOTION_OPTIONS.map((em) => <option key={em} value={em}>{em}</option>)}
-        </select>
+        <SelectMenu
+          value={String(value ?? emoOpts[0] ?? '平静')}
+          onChange={(v) => onChange(v)}
+          disabled={!editable}
+          options={emoOpts.map((em) => ({ value: em, label: em }))}
+          className="mt-0.5 w-full"
+        />
       </label>
     )
   }

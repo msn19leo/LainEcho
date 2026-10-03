@@ -3,12 +3,14 @@
  * （剧本→角色卡→立绘集→语音→覆盖背景）+ 存档列表（多周目）。
  * 演出在独立剧情窗进行（galgame 式），与聊天系统完全分离。
  */
-import { useEffect, useRef, useState } from 'react'
-import { BookOpen, Download, FilePlus2, ImagePlus, Pencil, Play, RotateCcw, Save, Sparkles, Trash2, Type, Upload } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { BookOpen, Download, FilePlus2, ImagePlus, Music, Pause, Pencil, Play, RotateCcw, Save, Sparkles, Trash2, Type, Upload } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../../api'
 import { useSettingsStore, typingSpeedToMs } from '../../store/settingsStore'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { Card, Slider } from '../../components/ui'
+import { cn } from '../../lib/utils'
 import type { CharacterCard, CharacterSprite, ScriptIndexItem, StoryRunIndexItem, StoryVoiceConfig, TTSModelCard } from '../../types'
 
 interface ScriptCardItem extends ScriptIndexItem {
@@ -78,6 +80,7 @@ export function StoryPanel() {
   const [sprites, setSprites] = useState<CharacterSprite[] | null>(null)
   const [ttsModels, setTtsModels] = useState<TTSModelCard[]>([])
   const [backgrounds, setBackgrounds] = useState<string[]>([])
+  const [musics, setMusics] = useState<string[]>([])
 
   // ---- 开始演出表单 ----
   const [scriptId, setScriptId] = useState('')
@@ -93,6 +96,8 @@ export function StoryPanel() {
   // ---- AI 辅助写剧本（草稿可编辑，校验通过后手动导入） ----
   const [premise, setPremise] = useState('')
   const [draftCardId, setDraftCardId] = useState('')
+  /** 情绪词表来源（AI 写剧本的 emotion 值域；空 = 跟随参考角色卡绑定，再退内置最小词表） */
+  const [draftSpriteSetId, setDraftSpriteSetId] = useState('')
   const [draft, setDraft] = useState('')
   const [draftErrors, setDraftErrors] = useState<Array<{ file: string; message: string }>>([])
   const [generating, setGenerating] = useState(false)
@@ -100,13 +105,14 @@ export function StoryPanel() {
 
   const refresh = async () => {
     try {
-      const [list, runList, cardList, spriteList, ttsList, bgList] = await Promise.all([
+      const [list, runList, cardList, spriteList, ttsList, bgList, musicList] = await Promise.all([
         api.story.list(),
         api.story.listRuns(),
         api.characterCard.list(),
         api.sprite.list(),
         api.ttsModel.list(),
         api.story.listBackgrounds(),
+        api.story.listMusics(),
       ])
       const enriched: ScriptCardItem[] = list.map((s) => ({
         ...s,
@@ -118,6 +124,7 @@ export function StoryPanel() {
       setSprites(spriteList)
       setTtsModels(ttsList)
       setBackgrounds(bgList)
+      setMusics(musicList)
       setScriptId((cur) => cur || list[0]?.id || '')
     } catch (err) {
       console.error('加载剧情数据失败', err)
@@ -230,12 +237,104 @@ export function StoryPanel() {
     }
   }
 
-  /** AI 生成剧本草稿（产物仅回显编辑，不直接入库） */
+  /** 音乐库：上传（多选） */
+  const handleUploadMusics = async () => {
+    const res = await api.story.uploadMusics()
+    if (!res.ok) {
+      toast.error(res.error ?? '音乐导入失败')
+      return
+    }
+    if (res.added && res.added.length > 0) {
+      toast.success(`已导入 ${res.added.length} 首音乐`)
+      await refresh()
+    }
+  }
+
+  const handleRemoveMusic = async (name: string) => {
+    if (!window.confirm(`删除音乐「${name}」？引用它的剧本将无法播放该 BGM（播放时静默跳过）。`)) return
+    if (playingMusic === name) stopMusicPreview()
+    const res = await api.story.removeMusic(name)
+    if (res.ok) {
+      await refresh()
+    } else {
+      toast.error(res.error ?? '删除失败')
+    }
+  }
+
+  // ---- 音乐库预览播放（单实例；与剧情窗 BGM 完全独立，互不影响音量/播放） ----
+  const musicAudio = useMemo(() => new Audio(), [])
+  const [playingMusic, setPlayingMusic] = useState<string | null>(null)
+  const [musicPaused, setMusicPaused] = useState(false)
+  const [musicProgress, setMusicProgress] = useState({ cur: 0, dur: 0 })
+
+  // audio 事件绑定（一次）：进度 / 时长 / 播放态 / 播完复位；卸载时暂停。
+  // 拖动进度条期间屏蔽 timeupdate（seek 是异步的，旧播放位置会把受控滑块弹回去）
+  const seekingRef = useRef(false)
+  useEffect(() => {
+    const a = musicAudio
+    const onTime = () => {
+      if (seekingRef.current) return
+      setMusicProgress({ cur: a.currentTime, dur: Number.isFinite(a.duration) ? a.duration : 0 })
+    }
+    const onMeta = () => setMusicProgress((p) => ({ ...p, dur: Number.isFinite(a.duration) ? a.duration : 0 }))
+    const onEnd = () => {
+      setPlayingMusic(null)
+      setMusicProgress({ cur: 0, dur: 0 })
+    }
+    const onPlay = () => setMusicPaused(false)
+    const onPause = () => setMusicPaused(true)
+    a.addEventListener('timeupdate', onTime)
+    a.addEventListener('loadedmetadata', onMeta)
+    a.addEventListener('ended', onEnd)
+    a.addEventListener('play', onPlay)
+    a.addEventListener('pause', onPause)
+    return () => {
+      a.pause()
+      a.removeEventListener('timeupdate', onTime)
+      a.removeEventListener('loadedmetadata', onMeta)
+      a.removeEventListener('ended', onEnd)
+      a.removeEventListener('play', onPlay)
+      a.removeEventListener('pause', onPause)
+    }
+  }, [musicAudio])
+
+  const toggleMusicPlay = (name: string) => {
+    const a = musicAudio
+    if (playingMusic === name) {
+      // 同一首：播放/暂停切换（暂停保留进度）
+      if (a.paused) void a.play().catch(() => toast.error('播放失败'))
+      else a.pause()
+      return
+    }
+    // 换曲：重设 src 从头播放
+    a.src = api.story.musicUrl(name)
+    void a.play().catch(() => toast.error('播放失败'))
+    setPlayingMusic(name)
+    setMusicProgress({ cur: 0, dur: 0 })
+  }
+
+  const stopMusicPreview = () => {
+    musicAudio.pause()
+    musicAudio.removeAttribute('src')
+    setPlayingMusic(null)
+    setMusicProgress({ cur: 0, dur: 0 })
+  }
+
+  const seekMusic = (v: number) => {
+    if (!Number.isFinite(v)) return
+    musicAudio.currentTime = v
+    setMusicProgress((p) => ({ ...p, cur: v }))
+  }
+
+  /** AI 生成剧本草稿（产物仅回显编辑，不直接入库）；情绪词表按所选立绘集（缺省跟随参考角色卡绑定） */
   const handleGenerateDraft = async () => {
     if (!premise.trim() || generating) return
     setGenerating(true)
     try {
-      const res = await api.story.generateDraft({ premise: premise.trim(), cardId: draftCardId || null })
+      // 词表来源：显式选择 > 参考角色卡绑定的立绘集 > 内置最小词表（主进程侧兜底）
+      const card = cards.find((c) => c.id === draftCardId)
+      const effSpriteSetId = draftSpriteSetId || card?.spriteId || null
+      const res = await api.story.generateDraft({ premise: premise.trim(), cardId: draftCardId || null, spriteSetId: effSpriteSetId })
       if (!res.ok) {
         toast.error(res.error ?? '生成失败')
         return
@@ -329,8 +428,12 @@ export function StoryPanel() {
           </h3>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => void api.story.editorCreate().then((r) => {
-                if (!r.ok && r.error) toast.error(r.error)
+              onClick={() => void api.story.editorCreate().then(async (r) => {
+                if (r.ok) {
+                  await refresh()
+                } else if (r.error) {
+                  toast.error(r.error)
+                }
               })}
               className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-3 py-1.5 text-xs font-medium text-text transition-all hover:bg-card-hover"
             >
@@ -351,47 +454,38 @@ export function StoryPanel() {
         ) : scripts.length === 0 ? (
           <p className="py-6 text-center text-xs text-text-muted">还没有剧本，点右上角「导入剧本」选择 zip 包</p>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3">
+          <div className="max-h-[17.5rem] overflow-y-auto grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3">
             {scripts.map((s) => (
-              <div key={s.id} className="overflow-hidden rounded-[var(--radius-lg)] border border-border">
-                <div className="relative h-24" style={{ background: 'var(--bg-surface)' }}>
-                  {s.cover ? (
-                    <img src={api.story.assetUrl(s.id, s.cover)} alt={s.title} className="h-full w-full object-cover" />
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-2xl opacity-40">📖</div>
-                  )}
-                </div>
-                <div className="p-2.5">
-                  <p className="truncate text-xs font-medium text-text">{s.title}</p>
-                  <p className="mt-0.5 line-clamp-2 min-h-[2rem] text-[11px] leading-relaxed text-text-muted">{s.summary || '暂无简介'}</p>
-                  <div className="mt-1.5 flex items-center justify-between">
-                    <span className="text-[10px] text-text-muted">{s.chapters} 章{s.card ? ` · ${s.card.name}` : ''}</span>
-                    <div className="flex items-center gap-0.5">
-                      <button
-                        onClick={() => void api.story.openEditor(s.id)}
-                        title="可视化编辑（7.6）"
-                        className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text"
-                      >
-                        <Pencil size={12} />
-                      </button>
-                      <button
-                        onClick={() => void api.story.export(s.id).then((r) => {
-                          if (r.ok && r.path) toast.success(`已导出：${r.path}`)
-                          if (!r.ok && r.error) toast.error(r.error)
-                        })}
-                        title="导出 zip"
-                        className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text"
-                      >
-                        <Download size={12} />
-                      </button>
-                      <button
-                        onClick={() => void handleRemove(s.id, s.title)}
-                        title="删除剧本"
-                        className="rounded p-1 text-text-muted hover:bg-danger/10 hover:text-danger"
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
+              <div key={s.id} className="rounded-[var(--radius-lg)] border border-border p-2.5">
+                <p className="truncate text-xs font-medium text-text">{s.title}</p>
+                <p className="mt-0.5 line-clamp-2 min-h-[2rem] text-[11px] leading-relaxed text-text-muted">{s.summary || '暂无简介'}</p>
+                <div className="mt-1.5 flex items-center justify-between">
+                  <span className="text-[10px] text-text-muted">{s.chapters} 章{s.card ? ` · ${s.card.name}` : ''}</span>
+                  <div className="flex items-center gap-0.5">
+                    <button
+                      onClick={() => void api.story.openEditor(s.id)}
+                      title="可视化编辑（7.6）"
+                      className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    <button
+                      onClick={() => void api.story.export(s.id).then((r) => {
+                        if (r.ok && r.path) toast.success(`已导出：${r.path}`)
+                        if (!r.ok && r.error) toast.error(r.error)
+                      })}
+                      title="导出 zip"
+                      className="rounded p-1 text-text-muted hover:bg-card-hover hover:text-text"
+                    >
+                      <Download size={12} />
+                    </button>
+                    <button
+                      onClick={() => void handleRemove(s.id, s.title)}
+                      title="删除剧本"
+                      className="rounded p-1 text-text-muted hover:bg-danger/10 hover:text-danger"
+                    >
+                      <Trash2 size={12} />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -421,10 +515,10 @@ export function StoryPanel() {
         {backgrounds.length === 0 ? (
           <p className="py-4 text-center text-xs text-text-muted">还没有背景图，点右上角「上传背景图」选择本地图片（可多选）</p>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3">
+          <div className="max-h-[14.5rem] overflow-y-auto grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3">
             {backgrounds.map((name) => (
               <div key={name} className="group relative overflow-hidden rounded-[var(--radius-lg)] border border-border">
-                <img src={api.story.assetUrl('', `user:${name}`)} alt={name} className="h-20 w-full object-cover" />
+                <img src={api.story.assetUrl('', `user:${name}`)} alt={name} loading="lazy" className="h-20 w-full object-cover" />
                 <div className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-black/50 px-2 py-1 opacity-0 transition-opacity group-hover:opacity-100">
                   <span className="truncate text-[10px] text-white">{name}</span>
                   <button onClick={() => void handleRemoveBackground(name)} title="删除背景" className="rounded p-0.5 text-white/80 hover:text-danger">
@@ -433,6 +527,80 @@ export function StoryPanel() {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      {/* 音乐库（与背景库同模式：music 事件以 user:文件名 引用） */}
+      <section className="glass rounded-[var(--radius-xl)] p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-text">
+            <Music size={15} className="text-primary-400" />
+            音乐库
+          </h3>
+          <button
+            onClick={() => void handleUploadMusics()}
+            className="bg-brand-gradient inline-flex items-center gap-1.5 rounded-[var(--radius-md)] px-3 py-1.5 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110"
+          >
+            <Upload size={12} strokeWidth={2} />
+            上传音乐
+          </button>
+        </div>
+        <p className="mb-3 text-[11px] leading-relaxed text-text-muted">
+          上传的音乐可在编辑器「音乐」事件中选用；剧本里用 <code className="rounded bg-[var(--bg-surface)] px-1">file: user:文件名</code> 引用。
+        </p>
+        {musics.length === 0 ? (
+          <p className="py-4 text-center text-xs text-text-muted">还没有音乐，点右上角「上传音乐」选择本地音频（可多选）</p>
+        ) : (
+          <div className="max-h-[13rem] overflow-y-auto grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-2">
+            {musics.map((name) => {
+              const active = playingMusic === name
+              const fmt = (s: number) => (Number.isFinite(s) && s >= 0 ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : '0:00')
+              return (
+                <div key={name} className={cn('group overflow-hidden rounded-[var(--radius-md)] border px-2.5 py-1.5 transition-colors', active ? 'border-primary-400/40 bg-primary-500/5' : 'border-border')}>
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      onClick={() => toggleMusicPlay(name)}
+                      title={active && !musicPaused ? '暂停' : '播放'}
+                      className="shrink-0 rounded-full p-1 text-primary-400 transition-colors hover:bg-primary-500/10"
+                    >
+                      {active && !musicPaused ? <Pause size={12} /> : <Play size={12} />}
+                    </button>
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-text">
+                      <Music size={12} className="shrink-0 text-primary-400" />
+                      <span className="min-w-0 truncate">{name}</span>
+                    </span>
+                    <button
+                      onClick={() => void handleRemoveMusic(name)}
+                      title="删除音乐"
+                      className="shrink-0 rounded p-0.5 text-text-muted opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                  {active && (
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <input
+                        type="range"
+                        min={0}
+                        max={musicProgress.dur || 0}
+                        step={0.1}
+                        value={musicProgress.cur}
+                        onPointerDown={() => (seekingRef.current = true)}
+                        onPointerUp={() => (seekingRef.current = false)}
+                        onPointerCancel={() => (seekingRef.current = false)}
+                        onBlur={() => (seekingRef.current = false)}
+                        onChange={(e) => seekMusic(Number(e.target.value))}
+                        className="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--primary-400)]"
+                      />
+                      <span className="shrink-0 text-[10px] tabular-nums text-text-2">
+                        {fmt(musicProgress.cur)} / {fmt(musicProgress.dur)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
       </section>
@@ -456,12 +624,27 @@ export function StoryPanel() {
           </label>
           <label className="flex items-center gap-3">
             <span className="shrink-0 text-xs text-text-muted">参考角色卡（可选，台词风格贴合人设）</span>
-            <select value={draftCardId} onChange={(e) => setDraftCardId(e.target.value)} className="min-w-0 flex-1 rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-sm text-text outline-none focus:border-[var(--primary-400)]">
-              <option value="">不参考</option>
-              {cards.map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
+            <SelectMenu
+              value={draftCardId}
+              onChange={setDraftCardId}
+              options={[
+                { value: '', label: '不参考' },
+                ...cards.map((c) => ({ value: c.id, label: c.name })),
+              ]}
+              className="min-w-0 flex-1"
+            />
+          </label>
+          <label className="flex items-center gap-3">
+            <span className="shrink-0 text-xs text-text-muted">情绪词表来源（emotion 值域）</span>
+            <SelectMenu
+              value={draftSpriteSetId}
+              onChange={setDraftSpriteSetId}
+              options={[
+                { value: '', label: '跟随参考角色卡绑定' },
+                ...(sprites ?? []).map((s) => ({ value: s.id, label: s.name })),
+              ]}
+              className="min-w-0 flex-1"
+            />
           </label>
           <button
             onClick={() => void handleGenerateDraft()}
@@ -519,27 +702,42 @@ export function StoryPanel() {
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
             <span className="mb-1 block text-xs text-text-muted">剧本</span>
-            <select value={scriptId} onChange={(e) => setScriptId(e.target.value)} className="w-full rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-sm text-text outline-none focus:border-[var(--primary-400)]">
-              {(scripts ?? []).map((s) => (
-                <option key={s.id} value={s.id}>{s.title}</option>
-              ))}
-            </select>
+            <SelectMenu
+              value={scriptId}
+              onChange={setScriptId}
+              options={(scripts ?? []).map((s) => ({ value: s.id, label: s.title }))}
+              className="w-full"
+            />
           </label>
           <label className="block">
             <span className="mb-1 block text-xs text-text-muted">角色卡</span>
-            <select value={cardId} onChange={(e) => setCardId(e.target.value)} className="w-full rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-sm text-text outline-none focus:border-[var(--primary-400)]">
-              {cards.map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
+            <SelectMenu
+              value={cardId}
+              onChange={setCardId}
+              options={cards.map((c) => ({ value: c.id, label: c.name }))}
+              className="w-full"
+            />
           </label>
           <label className="block">
             <span className="mb-1 block text-xs text-text-muted">2D 立绘集（必选）</span>
-            <select value={spriteId} onChange={(e) => setSpriteId(e.target.value)} className="w-full rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-sm text-text outline-none focus:border-[var(--primary-400)]">
-              {(sprites ?? []).map((s) => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
-            </select>
+            <SelectMenu
+              value={spriteId}
+              onChange={setSpriteId}
+              options={(sprites ?? []).map((s) => ({ value: s.id, label: s.name }))}
+              className="w-full"
+            />
+            {/* 开演前一致性提示（P1，不阻塞）：剧本创作词表与本次演出词表不同 → 事件情绪可能降级 */}
+            {(() => {
+              const script = scripts?.find((s) => s.id === scriptId)
+              if (!script?.spriteSetId || !spriteId || script.spriteSetId === spriteId) return null
+              const boundName = sprites?.find((s) => s.id === script.spriteSetId)?.name ?? script.spriteSetId
+              const perfName = sprites?.find((s) => s.id === spriteId)?.name ?? spriteId
+              return (
+                <span className="mt-1.5 block rounded-[var(--radius-md)] border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-amber-500">
+                  剧本按「{boundName}」的词表创作，本次演出用「{perfName}」——事件中不在演出词表内的情绪将降级为默认图。仍可演出（换皮重演属合法玩法）。
+                </span>
+              )
+            })()}
           </label>
           <div>
             <span className="mb-1 block text-xs text-text-muted">语音（本地声库，与角色卡声音模块无关）</span>
@@ -552,27 +750,35 @@ export function StoryPanel() {
               </button>
               {voiceEnabled && (
                 <>
-                  <select value={voiceModelId} onChange={(e) => setVoiceModelId(e.target.value)} className="min-w-0 flex-1 rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-xs text-text outline-none focus:border-[var(--primary-400)]">
-                    {ttsModels.map((m) => (
-                      <option key={m.id} value={m.id}>{m.name || m.characterName}</option>
-                    ))}
-                  </select>
-                  <select value={voiceLang} onChange={(e) => setVoiceLang(e.target.value as 'zh' | 'ja')} className="rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-xs text-text outline-none focus:border-[var(--primary-400)]">
-                    <option value="zh">中文</option>
-                    <option value="ja">日文</option>
-                  </select>
+                  <SelectMenu
+                    value={voiceModelId}
+                    onChange={setVoiceModelId}
+                    options={ttsModels.map((m) => ({ value: m.id, label: m.name || m.characterName }))}
+                    className="min-w-0 flex-1"
+                  />
+                  <SelectMenu
+                    value={voiceLang}
+                    onChange={(v) => setVoiceLang(v as 'zh' | 'ja')}
+                    options={[
+                      { value: 'zh', label: '中文' },
+                      { value: 'ja', label: '日文' },
+                    ]}
+                  />
                 </>
               )}
             </div>
           </div>
           <label className="block">
             <span className="mb-1 block text-xs text-text-muted">覆盖背景（可选，本次演出强制使用）</span>
-            <select value={backgroundOverride} onChange={(e) => setBackgroundOverride(e.target.value)} className="w-full rounded-[var(--radius-md)] border border-border bg-transparent px-2 py-1.5 text-sm text-text outline-none focus:border-[var(--primary-400)]">
-              <option value="">不覆盖（跟随剧本指令）</option>
-              {backgrounds.map((name) => (
-                <option key={name} value={`user:${name}`}>{name}</option>
-              ))}
-            </select>
+            <SelectMenu
+              value={backgroundOverride}
+              onChange={setBackgroundOverride}
+              options={[
+                { value: '', label: '不覆盖（跟随剧本指令）' },
+                ...backgrounds.map((name) => ({ value: `user:${name}`, label: name })),
+              ]}
+              className="w-full"
+            />
           </label>
         </div>
         <button

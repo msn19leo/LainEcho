@@ -8,15 +8,17 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { windowManager } from '../windows/windowManager'
-import { createEditorWindow, getEditorScriptId } from '../windows/editorWindow'
+import { createEditorWindow, getEditorScriptId, getEditorWindow } from '../windows/editorWindow'
 import { exportScriptToZip, importFromDir, importFromZip, listScripts, loadBundleFromDir, removeScript } from '../services/storyEngine/loader'
-import { validateChapter, validateMeta } from '../services/storyEngine/schema'
+import { validateChapter, validateMeta, STANDARD_EMOTIONS } from '../services/storyEngine/schema'
 import { deleteRun, getRun, listRuns } from '../services/storyEngine/runs'
 import { listBackgrounds, removeBackground, uploadBackgrounds } from '../services/storyEngine/backgrounds'
+import { listMusics, removeMusic, uploadMusics } from '../services/storyEngine/musics'
 import { generateStoryDraft, importStoryDraft } from '../services/storyEngine/draft'
 import { getStorySnapshot, resendStoryState, respondStory, setRunSpriteView, startStory, stopStory } from '../services/storyEngine/engine'
+import { consolidateStoryMemory } from '../services/storyEngine/storyMemory'
 import { getGenieConfig, synthesizeGenie } from '../services/genieTts'
-import { getTTSModel, genId } from '../services/repository'
+import { getSpritePalette, getTTSModel, genId, paletteHash } from '../services/repository'
 import { paths } from '../services/storage'
 import type { StoryResponse } from '../../src/types'
 
@@ -202,10 +204,45 @@ export function registerStoryIpc(): void {
     }
   })
 
+  // ---------------- 音乐库（与背景库同模式：上传/列表/删除，music 事件以 user:文件名 引用） ----------------
+
+  ipcMain.handle('story:list-musics', () => listMusics())
+
+  ipcMain.handle('story:upload-musics', async () => {
+    try {
+      const options = {
+        title: '导入音乐',
+        filters: [{ name: '音频', extensions: ['mp3', 'ogg', 'wav', 'flac', 'm4a'] }],
+        properties: ['openFile', 'multiSelections'] as Array<'openFile' | 'multiSelections'>,
+      }
+      const picked = await dialog.showOpenDialog(options)
+      if (picked.canceled || picked.filePaths.length === 0) return { ok: true, added: [] }
+      const added = await uploadMusics(picked.filePaths)
+      return { ok: true, added }
+    } catch (err) {
+      console.warn('[story] 音乐导入失败：', err instanceof Error ? err.message : err)
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('story:remove-music', async (_e, name: string) => {
+    try {
+      if (typeof name !== 'string' || !name) return { ok: false, error: '非法音乐文件名' }
+      await removeMusic(name)
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
   // ---------------- AI 辅助写剧本（设计文档 7.4：生成草稿 → 校验 → 手动导入） ----------------
 
-  ipcMain.handle('story:generate-draft', async (_e, params: { premise: string; cardId?: string | null }) => {
-    return generateStoryDraft({ premise: String(params?.premise ?? ''), cardId: params?.cardId ?? null })
+  ipcMain.handle('story:generate-draft', async (_e, params: { premise: string; cardId?: string | null; spriteSetId?: string | null }) => {
+    return generateStoryDraft({
+      premise: String(params?.premise ?? ''),
+      cardId: params?.cardId ?? null,
+      spriteSetId: params?.spriteSetId ?? null,
+    })
   })
 
   ipcMain.handle('story:import-draft', async (_e, draft: string) => {
@@ -227,6 +264,45 @@ export function registerStoryIpc(): void {
     if (typeof scriptId !== 'string' || !SAFE_ID.test(scriptId)) return { ok: false, error: '非法剧本 ID' }
     createEditorWindow(scriptId)
     return { ok: true }
+  })
+
+  /** 剧本素材扩展名白名单（图片/音频，供编辑器资产清单与导入校验） */
+  const EDITOR_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'])
+  const EDITOR_AUDIO_EXTS = new Set(['.mp3', '.ogg', '.wav', '.flac', '.m4a'])
+
+  /** 递归收集剧本目录内的图片/音频素材（相对路径，/ 分隔，供编辑器下拉选择） */
+  async function collectScriptAssets(dir: string): Promise<{ images: string[]; musics: string[] }> {
+    const images: string[] = []
+    const musics: string[] = []
+    const walk = async (rel: string): Promise<void> => {
+      const entries = await fs.readdir(path.join(dir, rel), { withFileTypes: true }).catch(() => [] as import('fs').Dirent[])
+      for (const e of entries) {
+        const relPath = rel ? `${rel}/${e.name}` : e.name
+        if (e.isDirectory()) {
+          await walk(relPath)
+          continue
+        }
+        const ext = path.extname(e.name).toLowerCase()
+        if (EDITOR_IMAGE_EXTS.has(ext)) images.push(relPath)
+        else if (EDITOR_AUDIO_EXTS.has(ext)) musics.push(relPath)
+      }
+    }
+    await walk('')
+    return { images: images.sort(), musics: musics.sort() }
+  }
+
+  /** 编辑器资产清单：剧本内图片/音乐 + 用户背景库/音乐库（背景与音乐事件下拉选择用，user: 引用） */
+  ipcMain.handle('story:editor-assets', async (_e, scriptId: string) => {
+    try {
+      if (typeof scriptId !== 'string' || !SAFE_ID.test(scriptId)) return { ok: false, error: '非法剧本 ID' }
+      const dir = path.join(paths.storiesDir, scriptId)
+      const { images, musics } = await collectScriptAssets(dir)
+      const [userBackgrounds, userMusics] = await Promise.all([listBackgrounds(), listMusics()])
+      return { ok: true, images, musics, userBackgrounds, userMusics }
+    } catch (err) {
+      console.warn('[story] 编辑器素材清单读取失败：', err instanceof Error ? err.message : err)
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
   })
 
   /** 新增剧本（7.6）：生成骨架剧本（元信息 + 起始章节含两个引导事件）后直接进编辑器编辑 */
@@ -285,6 +361,22 @@ export function registerStoryIpc(): void {
         }
       }))
       const metaRaw = storyYaml ? (parseYaml(storyYaml) as Record<string, unknown> | null) : null
+      // 创作词表：绑定立绘集的词表词（情绪下拉动态化）；未绑定/未启用词表时为 null（编辑器退回旧 6 枚举）
+      const boundSpriteSetId = typeof metaRaw?.['spriteSetId'] === 'string' ? metaRaw['spriteSetId'] : null
+      const palette = await getSpritePalette(boundSpriteSetId)
+      // 词表变化检测：story.yaml 记录的 vocabHash 与当前词表指纹不一致 = 绑定后词表被编辑过
+      const storedHash = typeof metaRaw?.['vocabHash'] === 'string' ? metaRaw['vocabHash'] : null
+      const currentHash = paletteHash(palette)
+      const paletteChanged = !!palette && !!storedHash && !!currentHash && currentHash !== storedHash
+      // 未知情绪词盘点：事件引用但不在当前值域（绑定=词表词；未绑定=旧 6 枚举）的词，去重
+      const refWords = new Set<string>(palette ? palette.entries.map((e) => e.name) : (STANDARD_EMOTIONS as readonly string[]))
+      const staleWords = new Set<string>()
+      for (const ch of bundle?.chapters ?? []) {
+        for (const ev of ch.def.events) {
+          const w = (ev as unknown as Record<string, unknown>)['emotion']
+          if (typeof w === 'string' && w.trim() && !refWords.has(w.trim())) staleWords.add(w.trim())
+        }
+      }
       return {
         ok: true,
         errors,
@@ -296,8 +388,15 @@ export function registerStoryIpc(): void {
           summary: typeof metaRaw['summary'] === 'string' ? metaRaw['summary'] : '',
           startChapter: String(metaRaw['startChapter'] ?? chapterFiles[0]?.replace(/\.yaml$/, '') ?? ''),
           characterCardId: typeof (metaRaw['characters'] as Array<{ cardId?: string }> | undefined)?.[0]?.cardId === 'string' ? (metaRaw['characters'] as Array<{ cardId?: string }>)[0]!.cardId! : null,
+          spriteSetId: boundSpriteSetId,
+          emotionWords: palette ? palette.entries.map((e) => e.name) : null,
+          paletteDefault: palette ? palette.defaultEmotion : null,
+          paletteChanged,
+          staleWords: [...staleWords],
           /** 手写剧本默认只读（7.6 定案）：仅当 story.yaml 带 editedVia: form 时允许表单写回 */
           editedVia: metaRaw['editedVia'] === 'form',
+          /** AI 背景联动开关（7.3）：默认关闭，编辑器表单可勾选 */
+          aiBackground: metaRaw['aiBackground'] === true,
         } : null,
         chapters,
       }
@@ -341,9 +440,17 @@ export function registerStoryIpc(): void {
         }
         const summary = String(meta['summary'] ?? '').trim()
         if (summary) metaRaw['summary'] = summary
+        if (meta['aiBackground'] === true) metaRaw['aiBackground'] = true
         if (typeof meta['characterCardId'] === 'string' && meta['characterCardId']) {
           metaRaw['characters'] = [{ cardId: meta['characterCardId'] }]
         }
+        // 创作词表来源：null/空 = 未绑定（不写字段，保持 story.yaml 简洁）
+        const spriteSetId = String(meta['spriteSetId'] ?? '').trim()
+        if (spriteSetId) metaRaw['spriteSetId'] = spriteSetId
+        // 词表指纹：绑定词表时记录当前内容 hash（下次打开剧本比对检测"词表已变"）；未绑定不写
+        const boundPalette = await getSpritePalette(spriteSetId || null)
+        const vocabHash = paletteHash(boundPalette)
+        if (vocabHash) metaRaw['vocabHash'] = vocabHash
         const metaCheck = validateMeta(metaRaw, 'story.yaml')
         errors.push(...metaCheck.errors)
 
@@ -414,6 +521,16 @@ export function registerStoryIpc(): void {
       console.warn('[story] 编辑器保存失败：', err instanceof Error ? err.message : err)
       return bad(err instanceof Error ? err.message : String(err))
     }
+  })
+
+  // ---------------- 剧情记忆沉淀（戏内延续：把演出经历沉淀为陪伴记忆） ----------------
+
+  /** 手动兜底沉淀：从上次沉淀游标到存档末尾提取一条记忆摘要写入待确认候选（剧情窗完结屏按钮）。
+   *  同步等待结果以便前端提示；manual 绕过「自动沉淀记忆」开关（明确意图始终执行）；
+   *  引擎钩子（章节切换/完结）不走此通道，受开关控制 */
+  ipcMain.handle('story:consolidate-memory', async (_e, runId: string) => {
+    if (typeof runId !== 'string' || !runId) return { ok: false, error: '缺少存档 ID' }
+    return consolidateStoryMemory(runId, { manual: true })
   })
 
   // ---------------- 剧情 TTS（本地 Genie 声库，与角色卡声音模块解耦） ----------------

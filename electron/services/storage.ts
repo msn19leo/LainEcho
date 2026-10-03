@@ -129,6 +129,10 @@ export const paths = {
   get storyBackgroundsDir() {
     return path.join(getRootDir(), 'data', 'story-backgrounds')
   },
+  /** 剧情音乐库目录（用户上传的音频；剧本 music 事件以 user:文件名 引用） */
+  get storyMusicsDir() {
+    return path.join(getRootDir(), 'data', 'story-music')
+  },
   get modelsDir() {
     return path.join(getRootDir(), 'models')
   },
@@ -161,7 +165,7 @@ export const paths = {
   get memoryVectorsFile() {
     return path.join(this.dataDir, 'memory-vectors.json')
   },
-  /** 记忆分层压缩产物（用户画像 + 编年史，按角色隔离），由 profile 维护 */
+  /** 记忆分层压缩产物（用户画像，按角色隔离），由 profile 维护 */
   get memoryProfileFile() {
     return path.join(this.dataDir, 'memory-profile.json')
   },
@@ -204,6 +208,10 @@ export const paths = {
   /** 立绘集索引文件 */
   get spritesIndexFile() {
     return path.join(this.spritesDir, 'index.json')
+  },
+  /** Live2D 模型演出词表文件（modelId → { entries, defaultEmotion }，与立绘集词表双轨对等） */
+  get modelPalettesFile() {
+    return path.join(this.dataDir, 'model-palettes.json')
   },
   /** TTS 模型卡索引文件 */
   get ttsModelsIndexFile() {
@@ -256,6 +264,7 @@ export async function ensureDataDirs() {
     ensureDir(paths.storiesDir),
     ensureDir(paths.storyRunsDir),
     ensureDir(paths.storyBackgroundsDir),
+    ensureDir(paths.storyMusicsDir),
     ensureDir(paths.modelsDir),
     ensureDir(paths.coreDir),
     ensureDir(paths.voicesDir),

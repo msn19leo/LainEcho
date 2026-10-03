@@ -1,18 +1,17 @@
 /**
  * 剧本 schema 校验（纯函数，零 Electron 依赖）。
  *
- * 一期 12 种事件（源自 LingChat schema 裁剪）：background / music / modify_character /
+ * 一期 12 种事件：background / music / modify_character /
  * narration / player / dialogue / ai_dialogue / free_dialogue / choices / input / set_var / chapter_end。
  * 导入时全量校验并逐条报出（文件 + 原因），不抛异常——错误集中返回供 UI 展示。
  *
  * 注：设计文档原计划用 zod；为避免新增依赖改为手写校验器，产出物（校验报告结构）不变。
  * 条件求值器支持：裸变量真值 / == / != / >= / <= / > / <，以及 &&（全部满足）/ ||（任一满足）组合——
- * 吸取 LingChat "hp >= 5 静默恒假"的教训，凡无法解析的条件一律导入期明确报错，绝不静默跳过。
+ * 吸取 "hp >= 5 静默恒假"的教训，凡无法解析的条件一律导入期明确报错，绝不静默跳过。
  */
 import type {
   ScriptChapterDef,
   ScriptMeta,
-  StandardEmotion,
   StoryAction,
   StoryAiJudge,
   StoryChapterBranch,
@@ -21,6 +20,7 @@ import type {
   StoryEvent,
 } from '../../../src/types'
 
+/** 旧 6 标准情绪（保留词集）：词表方案下仍合法的历史值，导入校验只要求非空字符串 */
 export const STANDARD_EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy'] as const
 
 /** 校验错误（file = 剧本包内相对路径） */
@@ -50,14 +50,18 @@ function asString(v: unknown): string | null {
   return typeof v === 'string' && v.trim() ? v : null
 }
 
-/** 校验 emotion 字段（必须是 6 标准情绪之一；缺省合法） */
+/**
+ * 校验 emotion 字段（词表方案）：只需是非空字符串。
+ * 值域 = 剧本绑定立绘集的词表（编辑器下拉动态生成，从源头防拼错）；导入外部剧本遇到未知词时
+ * 不再硬拦（运行时归一化链会降级到默认情绪，比阻断导入更稳）。缺省合法。
+ */
 function checkEmotion(raw: Unknown, file: string, index: number, errors: SchemaIssue[], field = 'emotion'): void {
   const v = raw[field]
   if (v === undefined) return
-  if (typeof v === 'string' && (STANDARD_EMOTIONS as readonly string[]).includes(v)) return
+  if (typeof v === 'string' && v.trim()) return
   errors.push({
     file,
-    message: `事件 #${index + 1}：${field} 必须是 ${STANDARD_EMOTIONS.join(' / ')} 之一，实际为「${String(v)}」`,
+    message: `事件 #${index + 1}：${field} 必须是非空字符串（情绪词，来自剧本绑定立绘集的词表），实际为「${String(v)}」`,
   })
 }
 
@@ -171,7 +175,7 @@ function checkClauseObject(c: unknown, prefix: string, file: string, errors: Sch
   }
   const op = c['op']
   if (op !== undefined && !(CONDITION_OPS as readonly string[]).includes(String(op))) {
-    // LingChat 教训：不认识的运算符会静默恒假，必须导入期报错
+    // 教训：不认识的运算符会静默恒假，必须导入期报错
     errors.push({
       file,
       message: `${prefix}.op 仅支持 ${CONDITION_OPS.join(' / ')}，实际为「${String(op)}」`,
@@ -270,7 +274,7 @@ export function validateEvent(raw: unknown, file: string, index: number, errors:
         return null
       }
       checkEmotion(ev, file, index, errors)
-      out = { type, emotion: String(ev['emotion']) as StoryEvent extends never ? never : import('../../../src/types').StandardEmotion }
+      out = { type, emotion: String(ev['emotion']) }
       break
     }
     case 'narration':
@@ -292,7 +296,7 @@ export function validateEvent(raw: unknown, file: string, index: number, errors:
         type,
         character: asString(ev['character']) ?? undefined,
         text: String(ev['text']),
-        emotion: typeof ev['emotion'] === 'string' ? (ev['emotion'] as StandardEmotion) : undefined,
+        emotion: typeof ev['emotion'] === 'string' ? ev['emotion'] : undefined,
       }
       break
     }
@@ -445,6 +449,12 @@ export function validateMeta(raw: unknown, file: string): SchemaResult<ScriptMet
       errors.push({ file, message: 'characters 必须是数组（一期单角色）' })
     }
   }
+  // AI 背景联动开关（7.3）：默认关闭——仅作者显式 aiBackground: true 时允许 AI 自行切背景
+  const aiBackground = raw['aiBackground'] === true
+  // 创作词表来源（情绪词表方案）：可选，指向立绘集 id；编辑器情绪下拉按该集词表生成
+  const spriteSetId = asString(raw['spriteSetId']) ?? undefined
+  // 词表内容指纹（表单保存时写入）：可选，仅用于打开剧本时检测词表已变，不参与结构校验
+  const vocabHash = asString(raw['vocabHash']) ?? undefined
   if (errors.length > 0) return { value: null, errors }
   return {
     value: {
@@ -453,8 +463,11 @@ export function validateMeta(raw: unknown, file: string): SchemaResult<ScriptMet
       summary: asString(raw['summary']) ?? undefined,
       cover: asString(raw['cover']) ?? undefined,
       characters: characterCardId ? [{ cardId: characterCardId }] : undefined,
+      spriteSetId,
+      vocabHash,
       startChapter: startChapter!,
       version: typeof version === 'number' ? version : 1,
+      aiBackground,
     },
     errors,
   }

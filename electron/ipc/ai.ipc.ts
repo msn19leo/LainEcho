@@ -62,7 +62,7 @@ export function registerAiIpc(): void {
       const lastUserText = [...session.messages].reverse().find((m) => m.role === 'user')?.content ?? ''
       const retrieval = await retrieveMemories(session.characterCardId, lastUserText, MAX_MEMORIES)
       const composed = composeSystemPrompt(
-        buildSystemParts(card, retrieval.items, retrieval.profileDigest, settings.enableProactive),
+        buildSystemParts(card, retrieval.items, retrieval.profileDigest, settings.enableProactive, null, settings.stripParenNarration),
         { userName: settings.userName },
       )
       return { ok: true, mode: retrieval.mode, memoryCount: retrieval.items.length, text: composed.text, sections: composed.sections }
