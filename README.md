@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="build/icon.png" width="120" height="120" alt="LainEcho">
+<img src="build/icon.png" width="140" height="140" alt="LainEcho">
 
 # LainEcho
 
