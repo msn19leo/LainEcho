@@ -195,6 +195,10 @@ export const paths = {
   get visionApiKeyFile() {
     return path.join(this.secureDir, 'visionApiKey.enc')
   },
+  /** 翻译/修复辅助模型 API Key 加密存储文件（独立配置，留空回落主 LLM Key） */
+  get translationApiKeyFile() {
+    return path.join(this.secureDir, 'translationApiKey.enc')
+  },
   /** 主动搭话调度状态（兴趣值/当日计数，重启不丢） */
   get proactiveStateFile() {
     return path.join(this.dataDir, 'proactive-state.json')

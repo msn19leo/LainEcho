@@ -25,7 +25,7 @@ import { useLayoutEffect, type DependencyList, type RefObject } from 'react'
  */
 export function useAutoScrollBottom(
   scrollRef: RefObject<HTMLElement | null>,
-  contentRef: RefObject<HTMLElement | null>,
+  contentRef: RefObject<HTMLDivElement | null>,
   enabledRef: RefObject<boolean>,
   deps: DependencyList = [],
 ): void {
@@ -44,4 +44,30 @@ export function useAutoScrollBottom(
     return () => ro.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollRef, contentRef, ...deps])
+}
+
+/**
+ * 在"用户临时展开/收起某元素"（如宠物窗旁白气泡点开看全文）时抑制自动滚底：
+ * 记录当前滚动位置 → 置 false 暂停跟随 → 高度变化稳定后恢复位置并**恢复进入前**
+ * 的跟随状态。不再无条件恢复 true：跟随现在可能因"用户上翻"而关闭（PetContentList
+ * 上翻暂停），pin 结束时若用户仍在上翻位置，恢复 true 会让下一次高度增长把列表
+ * 拉到底部、丢掉阅读位置。
+ * @param restoreAfterMs 高度稳定后恢复锚点的等待时间（默认 120ms，覆盖一两帧布局）
+ */
+export function createScrollPin(
+  enabledRef: RefObject<boolean>,
+  scrollRef: RefObject<HTMLElement | null>,
+  restoreAfterMs = 120,
+): () => void {
+  return () => {
+    const el = scrollRef.current
+    if (!el) return
+    const anchor = el.scrollTop
+    const wasFollowing = enabledRef.current
+    enabledRef.current = false
+    window.setTimeout(() => {
+      el.scrollTop = anchor
+      enabledRef.current = wasFollowing
+    }, restoreAfterMs)
+  }
 }

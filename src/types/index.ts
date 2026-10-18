@@ -18,6 +18,22 @@ export interface DialogueChunk {
   text: string
   /** 情绪词：词表方案的自由词，历史数据可能是旧 6 枚举 */
   emotion: string
+  /**
+   * 段落类型（多气泡渲染与语音门控用，缺省 = 按文本是否被（）包裹推断）：
+   * - 'speak'：角色真正说出口的台词 → 渲染为台词气泡、进 TTS；
+   * - 'narr'：心理/动作/环境描写 → 渲染为旁白气泡（自动补（））、零时长上屏不朗读。
+   */
+  kind?: 'speak' | 'narr'
+}
+
+/**
+ * 推断单个 dialogue 段的类型：kind 字段权威；缺省时按"是否被（）/()包裹"推断（旧消息与
+ * 模型漏写 kind 的兜底，行为与旧版括号剥除链一致）。
+ */
+export function inferChunkKind(chunk: { text: string; kind?: 'speak' | 'narr' }): 'speak' | 'narr' {
+  if (chunk.kind === 'speak' || chunk.kind === 'narr') return chunk.kind
+  const t = (chunk.text ?? '').trim()
+  return /^[（(]/.test(t) ? 'narr' : 'speak'
 }
 
 /** 单条聊天消息（落盘到 sessions/{id}.json 的 messages 数组） */
@@ -360,6 +376,8 @@ export interface SessionDetail {
   id: string
   characterCardId: string
   messages: ChatMessage[]
+  /** 情景摘要缓存（Phase 1）：本会话"此刻"的场景状态（对话层，辅助模型逐轮增量更新），注入【当前情景】Section */
+  sceneDigest?: string
 }
 
 /** 主题模式：dark / light / system（跟随系统 prefers-color-scheme） */
@@ -393,9 +411,9 @@ export interface AppSettings {
   proactiveLlmNarration: boolean
   /** 免打扰时段（'HH:MM' 24 小时制；start/end 任一为空 = 不启用；支持跨零点，如 23:00-08:00） */
   quietHours: { start: string; end: string }
-  /** 屏幕感知视觉模型 API 地址（OpenAI 兼容 chat/completions，支持图片输入；独立配置） */
+  /** 视觉模型 API 地址（屏幕感知/立绘打标共用；OpenAI 兼容 chat/completions，需支持图片输入；独立必填不回落主模型） */
   visionBaseURL: string
-  /** 屏幕感知视觉模型名（Key 走独立加密存储，不随 settings 明文保存） */
+  /** 视觉模型名（Key 走独立加密存储，不随 settings 明文保存；未配置时屏幕感知降级普通话题、打标不可用） */
   visionModel: string
   /** 是否启用记忆向量检索（按当前对话语义检索相关记忆注入；关闭或未配置嵌入模型时回退「最近 N 条」） */
   memoryRetrievalEnabled: boolean
@@ -403,12 +421,38 @@ export interface AppSettings {
   embeddingBaseURL: string
   /** 嵌入模型名（对应 embeddingBaseURL 的服务商；Key 走独立加密存储，不随 settings 明文保存） */
   embeddingModel: string
+  /**
+   * 翻译/修复辅助模型 API 地址（留空回落主对话模型 baseURL）：ja 翻译与 JSON 结构修复是
+   * 机械型小任务，建议配置非思考的快速小模型，把首声关键路径上的这两次串行调用压到秒级
+   */
+  translationBaseURL: string
+  /** 翻译/修复辅助模型名（留空回落主对话模型；Key 走独立加密存储，为空回落主 LLM Key） */
+  translationModel: string
+  /**
+   * AI 时间感知总开关：开启时向模型发送当前真实时间锚点、对话间隔标注、记忆年龄标注与
+   * 摘要时间线；关闭时不发送任何时间信息，改为注入防幻觉条款（模型无时钟，纯静默会乱猜）
+   */
+  timeAwarenessEnabled: boolean
+  /**
+   * 语音文本跟随语音逐字显示（默认开）：开启时台词文本按音频实际播放进度逐字放行；
+   * 关闭时台词文本在语音开播时整块解锁、按「文字显示速度」的打字机速度输出
+   * （可能快于语音播完）。旁白无音频可跟随，恒按文字显示速度输出；剧情系统不受影响
+   */
+  voiceTextFollowAudio: boolean
+  /**
+   * 情景摘要缓存（默认开）：每轮结束后由辅助模型异步更新"此刻场景状态"（用户活动/角色状态/
+   * 场景氛围），下一轮注入【当前情景】Section——消除长上下文中旁白/台词与当前场景错位。
+   * 同时注入系统层活跃状态（powerMonitor 空闲检测）；剧情系统不参与
+   */
+  enableSceneDigest: boolean
   /** 语义去重相似度阈值（0-1，cos ≥ 该值的候选记忆视为重复；默认 0.92） */
   memoryDedupThreshold: number
   /** 你的称呼（%player% 占位符在人设/示例对话中的替换值，默认「用户」） */
   userName: string
-  /** 文字显示速度（0-100 速度档，越大越快；参考 默认 80；0 = 即时显示，不逐字） */
+  /** 文字显示速度（0-100 速度档，越大越快；参考 默认 80；0 = 即时显示，不逐字）——桌宠/聊天窗用 */
   textSpeed: number
+  /** 剧情窗对话框文字显示速度（0-100，独立于通用 textSpeed，仅剧情系统读取） */
+  storyTextSpeed: number
 }
 
 /** Live2D 模型元信息（models/index.json） */
@@ -715,15 +759,50 @@ export interface StreamUserPayload {
   meta?: ChatMessageMeta | null
 }
 
+// ================= 方案A：主进程回合文档 + 幂等快照协议 =================
+// 设计文档：docs/方案A-主进程回合文档与幂等快照协议.md
+// 主进程是文档唯一写者；渲染端"整体替换最近一次快照"，幂等无时序竞态。
+
+/** 回合文档中一个底稿分段（显示/语音/定型的唯一来源） */
+export interface TurnSegment {
+  id: number
+  text: string
+  kind: 'speak' | 'narr'
+  emotion: string
+  /** 语音进度：closed=已交付未播；speaking=播放中；spoken=已播完（宠物窗上行回报） */
+  state: 'closed' | 'speaking' | 'spoken'
+}
+
+/** 回合阶段：generating=LLM 生成中；reading=文本已落盘、语音跟读中；done=全部结束 */
+export type TurnPhase = 'generating' | 'reading' | 'done'
+
 /**
- * AI 流式"开头括号旁白前置"事件负载（ai:stream-narration，仅语音跟读模式广播）：
- * 回答最前面的连续括号旁白在流式阶段即时上屏，不等语音；台词仍段随语音。
+ * 主进程回合文档（每轮回答的唯一状态）。
+ * 单写者：仅主进程 TurnCoordinator 修改；segments 正常流式只增不减，
+ * 空回复重试轮以新 turnId 整体重建（旧快照凭 turnId 失效）。
  */
-export interface StreamNarrationPayload {
-  /** 重试轮重置：渲染端清空已前置旁白，等待重新增量接收 */
-  reset?: boolean
-  /** 增量旁白文本（已闭合括号组原文，逐段追加） */
-  delta?: string
+export interface TurnDocument {
+  turnId: string
+  sessionId: string
+  phase: TurnPhase
+  /** 本轮用户消息（认领补气泡的权威源；user 消息回合结束才落盘，中途开窗靠它） */
+  user: { content: string; timestamp: number; meta: ChatMessageMeta | null }
+  segments: TurnSegment[]
+  /** 流式中已写出的最后一段的未闭合部分（打字机尾部预览；定型时并入最后一段） */
+  trailing: string
+  /**
+   * 本轮是否启用语音跟读（有语音 → 文本揭示由语音进度门控：已播字符数之内的文本才显示；
+   * 无语音 → 文本随 LLM 流式直接揭示）。渲染端据此选择揭示策略，消灭"文本跑在语音前"。
+   */
+  voice: boolean
+  /** 已完播字符数（宠物窗实际播完的文本累计，单调不减；渲染端揭示下限=开窗快进） */
+  spokenChars: number
+  /** 已开播字符数（含正在播放的块，单调不减；渲染端揭示上限——文本不跑在语音前） */
+  speakingChars: number
+  /** 进入 reading 阶段的时刻（主进程看门狗用；see markReading） */
+  readingAt?: number
+  /** 落盘后的定型消息（phase=done 时必有；由 segments 映射生成） */
+  final?: ChatMessage
 }
 
 /**
@@ -1136,6 +1215,20 @@ export interface StoryExportResult {
   error?: string
 }
 
+/** 日志来源标签（主进程 = main；渲染端 = 窗口名） */
+export type LogEntrySource = 'main' | 'chat' | 'pet' | 'settings' | 'story' | 'editor'
+/** 日志级别（debug 归入 info） */
+export type LogEntryLevel = 'info' | 'warn' | 'error'
+/** 结构化日志条目（内存缓冲 / 实时推送 / 历史文件解析的统一形态） */
+export interface LogEntry {
+  /** 毫秒时间戳 */
+  ts: number
+  level: LogEntryLevel
+  source: LogEntrySource
+  /** 格式化后的完整消息（可能含多行） */
+  msg: string
+}
+
 /**
  * preload.ts 暴露到 window.api 的白名单 API 契约。
  * 渲染进程只能调用这里声明的能力，不做通配符透传。
@@ -1144,19 +1237,40 @@ export interface WindowApi {
   ai: {
     /** 发送消息；主进程组装 system prompt（人设+记忆）、发起流式请求、持久化 */
     sendMessage: (params: { sessionId: string; messages: ChatMessage[] }) => Promise<ChatMessage>
-    /** 订阅流式 token 片段，返回取消订阅函数 */
-    onStreamChunk: (cb: (chunk: string) => void) => () => void
-    /** 订阅"开头括号旁白前置"流（语音跟读模式下旁白流式即时上屏，不等语音） */
-    onStreamNarration: (cb: (payload: StreamNarrationPayload) => void) => () => void
+    /**
+     * 消息重答：删除最后一轮（user+assistant）后重跑正常聊天链路。
+     * editText 非空 = 编辑并重发（用编辑后文本）；为空 = 重新回答（原 user 内容）。
+     * 轮次进行中（LLM/持久化阶段）由主进程 busy 标志拒绝。
+     */
+    regenerate: (params: { sessionId: string; editText?: string }) => Promise<ChatMessage>
+    /** 订阅会话截断广播（重答删除最后一轮后）：两窗用磁盘最新消息列表替换本地（旧轮气泡消失） */
+    onSessionRewound: (cb: (payload: { sessionId: string; messages: ChatMessage[] }) => void) => () => void
     onStreamDone: (cb: (payload: StreamDonePayload) => void) => () => void
     onStreamError: (cb: (payload: StreamErrorPayload) => void) => () => void
     /** 订阅主进程广播的用户消息（跟随窗口即时补上用户气泡，无需等 stream-done 全量拉取） */
     onStreamUser: (cb: (payload: StreamUserPayload) => void) => () => void
-    /** 订阅"进行中的流"会话 id 补发（窗口重载/就绪后，用于认领漏掉的当前会话；null 表示无流） */
-    onActiveSession: (cb: (sessionId: string | null) => void) => () => void
     /** 取消当前流式请求 */
     cancel: () => void
-    testConnection: () => Promise<TestConnectionResult>
+    /** ===== 方案A快照协议 ===== */
+    /** 拉取当前回合文档快照（请求-响应原子读；无进行中/刚结束的文档返回 null。幂等） */
+    getTurnSnapshot: () => Promise<TurnDocument | null>
+    /** 订阅回合文档全量快照广播（30ms 节流；渲染端整体替换，turnId 旧于本地则丢弃） */
+    onTurnState: (cb: (doc: TurnDocument) => void) => () => void
+    /** 订阅回合终态（phase=done 含 final；不节流立即送达） */
+    onTurnDone: (cb: (doc: TurnDocument) => void) => () => void
+    /**
+     * 上报语音进度（字符口径，方案A主门控）：宠物窗每消费一个槽位（播放中/播完/displayOnly 旁白）
+     * 上行该槽位及其之前所有已消费文本的累计字符数；主进程单调取 max。与提取器变体/合音/兜底
+     * 完全解耦——语音播到哪、两窗文本就放行到哪。speaking 与 spoken 的差值 = 正在播放的块。
+     */
+    reportTurnProgress: (turnId: string, speakingChars: number, spokenChars: number) => void
+    /** 语音链工作心跳（合成/播放中周期上行）：喂 reading 看门狗——慢合成（如 Genie 翻译数分钟）
+     *  不再被"进度停滞 90s"误判为链路死亡而强制落定（2026-10-14 20:30 轮实锤） */
+    reportTurnReadingPing: (turnId: string) => void
+    /** 宠物窗上报：本轮语音/旁白槽位全部消费完（reading 收尾 → 主进程 phase=done 广播） */
+    reportTurnReadingDone: (turnId: string) => void
+    /** 测试连接（profile：main=主模型 / aux=辅助模型（未配置回落主模型）/ vision=视觉模型（独立必填不回落）） */
+    testConnection: (profile?: 'main' | 'aux' | 'vision') => Promise<TestConnectionResult>
     /** 手动压缩指定会话历史：较早对话（最近 20 条之外）生成摘要并落盘复用，返回最新上下文用量 */
     compactNow: (sessionId: string) => Promise<{ ok: boolean; error?: string; compacted?: boolean; stats?: ContextStats }>
     /** 只读查询指定会话的上下文 token 用量（不触发摘要/发送），供桌宠窗切换会话时展示 */
@@ -1212,6 +1326,10 @@ export interface WindowApi {
   session: {
     list: () => Promise<SessionIndexItem[]>
     get: (id: string) => Promise<SessionDetail>
+    /** 读取最近活跃会话的情景摘要缓存（设置窗查看/编辑；无会话返回 null） */
+    getSceneDigest: () => Promise<{ sessionId: string; title: string; digest: string } | null>
+    /** 保存指定会话的情景摘要缓存（手动编辑；空串=清空缓存） */
+    setSceneDigest: (sessionId: string, text: string) => Promise<void>
     create: (params: { characterCardId: string }) => Promise<SessionIndexItem>
     remove: (id: string) => Promise<void>
     /** 修改会话标题（Data 面板重命名） */
@@ -1261,8 +1379,8 @@ export interface WindowApi {
     onChanged: (cb: () => void) => () => void
   }
   settings: {
-    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey/hasVisionApiKey 为独立服务 Key 状态） */
-    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean; hasVisionApiKey: boolean }>
+    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey/hasVisionApiKey/hasTranslationApiKey 为独立服务 Key 状态） */
+    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean; hasVisionApiKey: boolean; hasTranslationApiKey: boolean }>
     save: (settings: Partial<AppSettings>) => Promise<void>
     saveApiKey: (key: string) => Promise<void>
     hasApiKey: () => Promise<boolean>
@@ -1274,6 +1392,10 @@ export interface WindowApi {
     saveVisionApiKey: (key: string) => Promise<void>
     /** 视觉模型 Key 是否已配置（仅回显掩码用） */
     hasVisionApiKey: () => Promise<boolean>
+    /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密落盘；为空时运行时回落主 LLM Key） */
+    saveTranslationApiKey: (key: string) => Promise<void>
+    /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用） */
+    hasTranslationApiKey: () => Promise<boolean>
     /** 获取当前数据目录信息（当前路径、默认路径、是否自定义） */
     getDataDir: () => Promise<{ current: string; default: string; isCustom: boolean }>
     /** 选择新目录并迁移数据，成功后需手动重启应用 */
@@ -1306,12 +1428,14 @@ export interface WindowApi {
     setPetCard: (payload: PetCardPayload) => void
     quit: () => void
     /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步）。
-     *  payload 携带主进程切好的合成分段（dialogue 逐项），供桌宠段级合成并联动。 */
+     *  payload 携带主进程切好的合成分段（dialogue 逐项），供桌宠段级合成并联动；
+     *  cumChars：本块播完时"回合文档"应放行的累计字符数（主进程按 segments 口径分配，
+     *  宠物窗只透传回显——门控进度与文档空间精确对齐，2026-10-14 "今天"泄漏修复） */
     speak: (
       text: string,
       voiceId: string | null,
       languageOverride?: TTSLanguage | null,
-      payload?: { chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null },
+      payload?: { chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; cumChars?: number | null },
     ) => void
     /** 上报当前会话（聊天窗切会话/新建会话时调用，主进程转发给宠物窗同步内容框；null 表示清空） */
     notifyCurrentSession: (sessionId: string | null) => void
@@ -1334,18 +1458,16 @@ export interface WindowApi {
     /** 订阅全局鼠标坐标变化（窗口相对坐标，由主进程轮询 screen.getCursorScreenPoint） */
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
-     *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放 */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => void) => () => void
+     *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放；
+     *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本（零时长槽位）；
+     *  segIndex：本块对应的回合文档分段索引（方案A进度回报用，null/缺省 = 不参与回报） */
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null }) => void) => () => void
     /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘；词表方案下为自由情绪词） */
     onEmotion: (cb: (emotion: string) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
     /** 订阅流式开始时的"本轮语音模式"（是否有语音），宠物窗提前决定文本展示方式 */
     onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
-    /** 上报宠物窗"当前已朗读到"的段落文本（段变化时调用），经主进程转发给聊天窗随语音显示 */
-    reportReadingText: (text: string) => void
-    /** 上报语音朗读是否进行中（经主进程转发给聊天窗控制光标显隐） */
-    reportReadingActive: (active: boolean) => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
     reportRendererReady: () => void
     /** 订阅"当前会话变化"（聊天窗切会话/新建会话时主进程转发，宠物窗内容框同步） */
@@ -1413,10 +1535,6 @@ export interface WindowApi {
   chat: {
     /** 订阅"打开聊天窗口并进入指定会话"，聊天窗据此 loadSession；返回取消订阅函数 */
     onOpenSession: (cb: (sessionId: string) => void) => () => void
-    /** 订阅"语音朗读到当前段落文本"（宠物窗朗读时经主进程转发），聊天窗随语音段段显示 */
-    onReadingText: (cb: (text: string) => void) => () => void
-    /** 订阅"语音朗读是否进行中"（控制聊天窗跳动光标显隐） */
-    onReadingActive: (cb: (active: boolean) => void) => () => void
     /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
     onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
@@ -1530,5 +1648,20 @@ export interface WindowApi {
     onError: (cb: (message: string) => void) => () => void
     /** 订阅「托盘触发检查更新」事件（设置窗已打开，等待弹窗），返回取消订阅函数 */
     onCheckRequest: (cb: () => void) => () => void
+  }
+  /** 运行日志：缓冲快照 / 历史文件尾部 / 打开日志文件夹 / 渲染端 console 转发 / 实时 tail */
+  logs: {
+    /** 渲染端日志转发（fire-and-forget；由各窗口入口 setupLogForward 统一调用） */
+    forward: (source: LogEntrySource, level: LogEntryLevel, message: string) => void
+    /** 读取内存环形缓冲快照（旧→新），面板打开时秒显 */
+    getBuffer: () => Promise<LogEntry[]>
+    /** 读取当前日志文件尾部并解析为结构化条目（查看重启前的历史；truncated 表示文件超限被截头） */
+    readFileTail: () => Promise<{ entries: LogEntry[]; truncated: boolean }>
+    /** 打开日志文件夹（资源管理器），返回空串成功否则为错误消息 */
+    openFolder: () => Promise<string>
+    /** 清空当前会话日志（内存缓冲 + latest.log；历史备份文件不动） */
+    clear: () => Promise<void>
+    /** 订阅实时日志推送（logger 每条新日志广播），返回取消订阅函数 */
+    onAppended: (cb: (entry: LogEntry) => void) => () => void
   }
 }

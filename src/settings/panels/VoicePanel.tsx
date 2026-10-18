@@ -271,6 +271,18 @@ export function VoicePanel() {
       toast('请输入 onnx 模型目录', 'info')
       return
     }
+    // 参考音频与文本**都必填**：Genie /tts 硬依赖参考音频（未设置直接 404），角色内置
+    // prompt_wav 兜底只对官方目录布局可靠（GUI 导入模型多数没有，且 onnx 目录层级多变
+    // 导致兜底查找常落空）——"可选"只是把必填推迟到运行时报错。必填让约束在录入时闭环。
+    // 缺文本或文本错位还会让条件音素与音频对不上，显著放大模型复诵参考音频（复读）的概率
+    if (!editor.refAudioPath.trim()) {
+      toast('参考音频必填：Genie 合成以"参考音频+转写文本"为生成条件，未设置时无法合成', 'info')
+      return
+    }
+    if (!editor.refAudioText.trim()) {
+      toast('参考音频对应文本必填：文本告诉模型参考音频说了什么，缺失或错位会导致语音复读参考音频内容', 'info')
+      return
+    }
     setSavingModel(true)
     try {
       // 模型名称即角色名
@@ -799,12 +811,12 @@ export function VoicePanel() {
               </Button>
             </div>
           </Field>
-          <Field label="参考音频路径（可选）" hint="用于语气/情绪素材；留空则用声库默认音色">
+          <Field label="参考音频路径（必填）" hint="Genie 合成的生成条件：音色与语气完全克隆自该音频；未设置时无法合成。需 .wav 格式（建议单声道）">
             <div className="flex gap-2">
               <Input
                 value={editor.refAudioPath}
                 onChange={(e) => setEditor((prev) => ({ ...prev, refAudioPath: e.target.value }))}
-                placeholder="角色参考音频.wav（可选）"
+                placeholder="角色参考音频.wav（必填）"
               />
               <Button variant="outline" onClick={() => void handleEditorChooseAudio()} title="选择音频文件">
                 <FileAudio size={14} strokeWidth={2.25} />
@@ -812,11 +824,14 @@ export function VoicePanel() {
               </Button>
             </div>
           </Field>
-          <Field label="参考音频对应文本（可选）">
+          <Field
+            label="参考音频对应文本（必填）"
+            hint="参考音频说出的话，需逐字对应：文本让模型知道参考音频的内容，缺失或错位会导致语音复读参考音频"
+          >
             <Input
               value={editor.refAudioText}
               onChange={(e) => setEditor((prev) => ({ ...prev, refAudioText: e.target.value }))}
-              placeholder="参考音频说出的话（可选）"
+              placeholder="参考音频说出的话（必填，逐字对应）"
             />
           </Field>
         </div>

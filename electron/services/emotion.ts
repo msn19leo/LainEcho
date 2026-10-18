@@ -307,12 +307,12 @@ function salvageWrappedDialogue(raw: string): Array<{ text: string; emotion?: st
 }
 
 /** 宽松解析单个对话项对象：JSON.parse 失败后做全角结构修复重试 */
-function tryParseItemLoose(raw: string): { text?: string; emotion?: string } | null {
+function tryParseItemLoose(raw: string): { text?: string; emotion?: string; kind?: string } | null {
   try {
-    return JSON.parse(raw) as { text?: string; emotion?: string }
+    return JSON.parse(raw) as { text?: string; emotion?: string; kind?: string }
   } catch {
     try {
-      return JSON.parse(repairFullWidthJson(raw)) as { text?: string; emotion?: string }
+      return JSON.parse(repairFullWidthJson(raw)) as { text?: string; emotion?: string; kind?: string }
     } catch {
       return null
     }
@@ -392,11 +392,23 @@ function tryParseDialogueBlock(content: string): { dialogue?: unknown; backgroun
   }
 }
 
-/** JSON 字符串值转义还原（\n、\"、\uXXXX 等） */
+/** JSON 字符串值转义还原（\n、\"、\uXXXX 等）。
+ *  注意 \\n 必须正确映射为换行——旧实现把所有合法转义一律还原为其字面字符，
+ *  导致流式气泡出现"）n晚上好"这类脏字（\n→n），而定型走 JSON.parse 解码正确，
+ *  是"流式与定型不一致"的又一实锤来源（2026-10-13 latest.log 案例）。 */
 function decodeJsonString(raw: string): string {
   return raw
-    .replace(/\\(["\\/bfnrt])/g, '$1')
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\(["\\/bfnrt])/g, (_m, ch: string) => {
+      switch (ch) {
+        case 'b': return '\b'
+        case 'f': return '\f'
+        case 'n': return '\n'
+        case 'r': return '\r'
+        case 't': return '\t'
+        default: return ch // " \ / 原字符
+      }
+    })
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
 }
 
 /**
@@ -432,6 +444,68 @@ export function stripParenGroups(text: string): string {
 }
 
 /**
+ * 结构契约：键名回显检测（2026-10-15 实锤：模型把字段名当值写，"text": text → 正文变成字面量 "text"，
+ * 整轮回答退化）。正文剥括号后（忽略大小写、容忍一层引号包裹）恰为 dialogue JSON 的字段名
+ * （text/emotion/kind/dialogue）→ 视为退化项，不是内容。纯标点/省略号项（"…"）是合法的停顿节拍，
+ * 不在此列。文档切片、语音链、定型解析三处同口径剔除，保持两侧对齐。
+ */
+const KEY_ECHO_RE = /^["'“”]?(?:text|emotion|kind|dialogue)["'“”]?$/i
+function isKeyEchoText(text: string): boolean {
+  return KEY_ECHO_RE.test(stripParenGroups(text.trim()))
+}
+
+/**
+ * ② 引号剧本清洗：模型放弃 JSON 契约时偶发输出"每行一段、引号包裹"的剧本纯文本
+ * （2026-10-15 03:22 轮实锤：行间孤立引号行 + 台词行被引号包裹）——
+ * 规则：删纯引号/标点的孤立行；**行首引号独立剥 + 行尾引号随之剥**（一层，文字原样保留）。
+ * 早先要求"首尾成对"才剥，与直通提取器（开引号即剥、闭引号到达即剥）口径不一致：
+ * 未闭合的开引号行流式已剥、定型保留 → 收尾字符不一致（2026-10-16 14:12 轮实锤引号跳变）。
+ * 不以引号开头的行完全不动：句中内容引号（她说“晚安”）不受影响。
+ * （…）旁白与任何正文词汇不受影响。仅非 JSON 降级路径经过；正常 JSON 解析不经过（零影响）。
+ */
+function cleanQuotedScriptText(content: string): string {
+  const QUOTE_ONLY_RE = /^[\s"'“”「」『』]+$/
+  const LEAD_RE = /^["'“”「」『』]/
+  const TAIL_RE = /["'“”「」『』]$/
+  const out: string[] = []
+  for (const line0 of content.split('\n')) {
+    const line = line0.trim()
+    if (!line) continue
+    if (QUOTE_ONLY_RE.test(line)) continue
+    let stripped = line
+    if (LEAD_RE.test(stripped)) {
+      stripped = stripped.slice(1)
+      if (TAIL_RE.test(stripped)) stripped = stripped.slice(0, -1)
+    }
+    stripped = stripped.trim()
+    if (stripped) out.push(stripped)
+  }
+  return out.join('\n')
+}
+
+/** 剧本标签行匹配：行首【短标签】（≤12 字、不含【】嵌套），后跟可选内容 */
+const SCRIPT_TAG_LINE = /^【([^【】]{1,12})】\s*(.*)$/
+
+/**
+ * 剧本标签清洗：模型偶发放弃 JSON 契约，漂移输出【内心独白】【台词】等剧本标签纯文本
+ * （诱因：历史回传的是解析后纯文本，few-shot 诱导压过 system prompt 的 JSON 纸面契约；
+ * 旁白规范里的"内心独白"概念词被模型顺手升格成标签）。
+ * 这类输出不是 JSON 形态（不触发 JSON 形态拒收），旧式标签解析也认不出它们，若放行会：
+ * 标签原样显示、被 TTS 朗读（sanitizeGenieText 只剥圆括号不剥【】）、回传历史强化漂移。
+ * 清洗规则：行首【短标签】剥头留余（整行仅标签则删除该行），其余行原样保留；
+ * 只用于结构化解析失败后的降级路径，正常 JSON 路径不经过这里。
+ */
+export function stripScriptTags(content: string): string {
+  const kept: string[] = []
+  for (const line of content.split('\n')) {
+    const m = SCRIPT_TAG_LINE.exec(line.trim())
+    const rest = m ? (m[2] ?? '') : line
+    if (rest.trim()) kept.push(rest)
+  }
+  return kept.join('\n')
+}
+
+/**
  * 解析结构化 JSON dialogue 输出（prompt 强制契约）。
  * 每个元素是一个台词节拍 { text, emotion }，按元素顺序拼接成段落文本，
  * 并把每项的 emotion 落到其首句的句子索引上生成 emotionSegments（相邻相同合并）。
@@ -461,19 +535,27 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
   rawEmotions: string[]
 } {
   const parsed = tryParseDialogueBlock(content)
-  let dialogue: Array<{ text?: string; emotion?: string }> = []
+  let dialogue: Array<{ text?: string; emotion?: string; kind?: string }> = []
   let background: string | undefined
   if (parsed) {
     if (Array.isArray(parsed.dialogue)) {
-      // dialogue 数组元素兼容两种形态：{text, emotion} 对象（标准）与纯字符串（模型偶发的简化变体，
+      // dialogue 数组元素兼容两种形态：{text, emotion, kind} 对象（标准）与纯字符串（模型偶发的简化变体，
       // 字符串元素视作一段正文、情绪 neutral）——不支持后者时整条解析会退化为"JSON 源码当正文"
       dialogue = (parsed.dialogue as Array<unknown>).map((it) =>
-        typeof it === 'string' ? { text: it } : (it as { text?: string; emotion?: string }),
+        typeof it === 'string' ? { text: it } : (it as { text?: string; emotion?: string; kind?: string }),
       )
     }
     if (typeof parsed.background === 'string' && parsed.background.trim()) background = parsed.background.trim()
   }
-  const items = dialogue.filter((it) => typeof it?.text === 'string' && it.text.trim() !== '')
+  const items0 = dialogue.filter((it) => typeof it?.text === 'string' && it.text.trim() !== '')
+  // 结构契约检查：剔除"键名回显"型退化项——模型偶发把字段名当值写
+  // （"text": text → 正文 = 字面量 "text"），该项不是内容。全部项均退化 → 返回空文本，
+  // 触发调用方的空回复自动重试链（附加纠正提示重新生成）。
+  const items = items0.filter((it) => !isKeyEchoText(it.text!))
+  if (items0.length > 0 && items.length === 0) {
+    console.warn('[parse] 结构契约：全部 %d 个 dialogue 项均为键名回显退化项 → 按空回复处理，触发自动重试', items0.length)
+    return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
+  }
 
   if (items.length === 0) {
     // 末级兜底（2026-10-02 变体）：结构字符被全角引号逐个包裹时，直接扫描提取 text/emotion 值对
@@ -481,7 +563,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
     if (salvaged) {
       const sItems = salvaged
         .map((it) => ({ text: fixUnclosedBrackets(it.text), emotion: normalizeEmotion(it.emotion ?? '', palette) }))
-        .filter((it) => it.text)
+        .filter((it) => it.text && !isKeyEchoText(it.text))
       if (sItems.length > 0) {
         const sText = sItems.map((it) => it.text).join('\n')
         const sentences = splitSentences(sText)
@@ -509,13 +591,15 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
     // 先尽力从原始输出中提取各 "text" 台词值，避免把整段原始 JSON 外露成文本、或拿去朗读；
     // 抢救出的正文须含实质台词（剥括号后非空）——纯括号/空半截不走此路，落到截断补全/拒收重试
     const prose = extractStreamingJsonText(content)
-    if (prose && prose !== content && stripParenGroups(prose).trim()) {
+    if (prose && prose !== content && stripParenGroups(prose).trim() && !isKeyEchoText(prose)) {
       return {
         text: prose,
         emotion: defWord(palette),
         sentences: splitSentences(prose),
         emotionSegments: [{ startSentence: 0, emotion: defWord(palette) }],
-        chunks: [{ text: prose, emotion: defWord(palette) }],
+        // kind 显式 speak：混合旁白/台词的降级正文由渲染端按内联（）拆分显示——
+        // 缺 kind 会被渲染端按"（ 开头 → 旁白"整条判旁白，全文旁白样式（2026-10-14 20:44 轮实锤）
+        chunks: [{ text: prose, emotion: defWord(palette), kind: 'speak' as const }],
         background,
         rawEmotions: [],
       }
@@ -537,10 +621,27 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
     if (jsonish.startsWith('{') || jsonish.startsWith('[') || /["\u201C]dialogue["\u201D]/.test(jsonish)) {
       return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
     }
-    // 回退旧式标签解析（历史消息兼容），否则整段默认情绪
+    // 回退旧式标签解析（历史消息兼容），否则整段默认情绪。
+    // 先做剧本标签清洗（stripScriptTags）：【内心独白】【台词】等漂移标签若放行会被
+    // 朗读并回传历史强化漂移；清洗后无实质台词（剥括号后空）视为无效输出 → 返回空文本，
+    // 交由调用方的空回复自动重试链附加纠正提示。
     try {
-      const fallback = extractEmotion(content, palette)
-      return { ...fallback, chunks: [{ text: fallback.text, emotion: fallback.emotion }], rawEmotions: [] }
+      const cleaned = stripScriptTags(content)
+      if (cleaned !== content && !stripParenGroups(cleaned).trim()) {
+        return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
+      }
+      // ② 引号剧本清洗（仅非 JSON 降级路径经过，正常 JSON 解析不经过——零影响）
+      const scriptCleaned = cleanQuotedScriptText(cleaned)
+      if (!stripParenGroups(scriptCleaned).trim() || isKeyEchoText(scriptCleaned)) {
+        return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
+      }
+      const fallback = extractEmotion(scriptCleaned, palette)
+      // 结构契约：键名回显正文（如整段只写了 "text"）按空回复处理
+      if (isKeyEchoText(fallback.text)) {
+        return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
+      }
+      // kind 显式 speak（理由同上：缺 kind + （ 开头会被渲染端整条判旁白）
+      return { ...fallback, chunks: [{ text: fallback.text, emotion: fallback.emotion, kind: 'speak' as const }], rawEmotions: [] }
     } catch {
       const single: DialogueChunk = { text: content, emotion: defWord(palette) }
       return { text: content, emotion: defWord(palette), sentences: splitSentences(content), emotionSegments: [{ startSentence: 0, emotion: defWord(palette) }], chunks: [single], background, rawEmotions: [] }
@@ -548,24 +649,37 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
   }
 
   // 拼接段落文本（单换行分隔，去掉过密的空行，保持与 AssistantSentences 段级展示一致）；
-  // 先转义还原再补未闭合括号（2026-10-02 线上案例：模型漏写右括号导致纯旁白块被朗读）
+  // 先转义还原再补未闭合括号（2026-10-02 线上案例：模型漏写右括号导致纯括号块被朗读）
   const decodeText = (t: string) => fixUnclosedBrackets(decodeJsonString(t.trim()))
-  const text = items.map((it) => decodeText(it.text!)).join('\n')
+  // 合成分段：每个 dialogue 项一条；**混合 narr 项拆分**——narr 项开头连续（）组 + 尾部台词时
+  // 拆成 [narr, speak]（2026-10-15 02:19 轮实锤：模型把台词塞进旁白项尾部，整项按旁白处理
+  // 导致台词无语音、样式旁白化）。拆分与文档切片/语音链同口径（均为 splitLeadingNarrGroups）。
+  const chunks: DialogueChunk[] = []
+  for (const it of items) {
+    const decoded = decodeText(it.text!)
+    const emo = normalizeEmotion(it.emotion ?? '', palette)
+    const kind = it.kind === 'speak' || it.kind === 'narr' ? it.kind : (/^[（(]/.test(decoded) ? 'narr' as const : 'speak' as const)
+    if (kind === 'narr') {
+      const { narr: leadingNarr, rest } = splitLeadingNarrGroups(decoded)
+      if (leadingNarr && rest.trim()) {
+        chunks.push({ text: leadingNarr.trim(), emotion: emo, kind: 'narr' })
+        chunks.push({ text: rest.trim(), emotion: emo, kind: 'speak' })
+        continue
+      }
+    }
+    chunks.push({ text: decoded, emotion: emo, kind })
+  }
+  // 段落文本由 chunks 拼接（与合成分段严格同源，拆分项以单换行分界）
+  const text = chunks.map((c) => c.text).join('\n')
   const sentences = splitSentences(text)
-  // 合成分段：每个 dialogue 项一条，段级合成（不再按标点切碎）+ 段级切立绘
-  const chunks: DialogueChunk[] = items.map((it) => ({
-    text: decodeText(it.text!),
-    emotion: normalizeEmotion(it.emotion ?? '', palette),
-  }))
 
-  // 逐项累计句子数，把每项情绪落到其首句索引
+  // 逐 chunk 累计句子数，把每个 chunk 的情绪落到其首句索引（与 chunks 拆分保持同源）
   const emotionSegments: EmotionSegment[] = []
   let sentCursor = 0
-  for (const it of items) {
-    const n = splitSentences(decodeText(it.text!)).length
-    const emo = normalizeEmotion(it.emotion ?? '', palette)
+  for (const c of chunks) {
+    const n = splitSentences(c.text).length
     const prev = emotionSegments[emotionSegments.length - 1]
-    if (!prev || prev.emotion !== emo) emotionSegments.push({ startSentence: sentCursor, emotion: emo })
+    if (!prev || prev.emotion !== c.emotion) emotionSegments.push({ startSentence: sentCursor, emotion: c.emotion })
     sentCursor += n
   }
   if (emotionSegments.length === 0) emotionSegments.push({ startSentence: 0, emotion: defWord(palette) })
@@ -583,8 +697,8 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
  * - 遇未闭合/非法对象时立即停止（等更多 token），cursor 停在原地以便下一次用更长文本重试。
  * - cursor 语义：已消费的 partial 字符索引（与分析用的 partial 字符串保持一致）。
  */
-export function extractDialogueChunkDelta(partial: string, fromCursor: number, palette?: EmotionPaletteRef | null): { items: Array<{ text: string; emotion: string }>; cursor: number } {
-  const items: Array<{ text: string; emotion: string }> = []
+export function extractDialogueChunkDelta(partial: string, fromCursor: number, palette?: EmotionPaletteRef | null): { items: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }>; cursor: number } {
+  const items: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }> = []
   let cursor = fromCursor
   while (true) {
     const open = partial.indexOf('{', cursor)
@@ -602,14 +716,19 @@ export function extractDialogueChunkDelta(partial: string, fromCursor: number, p
       }
       if (end === -1) break // 字符串仍在书写中，等待更多 token
       const text = decodeJsonString(partial.slice(quote + 1, end)).trim()
-      if (text) items.push({ text: fixUnclosedBrackets(text), emotion: normalizeEmotion('', palette) })
+      const fixed = fixUnclosedBrackets(text)
+      // 结构契约：键名回显退化项（"text"）不进语音链，与文档切片同步跳过
+      if (fixed && !isKeyEchoText(fixed)) {
+        items.push({ text: fixed, emotion: normalizeEmotion('', palette), kind: /^[（(]/.test(fixed) ? 'narr' : 'speak' })
+      }
       cursor = end + 1
       continue
     }
     if (open === -1) break
     const afterBrace = partial.slice(open + 1).replace(/^\s*/, '')
     // 键名引号半角/全角都识别（模型偶发把结构引号写成全角，2026-09-26 线上案例）
-    const isDialogueItem = /^["\u201C](?:text|emotion)["\u201D]/.test(afterBrace)
+    // 新契约下对话项还带 "kind" 键，键名开头识别同步放行
+    const isDialogueItem = /^["\u201C](?:text|emotion|kind)["\u201D]/.test(afterBrace)
     if (!isDialogueItem) {
       // 根对象 {"dialogue":[...]}：跳进其数组内部（定位 '[' 之后），而非跳过整根——
       // 否则会把整段都跳过，永远扫不到内层对话项，导致流式语音块不触发。
@@ -634,7 +753,10 @@ export function extractDialogueChunkDelta(partial: string, fromCursor: number, p
       const salvaged = salvageWrappedDialogue(raw)
       if (salvaged && salvaged.length > 0) {
         for (const it of salvaged) {
-          if (it.text) items.push({ text: fixUnclosedBrackets(it.text), emotion: normalizeEmotion(it.emotion ?? '', palette) })
+          if (it.text) {
+            const fixed = fixUnclosedBrackets(it.text)
+            items.push({ text: fixed, emotion: normalizeEmotion(it.emotion ?? '', palette), kind: /^[（(]/.test(fixed) ? 'narr' : 'speak' })
+          }
         }
         cursor = close + 1
         continue
@@ -642,7 +764,12 @@ export function extractDialogueChunkDelta(partial: string, fromCursor: number, p
       break // 非法/不完整：停在 open，待更长文本重试
     }
     const text = obj?.text?.trim()
-    if (text) items.push({ text: fixUnclosedBrackets(text), emotion: normalizeEmotion(obj?.emotion ?? '', palette) })
+    const fixed = text ? fixUnclosedBrackets(text) : ''
+    // 结构契约：键名回显退化项（"text"）不进语音链，与文档切片同步跳过
+    if (fixed && !isKeyEchoText(fixed)) {
+      const kindRaw = (obj as { kind?: string }).kind
+      items.push({ text: fixed, emotion: normalizeEmotion(obj?.emotion ?? '', palette), kind: kindRaw === 'speak' || kindRaw === 'narr' ? kindRaw : (/^[（(]/.test(fixed) ? 'narr' : 'speak') })
+    }
     cursor = close + 1
   }
   return { items, cursor }
@@ -671,6 +798,98 @@ function findObjectEnd(s: string, open: number): number {
 }
 
 /**
+ * 对象闭合切片器（Shinsekai 式）：从流式累积文本中逐个提取**已完整闭合的顶层 JSON 对象**，
+ * 每个闭合对象解析为 dialogue 项（text/kind/emotion），附加正在书写中项的尾部预览。
+ *
+ * 与 extractStreamingJsonText（正则抠 text 值）相比：
+ * - 对象边界由状态机判定（括号深度 + 字符串感知），项与项之间不互相干扰，无"裸值跨行"歧义；
+ * - 与定型解析（parseDialogueJson → tryParseDialogueBlock）同一闭合语义，流式所见即定型所得；
+ * - 逐项 yield 语义天然适配"每个 dialogue 项一个气泡/一段语音"的新渲染与门控模型。
+ *
+ * @param partial 累积中的原始回复文本
+ * @param palette 情绪词表（缺省时用内置词表归一化）
+ * @returns closed: 已闭合的对话项序列（按输出顺序）；trailing: 书写中项的已写出部分（预览，不入正式序列）
+ */
+export function extractDialogueObjects(
+  partial: string,
+  palette?: EmotionPaletteRef | null,
+): { closed: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }>; trailing: string } {
+  const empty = { closed: [] as Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }>, trailing: '' }
+  if (!partial) return empty
+  const block = extractJsonBlock(partial)
+  if (!block) {
+    // 尚无完整 JSON 块（或非 JSON 输出）：交由调用方走既有非 JSON 兜底
+    return empty
+  }
+  // 状态机扫描：逐个等待完整 {...} 闭合（跳过字符串内花括号），支持嵌套
+  const starts: number[] = []
+  for (let i = 0; i < block.length; i++) if (block[i] === '{') starts.push(i)
+  const closed: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }> = []
+  let trailing = ''
+  for (const start of starts) {
+    let depth = 0
+    let inStr = false
+    let escaped = false
+    let end = -1
+    for (let i = start; i < block.length; i++) {
+      const ch = block[i]
+      if (inStr) {
+        if (escaped) escaped = false
+        else if (ch === '\\') escaped = true
+        else if (ch === '"') inStr = false
+        continue
+      }
+      if (ch === '"') inStr = true
+      else if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) { end = i; break }
+        if (depth < 0) break
+      }
+    }
+    if (end === -1) {
+      // 该对象未闭合：取其已写出的 text 值作尾部预览（若有），继续尝试后续起点
+      const raw = block.slice(start)
+      const tm = /["\u201C]text["\u201D]\s*[:：]\s*"((?:[^"\\]|\\.)*)/.exec(raw)
+      if (tm) trailing = decodeJsonString(tm[1] ?? '')
+      continue
+    }
+    const raw = block.slice(start, end + 1)
+    const obj = tryParseItemLoose(raw)
+    if (obj && typeof obj.text === 'string' && obj.text.trim()) {
+      const fixed = fixUnclosedBrackets(decodeJsonString(obj.text.trim()))
+      const kindRaw = typeof obj.kind === 'string' ? obj.kind : undefined
+      const kind = kindRaw === 'speak' || kindRaw === 'narr' ? kindRaw : (/^[（(]/.test(fixed) ? 'narr' : 'speak')
+      const emotion = normalizeEmotion(obj.emotion ?? '', palette)
+      // 结构契约：键名回显退化项（"text"）不入稿，与语音链/定型解析同步跳过
+      if (isKeyEchoText(fixed)) {
+        trailing = ''
+        continue
+      }
+      // 混合项拆分（与语音链/定型解析同口径）：
+      //  - speak 项开头连续（）组 → [narr, speak]（模型误标 kind:speak 的开头旁白）
+      //  - narr 项开头连续（）组 + 尾部台词 → [narr, speak]（模型把台词塞进旁白项尾部，
+      //    2026-10-15 02:19 轮实锤：整项按旁白处理导致台词无语音、样式旁白化）
+      const { narr: leadingNarr, rest } = splitLeadingNarrGroups(fixed)
+      if (kind === 'speak' && leadingNarr) {
+        closed.push({ text: leadingNarr.trim(), emotion, kind: 'narr' })
+        if (rest.trim()) closed.push({ text: rest.trim(), emotion, kind: 'speak' })
+      } else if (kind === 'narr' && leadingNarr && rest.trim()) {
+        closed.push({ text: leadingNarr.trim(), emotion, kind: 'narr' })
+        closed.push({ text: rest.trim(), emotion, kind: 'speak' })
+      } else {
+        closed.push({ text: fixed, emotion, kind })
+      }
+      trailing = ''
+    } else if (!obj) {
+      // 解析失败但对象已闭合：不再把它当尾部预览，跳过
+      trailing = ''
+    }
+  }
+  return { closed, trailing }
+}
+
+/**
  * 流式上屏用的裸字符串数组提取（2026-10-02 线上案例变体）：
  * dialogue 数组元素是无键名裸字符串（无 "text" 键可命中），逐个提取已闭合字符串 +
  * 正在书写的最后一个（保留流式打字感）。遇到对象元素（'{'）说明不是该变体
@@ -690,11 +909,11 @@ function extractBareStringArray(partial: string): string {
       if (end === -1) {
         // 正在书写中的最后一个字符串：取已写出的部分实时上屏
         const wip = decodeJsonString(body.slice(i + 1)).trim()
-        if (wip) out.push(wip)
+        if (wip && !isKeyEchoText(wip)) out.push(wip)
         break
       }
       const v = decodeJsonString(body.slice(i + 1, end)).trim()
-      if (v) out.push(v)
+      if (v && !isKeyEchoText(v)) out.push(v)
       i = end + 1
       continue
     }
@@ -726,7 +945,10 @@ export function extractStreamingJsonText(partial: string): string {
   while ((m = re.exec(partial))) {
     lastEnd = re.lastIndex
     const v = decodeJsonString((m[1] ?? m[2] ?? m[3] ?? '').trim()).trim()
-    if (v) out.push(v)
+    // 已闭合项与定型解析同口径：补未闭合括号（fixUnclosedBrackets），否则流式缺右括号、
+    // 定型补上后分段/文本发生肉眼可见的"定型再变"（2026-10-02 线上案例形态）
+    // 结构契约：键名回显退化值（"text"）不上屏，与文档切片/语音链同步跳过
+    if (v && !isKeyEchoText(v)) out.push(fixUnclosedBrackets(v))
   }
 
   // 追加正在写入、尚未闭合的最后一个 text 值（从上次匹配末尾之后找 "text": 开头的片段）
@@ -737,11 +959,13 @@ export function extractStreamingJsonText(partial: string): string {
     if (after.startsWith('"') || after.startsWith('\u201C')) {
       // 引号值：取到第一个未转义的引号为止（该值要么闭合，要么仍在书写中）
       const partialVal = after.slice(1).split(/(?<!\\)["\u201D]/)[0] ?? ''
-      if (partialVal.trim()) trailing = decodeJsonString(partialVal)
+      if (partialVal.trim() && !isKeyEchoText(partialVal)) trailing = decodeJsonString(partialVal)
     } else {
       // 裸值：取到行尾（正在书写中时即当前行已写出的部分）
       const partialVal = after.split('\n')[0] ?? ''
-      if (partialVal.trim()) trailing = partialVal
+      // 书写中的尾部同样补括号：闭合时它将整体转入已闭合列表且已含补全，长度不回缩
+      // （Typewriter 只增不减依赖单调性），流式与定型口径也保持一致
+      if (partialVal.trim() && !isKeyEchoText(partialVal)) trailing = fixUnclosedBrackets(partialVal)
     }
   }
 
@@ -757,6 +981,141 @@ export function extractStreamingJsonText(partial: string): string {
   }
   return joined
 }
+
+/**
+ * 流式探测/直通用：剥掉模型输出的非正文包裹（<think> 思考块、markdown 代码围栏），
+ * 返回"可见正文"。漂移探测在可见正文上判定 JSON 结构迹象，避免被思考内容误判。
+ */
+export function stripStreamWrappers(raw: string): string {
+  let t = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/i, '')
+  // 仅剥头部围栏（```json / ```）；尾部闭合围栏由 prepareScriptPartial 处理（对游标安全）
+  t = t.replace(/^\s*```[a-zA-Z]*[ \t]*\n?/, '')
+  return t
+}
+
+/**
+ * 直通模式提取源整形（②漂移轮）：stripStreamWrappers 基础上再剥**尾部**闭合代码围栏。
+ * 只动"尚未被游标消费的尾部区域"，对提取游标安全（围栏到达前它位于 pending 尾巴里，
+ * 游标从未推进过它；移除不改变已消费区间内的任何下标）。
+ */
+export function prepareScriptPartial(partial: string): string {
+  return stripStreamWrappers(partial).replace(/```[ \t]*$/, '')
+}
+
+/**
+ * 纯文本直通提取器（②漂移轮专用，2026-10-15）：模型完全放弃 JSON 契约输出括号剧本/
+ * 纯文本时，三条 JSON 提取链全部零产出 → 流式期间零投递、（修复轮）整段静默 20-38s。
+ * 本提取器把「（旁白）台词（旁白）台词」形态的累积文本按括号组与**行**增量切分为
+ * speak/narr 项，产出形状与 extractDialogueChunkDelta 完全一致（text/emotion/kind），
+ * 供语音链（pumpSpeech）与文档切片（syncFromPartialScript）以各自独立游标复用。
+ *
+ * 切分规则：
+ *  - （…）/(...) 组（全角/半角）→ kind:'narr' 项（text 含括号，与 JSON 链 narr 同形）
+ *  - 行首/句中【≤12字标签】整段跳过（与定型链 stripScriptTags 同向：标签不入稿不朗读；
+ *    在提取器内联处理而非预处理，保证游标单调无回退）
+ *  - 台词按**行**封段（仅 \n 封段）：与定型渲染的原文行结构同粒度，"输出时什么样，
+ *    结束时就什么样"。早先按句中标点（含省略号）切句，「……晚上好。」被切成多行，
+ *    直播多行、定型一行，收尾结构跳变（2026-10-15 21:03 轮实锤）。语音粒度由合成层
+ *    mergeSentences 在块内再按标点分段保证，不受文档段粒度影响
+ *  - 台词段剥包裹引号（stripSpeakWrapQuotes，与定型 cleanQuotedScriptText 同口径）：
+ *    模型给台词套引号（引号漂移），流式若原样上屏、定型清洗剥引号 → 收尾引号消失
+ *    （2026-10-16 14:12 轮实锤）
+ *  - emotion 恒为词表默认词（漂移形态本就无逐段情绪；依从 miss 也回落默认词，无信息损失）
+ *
+ * @param force 结束冲刷：把残余未封段的尾巴也产出（流结束时调用一次）
+ * @returns items 产出项序列；cursor 已消费游标（下一次调用从此继续，未定稿尾巴不重复产出）
+ */
+/** 台词包裹引号剥除（直通链）：行首引号立即剥、行尾引号到达即剥（独立、一层）。
+ * 与定型 cleanQuotedScriptText 同口径（行首引号独立剥，不要求成对——未闭合的开引号行
+ * 两链一致）；不以引号开头的台词完全不动（句中内容引号受保护）。
+ * 引号被剥空的行返回空串（调用方按空段跳过）。 */
+const WRAP_QUOTE_LEAD_RE = /^["'“”「」『』]/
+const WRAP_QUOTE_TAIL_RE = /["'“”「」『』]$/
+function stripSpeakWrapQuotes(t: string): string {
+  let s = t
+  if (WRAP_QUOTE_LEAD_RE.test(s)) {
+    s = s.slice(1)
+    if (WRAP_QUOTE_TAIL_RE.test(s)) s = s.slice(0, -1)
+  }
+  return s.trim()
+}
+
+export function extractScriptChunkDelta(
+  partial: string,
+  fromCursor: number,
+  palette?: EmotionPaletteRef | null,
+  force = false,
+): { items: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }>; cursor: number } {
+  const items: Array<{ text: string; emotion: string; kind: 'speak' | 'narr' }> = []
+  const def = normalizeEmotion('', palette)
+  let cursor = fromCursor
+  let segStart = fromCursor
+  let bracketStart = -1
+  let depth = 0
+  const pushSpeak = (end: number) => {
+    const t = stripSpeakWrapQuotes(fixUnclosedBrackets(partial.slice(segStart, end)))
+    if (t && !isKeyEchoText(t)) items.push({ text: t, emotion: def, kind: 'speak' })
+    segStart = end
+    cursor = end
+  }
+  let i = fromCursor
+  while (i < partial.length) {
+    const ch = partial[i]
+    if (bracketStart >= 0) {
+      if (ch === '（' || ch === '(') depth++
+      else if (ch === '）' || ch === ')') {
+        depth--
+        if (depth <= 0) {
+          const t = fixUnclosedBrackets(partial.slice(bracketStart, i + 1)).trim()
+          if (t && !isKeyEchoText(t)) items.push({ text: t, emotion: def, kind: 'narr' })
+          bracketStart = -1
+          depth = 0
+          segStart = i + 1
+          cursor = i + 1
+        }
+      }
+      i++
+      continue
+    }
+    if (ch === '（' || ch === '(') {
+      pushSpeak(i)
+      bracketStart = i
+      depth = 1
+      i++
+      continue
+    }
+    // 剧本标签漂移形态：【内心独白】等 ≤12 字标签整段跳过（仅完整闭合才跳，书写中留待下次）
+    if (ch === '【') {
+      const m = /^【[^【】]{1,12}】/.exec(partial.slice(i))
+      if (m) {
+        pushSpeak(i)
+        i += m[0].length
+        segStart = i
+        cursor = i
+        continue
+      }
+    }
+    // 行封段：仅换行符切断台词段（句中标点/省略号是停顿不是句界，见函数注释）
+    if (ch === '\n') {
+      i++
+      pushSpeak(i)
+      continue
+    }
+    i++
+  }
+  if (force) {
+    if (bracketStart >= 0) {
+      // 未闭合括号尾巴：按旁白处理（显示语义优先正确；括号前的台词已在入括时定稿）
+      const t = fixUnclosedBrackets(partial.slice(bracketStart)).trim()
+      if (t && !isKeyEchoText(t)) items.push({ text: t, emotion: def, kind: 'narr' })
+    } else {
+      pushSpeak(partial.length)
+    }
+    cursor = partial.length
+  }
+  return { items, cursor }
+}
+
 
 /** 开头旁白正则：从文本第一个字符起、连续的（…）/(…) 括号组（组间允许空白/换行），
  *  遇到第一个台词字符即止。只匹配已闭合的括号组——流式中尚未写完的括号留待下次
@@ -774,6 +1133,23 @@ export function extractLeadingNarration(display: string): string {
   if (!display) return ''
   const m = LEADING_NARRATION_RE.exec(display)
   return m ? m[0] : ''
+}
+
+/**
+ * 把 speak 项开头的连续（）旁白组从台词中剥离。
+ * 模型偶发把开头旁白显式标成 kind:"speak"（2026-10-14 21:30 轮实锤）——旁白被粘进语音块，
+ * 文本揭示被语音门控卡到开播才逐字打出；拆出后旁白按零时长 displayOnly 槽位立即上屏，
+ * 与正确标注的 narr 项同节奏。 mid-text 的（）组不拆（随语音段插播，节奏语义不同）。
+ * @param text speak 项文本（与文档分段同源同构，已 trim + fixUnclosedBrackets）
+ * @returns narr=开头连续括号组原文（含组间空白，不含括号组时为空串）；rest=其余台词（可能与 narr 拼回原文）
+ */
+export function splitLeadingNarrGroups(text: string): { narr: string; rest: string } {
+  if (!text) return { narr: '', rest: text }
+  const m = LEADING_NARRATION_RE.exec(text)
+  const narr = m?.[0] ?? ''
+  // 纯前导空白不算旁白（无可显示内容，避免产生空槽位）
+  if (!narr || !/[（(]/.test(narr)) return { narr: '', rest: text }
+  return { narr, rest: text.slice(narr.length) }
 }
 
 /**

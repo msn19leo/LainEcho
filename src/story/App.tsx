@@ -67,8 +67,8 @@ const DEFAULT_SPRITE_VIEW: StorySpriteView = { scale: 1, x: 0, y: 0 }
 const DEFAULT_TEXT_SPEED = 80
 
 export function StoryApp() {
-  // 文字显示速度：与聊天窗/桌宠共用同一全局设置（可在设置页「剧情系统」调整）
-  const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? DEFAULT_TEXT_SPEED)
+  // 文字显示速度：剧情系统独立设置（storyTextSpeed），与桌宠/聊天窗的通用 textSpeed 互不影响
+  const textSpeed = useSettingsStore((s) => s.settings.storyTextSpeed ?? DEFAULT_TEXT_SPEED)
   const typeDelayRef = useRef(typingSpeedToMs(textSpeed))
   useEffect(() => {
     typeDelayRef.current = typingSpeedToMs(textSpeed)
@@ -203,21 +203,21 @@ export function StoryApp() {
     const spoken = (text: string, emotion?: string): QueueItem => ({
       kind: 'line', text, emotion, speaker: 'ai', voice: true,
     })
+    const narration = (text: string): QueueItem => ({ kind: 'narration', text })
+    // 段类型判定：kind 字段权威（新契约），缺省按（）包裹推断（旧存档兼容，isUnspoken 同口径）
+    const chunkKind = (c: { text: string; kind?: 'speak' | 'narr' }): 'narration' | 'line' =>
+      c.kind === 'narr' ? 'narration' : c.kind === 'speak' ? 'line' : (isUnspoken(c.text) ? 'narration' : 'line')
     const chunks = (m.chunks ?? []).filter((c) => typeof c.text === 'string' && c.text.trim())
-    if (chunks.length > 1) {
-      return chunks.map((c) => (isUnspoken(c.text) ? { kind: 'narration', text: c.text } : spoken(c.text, c.emotion)))
+    if (chunks.length > 0) {
+      return chunks.map((c) => (chunkKind(c) === 'narration' ? narration(c.text) : spoken(c.text, c.emotion)))
     }
     const paragraphs = m.content.split(/\n+/).map((t) => t.trim()).filter(Boolean)
     if (paragraphs.length > 1) {
       const emotion = m.emotion ?? 'neutral'
-      return paragraphs.map((text) => (isUnspoken(text) ? { kind: 'narration', text } : spoken(text, emotion)))
-    }
-    if (chunks.length === 1) {
-      const c = chunks[0]!
-      return [isUnspoken(c.text) ? { kind: 'narration', text: c.text } : spoken(c.text, c.emotion)]
+      return paragraphs.map((text) => (isUnspoken(text) ? narration(text) : spoken(text, emotion)))
     }
     return paragraphs.length === 1
-      ? [isUnspoken(paragraphs[0]!) ? { kind: 'narration', text: paragraphs[0]! } : spoken(paragraphs[0]!, m.emotion ?? 'neutral')]
+      ? [isUnspoken(paragraphs[0]!) ? narration(paragraphs[0]!) : spoken(paragraphs[0]!, m.emotion ?? 'neutral')]
       : []
   }, [])
 
@@ -877,7 +877,8 @@ export function StoryApp() {
                 ) : (
                   <p className="selectable min-h-[32px] whitespace-pre-wrap break-words text-sm leading-relaxed text-text">
                     {current ? typedText : ''}
-                    {phase !== 'idle' && <span className="streaming-cursor" />}
+                    {/* 剧情系统保持既有闪烁行为（光标态区分仅作用于聊天/桌宠的语音门控揭示） */}
+                    {phase !== 'idle' && <span className="streaming-cursor streaming-cursor--waiting" />}
                   </p>
                 )}
               </div>

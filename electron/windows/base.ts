@@ -14,14 +14,9 @@ export function isDev(): boolean {
 }
 
 export function loadWindowPage(win: BrowserWindow, page: WindowPage): void {
-  // 转发渲染进程 console 到主进程终端，便于定位渲染层问题
-  win.webContents.on('console-message', (e: unknown, a: unknown, b: unknown) => {
-    const msg =
-      typeof a === 'object' && a !== null && 'message' in (a as object)
-        ? (a as { message?: string }).message
-        : (b as string | undefined) ?? String(a)
-    console.log('[renderer]', msg)
-  })
+  // 渲染端 console 已由 src/lib/logForward.ts 经 IPC 转发主进程 logger（带窗口来源标签），
+  // 这里不再走 console-message 转发——避免同一条日志双重记账（[renderer] 与 [窗口名] 各一条），
+  // 且该 API 已被 Electron 弃用（会触发 deprecation 警告）。
 
   if (DEV_SERVER_URL) {
     void win.loadURL(`${DEV_SERVER_URL}/${page}`)

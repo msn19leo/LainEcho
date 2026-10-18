@@ -109,17 +109,6 @@ export function registerWindowIpc(): void {
     windowManager.notifyCurrentSession(sessionId)
   })
 
-  /** 宠物窗朗读到某段文本 → 转发给聊天窗随语音显示 */
-  ipcMain.on('pet:reading-text', (_e, text: string) => {
-    const t = typeof text === 'string' ? text : ''
-    windowManager.notifyReadingText(t)
-  })
-
-  /** 宠物窗朗读是否进行中 → 转发给聊天窗控制光标 */
-  ipcMain.on('pet:reading-active', (_e, active: boolean) => {
-    windowManager.notifyReadingActive(active === true)
-  })
-
   /** 宠物窗/聊天窗 renderer 就绪 → 补发最近一次语音模式 + 进行中的会话 id + 角色卡形象配置（避免广播早于订阅而丢失） */
   ipcMain.on('pet:renderer-ready', () => {
     windowManager.resendVoiceMode('pet')
@@ -128,9 +117,9 @@ export function registerWindowIpc(): void {
   })
   ipcMain.on('chat:renderer-ready', () => {
     windowManager.resendVoiceMode('chat')
-    // 朗读状态必须在 voiceMode 之后补发：onVoiceMode 处理器会清空朗读文本
-    windowManager.resendReadingState('chat')
     windowManager.resendActiveSession('chat')
+    // 首建竞态兜底：宠物窗"打开聊天"带的会话 id 在 React 订阅前发出会丢 → 就绪时补发
+    windowManager.resendPendingChatSession()
   })
 
   /** 宠物窗内容框高度变化 → 调整宠物窗总高度（模型区恒定，顶边固定向下生长） */

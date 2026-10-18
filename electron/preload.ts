@@ -6,20 +6,17 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamNarrationPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
+import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
     sendMessage: (params) => ipcRenderer.invoke('ai:send-message', params),
-    onStreamChunk: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, chunk: string) => cb(chunk)
-      ipcRenderer.on('ai:stream-chunk', listener)
-      return () => ipcRenderer.removeListener('ai:stream-chunk', listener)
-    },
-    onStreamNarration: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: StreamNarrationPayload) => cb(payload)
-      ipcRenderer.on('ai:stream-narration', listener)
-      return () => ipcRenderer.removeListener('ai:stream-narration', listener)
+    /** 消息重答（截断最后一轮后重走正常链路；editText 非空 = 编辑并重发） */
+    regenerate: (params) => ipcRenderer.invoke('ai:regenerate', params),
+    onSessionRewound: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { sessionId: string; messages: import('../src/types').ChatMessage[] }) => cb(payload)
+      ipcRenderer.on('ai:session-rewound', listener)
+      return () => ipcRenderer.removeListener('ai:session-rewound', listener)
     },
     onStreamDone: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, payload: StreamDonePayload) => cb(payload)
@@ -36,13 +33,25 @@ const api: WindowApi = {
       ipcRenderer.on('ai:stream-user', listener)
       return () => ipcRenderer.removeListener('ai:stream-user', listener)
     },
-    onActiveSession: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, sessionId: string | null) => cb(sessionId)
-      ipcRenderer.on('ai:active-session', listener)
-      return () => ipcRenderer.removeListener('ai:active-session', listener)
-    },
     cancel: () => ipcRenderer.send('ai:cancel'),
-    testConnection: () => ipcRenderer.invoke('ai:test-connection'),
+    /** ===== 方案A快照协议（见 docs/方案A-主进程回合文档与幂等快照协议.md）===== */
+    getTurnSnapshot: () => ipcRenderer.invoke('ai:get-turn-snapshot') as Promise<import('../src/types').TurnDocument | null>,
+    onTurnState: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { doc: import('../src/types').TurnDocument }) => cb(payload.doc)
+      ipcRenderer.on('ai:turn-state', listener)
+      return () => ipcRenderer.removeListener('ai:turn-state', listener)
+    },
+    onTurnDone: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { doc: import('../src/types').TurnDocument }) => cb(payload.doc)
+      ipcRenderer.on('ai:turn-done', listener)
+      return () => ipcRenderer.removeListener('ai:turn-done', listener)
+    },
+    reportTurnProgress: (turnId, speakingChars, spokenChars) => ipcRenderer.send('ai:turn-progress', { turnId, speakingChars, spokenChars }),
+    reportTurnReadingDone: (turnId) => ipcRenderer.send('ai:turn-reading-done', { turnId }),
+    /** 语音链工作心跳（合成/播放中周期上行）：喂 reading 看门狗，慢合成不再被误判链路死亡 */
+    reportTurnReadingPing: (turnId) => ipcRenderer.send('ai:turn-reading-ping', { turnId }),
+    /** 测试连接（profile：main=主模型 / aux=辅助模型（未配置回落主模型）/ vision=视觉模型（独立必填不回落）） */
+    testConnection: (profile) => ipcRenderer.invoke('ai:test-connection', profile ?? 'main'),
     compactNow: (sessionId) => ipcRenderer.invoke('ai:compact-now', { sessionId }),
     getContextStats: (sessionId) => ipcRenderer.invoke('ai:get-context-stats', { sessionId }),
   },
@@ -93,6 +102,10 @@ const api: WindowApi = {
   session: {
     list: () => ipcRenderer.invoke('session:list'),
     get: (id) => ipcRenderer.invoke('session:get', id),
+    /** 读取最近活跃会话的情景摘要缓存（设置窗查看/编辑；无会话返回 null） */
+    getSceneDigest: () => ipcRenderer.invoke('session:scene-digest-get'),
+    /** 保存指定会话的情景摘要缓存（手动编辑；空串=清空缓存） */
+    setSceneDigest: (sessionId, text) => ipcRenderer.invoke('session:scene-digest-set', { sessionId, text }),
     create: (params) => ipcRenderer.invoke('session:create', params),
     remove: (id) => ipcRenderer.invoke('session:remove', id),
     rename: (id, title) => ipcRenderer.invoke('session:rename', id, title),
@@ -141,6 +154,10 @@ const api: WindowApi = {
     saveVisionApiKey: (key) => ipcRenderer.invoke('settings:save-vision-api-key', key),
     /** 视觉模型 Key 是否已配置（仅回显掩码用） */
     hasVisionApiKey: () => ipcRenderer.invoke('settings:has-vision-api-key'),
+    /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密；为空时运行时回落主 LLM Key） */
+    saveTranslationApiKey: (key) => ipcRenderer.invoke('settings:save-translation-api-key', key),
+    /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用） */
+    hasTranslationApiKey: () => ipcRenderer.invoke('settings:has-translation-api-key'),
     getDataDir: () => ipcRenderer.invoke('settings:get-data-dir'),
     changeDataDir: () => ipcRenderer.invoke('settings:change-data-dir'),
     resetDataDir: () => ipcRenderer.invoke('settings:reset-data-dir'),
@@ -184,18 +201,6 @@ const api: WindowApi = {
     },
     /** renderer 就绪通知（用于向主进程补发最近语音模式） */
     reportRendererReady: () => ipcRenderer.send('chat:renderer-ready'),
-    /** 订阅"语音朗读到当前段落文本"（宠物窗朗读时经主进程转发），聊天窗随语音段段显示 */
-    onReadingText: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, text: string) => cb(text)
-      ipcRenderer.on('chat:reading-text', listener)
-      return () => ipcRenderer.removeListener('chat:reading-text', listener)
-    },
-    /** 订阅"语音朗读是否进行中"（控制聊天窗跳动光标的显隐） */
-    onReadingActive: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, active: boolean) => cb(active)
-      ipcRenderer.on('chat:reading-active', listener)
-      return () => ipcRenderer.removeListener('chat:reading-active', listener)
-    },
     /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
     onVoiceMode: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, opts: { voiceEnabled: boolean }) => cb(opts)
@@ -230,18 +235,15 @@ const api: WindowApi = {
       ipcRenderer.on('cursor:move', listener)
       return () => ipcRenderer.removeListener('cursor:move', listener)
     },
-    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步） */
+    /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步）；
+     *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本 */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null; displayOnly?: boolean }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
     /** renderer 就绪通知（用于向主进程补发最近语音模式） */
     reportRendererReady: () => ipcRenderer.send('pet:renderer-ready'),
-    /** 上报宠物窗"当前已朗读到"的段落文本（段变化时调用），经主进程转发给聊天窗随语音显示 */
-    reportReadingText: (text: string) => ipcRenderer.send('pet:reading-text', text),
-    /** 上报语音朗读是否进行中（经主进程转发给聊天窗控制跳动光标显隐） */
-    reportReadingActive: (active: boolean) => ipcRenderer.send('pet:reading-active', active),
     /** 订阅 AI 回复情绪事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
     onEmotion: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, emotion: string) => cb(emotion)
@@ -280,6 +282,19 @@ const api: WindowApi = {
     },
     modelUrl: (modelId, model3Path) => `pet-res://models/${modelId}/${model3Path}`,
     spriteUrl: (spriteId, filePath) => `pet-res://sprites/${spriteId}/${filePath}`,
+  },
+  /** 运行日志：缓冲快照 / 历史文件尾部 / 打开日志文件夹 / 渲染端 console 转发 / 实时 tail */
+  logs: {
+    forward: (source, level, message) => ipcRenderer.send('logs:forward', source, level, message),
+    getBuffer: () => ipcRenderer.invoke('logs:get-buffer') as Promise<import('../src/types').LogEntry[]>,
+    readFileTail: () => ipcRenderer.invoke('logs:read-tail') as Promise<{ entries: import('../src/types').LogEntry[]; truncated: boolean }>,
+    openFolder: () => ipcRenderer.invoke('logs:open-folder') as Promise<string>,
+    clear: () => ipcRenderer.invoke('logs:clear') as Promise<void>,
+    onAppended: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, entry: import('../src/types').LogEntry) => cb(entry)
+      ipcRenderer.on('logs:appended', listener)
+      return () => ipcRenderer.removeListener('logs:appended', listener)
+    },
   },
   /** 语音合成（TTS）：MiMo 声音克隆 */
   tts: {

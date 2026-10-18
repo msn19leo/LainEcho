@@ -29,6 +29,8 @@ export interface PetStageHandle {
   getScale: () => number
   /** 播放语音并驱动口型同步：传入 wav ArrayBuffer */
   speak: (audio: ArrayBuffer) => Promise<void>
+  /** 当前语音播放进度（0~1；未播放返回 1）——播放进度插值上行用 */
+  getPlayProgress: () => number
   /** 停止播放语音并清零口型参数 */
   stopSpeak: () => void
   /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动；词表方案下为自由情绪词） */
@@ -72,6 +74,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const currentEmotionRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
   /** 当前立绘集词表的默认情绪词（空闲/重置态的默认展示跟随它；resolveSprite 时刷新） */
   const paletteDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
+  /** 上次已执行默认态迁移的默认情绪词（迁移基准）：仅当词表默认词相对它变化且空闲时才迁移。
+   *  不能用 paletteDefaultRef 当基准——refreshPalette 会先把它刷成新值，把"值变化"提前消费掉 */
+  const migratedDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
   /** 当前生效演出词表快照（演出词表双轨，模式分轨）：sprite 模式 = 立绘集词表（查图）；
    *  live2d 模式 = Live2D 模型词表（查表情联动 expression）。由 refreshPalette 按模式刷新 */
   const paletteEntriesRef = useRef<Array<{ name: string; gloss: string; expression?: string }>>([])
@@ -149,6 +154,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     speak: async (audio: ArrayBuffer) => {
       await lipSyncRef.current.play(audio)
     },
+    getPlayProgress: () => lipSyncRef.current.progress,
     /** 停止播放并清零口型 */
     stopSpeak: () => {
       lipSyncRef.current.stop()
@@ -269,10 +275,18 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         throw new Error(`立绘集不存在或没有图片（id=${spriteId}）`)
       }
       const has = (f: string | null | undefined) => !!f && spr.images.some((i) => i.filePath === f)
-      // 词表默认情绪词刷新 + 默认态跟随迁移：
-      // 当前情绪正处于旧默认词（或内置初始词）时，用户切换默认词后展示立即跟随新默认
+      // 词表默认情绪词刷新 + 默认态跟随迁移（值变化触发，2026-10-18 回归修复）：
+      // 仅当词表默认词相对"上次已迁移基准"变化且当前空闲（variant=idle）才迁移——
+      // 保留"改默认情绪 → 空闲立绘立即跟随"的目标（说话/思考变体期间不迁移，变体结束后
+      // 下一次 idle 解析自然跟随）。
+      // 【回归教训】早先的"空闲态无条件跟随新默认词"（2026-10-17 方案1）把"迁移"写成了
+      // "每次 idle 解析都重置"：轮内任何回 idle 的瞬间（语音段间隙 lipSync end、块边界
+      // setEmotion 恰逢 idle）都把 AI 轮内情绪抹平为默认词——实锤"立绘切为委屈后，后面
+      // 开心/害羞全部丢失、语音期间全程说话图"（平静让位说话图规则被重置误触发）。
+      // 正确语义=默认词值变化事件触发迁移，而非 idle 状态触发重置。
       const newDefault = paletteFromSprite(spr).defaultEmotion
-      if (currentEmotionRef.current === paletteDefaultRef.current || currentEmotionRef.current === BUILTIN_DEFAULT_EMOTION) {
+      if (variant === 'idle' && newDefault !== migratedDefaultRef.current) {
+        migratedDefaultRef.current = newDefault
         currentEmotionRef.current = newDefault
         emotion = newDefault // 查表同步用迁移后的词（emotion 参数来自调用方的 currentEmotionRef 快照）
       }

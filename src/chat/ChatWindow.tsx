@@ -19,11 +19,11 @@ import { FloatingDock } from '../components/FloatingDock'
 import { PendingMemoryBadge } from '../components/PendingMemoryBadge'
 import { useCharacterStore } from '../store/characterStore'
 import { bindPersistentSessionSync, useSessionStore } from '../store/sessionStore'
+import { useTurnDocStore } from '../store/turnDocStore'
 import { initSettingsSync } from '../store/settingsStore'
 import { MessageList } from './MessageList'
 import { InputArea } from './InputArea'
 import { SessionSidebar } from './SessionSidebar'
-import { useChatReadingStore } from './readingStore'
 import { toast } from '../components/toast'
 
 /**
@@ -55,59 +55,31 @@ export function ChatWindow() {
   const loadSession = useSessionStore((s) => s.loadSession)
   const resetCurrentSession = useSessionStore((s) => s.resetCurrentSession)
   const streaming = useSessionStore((s) => s.streaming)
-  // 持久订阅 AI 流式/完成事件，驱动会话消息流式上屏与完成落定（与宠物窗同步）
+  // ===== 方案A第3步：单源切换 =====
+  // 快照订阅 + 就绪拉取（幂等）：三时序开窗（生成中/跟读中/收尾后）的全部信息都在快照中。
+  // 旧直播链（stream-chunk 消费在 bind 内、reading 镜像四通道、认领补发）全部退役。
   useEffect(() => {
-    // 通知主进程 renderer 就绪：补发最近一次语音模式，避免广播早于订阅而丢失
+    // 通知主进程 renderer 就绪（补发语音模式等非直播状态，保留）
     api.chat.reportRendererReady()
-    return bindPersistentSessionSync()
+    const unsubTurn = api.ai.onTurnState((doc) => {
+      useTurnDocStore.getState().adopt(doc)
+    })
+    const unsubTurnDone = api.ai.onTurnDone((doc) => {
+      useTurnDocStore.getState().adopt(doc)
+    })
+    void api.ai.getTurnSnapshot().then((doc) => {
+      if (doc) useTurnDocStore.getState().adopt(doc)
+    }).catch(() => {})
+    const unsubSync = bindPersistentSessionSync()
+    return () => {
+      unsubTurn()
+      unsubTurnDone()
+      unsubSync()
+    }
   }, [])
 
   // 全局设置实时同步：加载持久化设置并订阅主进程广播（文字速度等设置窗改动后立即对聊天窗生效）
   useEffect(() => initSettingsSync(), [])
-
-  // 订阅宠物窗朗读文本与之语音模式：聊天窗与宠物窗采用一致的分段跟读展示
-  useEffect(() => {
-    const unsubText = api.chat.onReadingText((text) => {
-      useChatReadingStore.getState().setText(text)
-    })
-    const unsubMode = api.chat.onVoiceMode(({ voiceEnabled }) => {
-      useChatReadingStore.getState().setFollowReading(!!voiceEnabled)
-      // 新一轮语音模式到达：清空上一轮朗读文本，避免先冒出上轮内容
-      useChatReadingStore.getState().clear()
-    })
-    // 记录上一帧朗读态：仅"真正的朗读结束（active 下降沿）"才清 streamingContent，
-    // 避免非跟读模式（active 恒 false）下语音播放状态变化反复误清，导致打字机中途跳定型
-    let prevActive = false
-    const unsubActive = api.chat.onReadingActive((active) => {
-      useChatReadingStore.getState().setReadingActive(active)
-      if (prevActive && !active) {
-        const st = useSessionStore.getState()
-        if (!st.streaming) useSessionStore.setState({ streamingContent: '' })
-      }
-      prevActive = active
-    })
-    return () => {
-      unsubText()
-      unsubMode()
-      unsubActive()
-    }
-  }, [])
-
-  // 主动终止 / 出错：结束本轮朗读态（chat 侧由宠物窗转发同步，这里再兜底清一次，避免残留"待输出"光标）
-  useEffect(() => api.ai.onStreamError(() => {
-    const r = useChatReadingStore.getState()
-    r.setReadingActive(false)
-    r.clear()
-  }), [])
-
-  // 新一轮流式开始：清空上一轮朗读文本，避免残留导致"先闪上轮内容"
-  useEffect(() => {
-    let prev = useSessionStore.getState().streaming
-    return useSessionStore.subscribe((s) => {
-      if (s.streaming && !prev) useChatReadingStore.getState().clear()
-      prev = s.streaming
-    })
-  }, [])
 
   const currentCard = cards.find((c) => c.id === currentCardId)
   const currentSession = sessions.find((s) => s.id === currentSessionId)

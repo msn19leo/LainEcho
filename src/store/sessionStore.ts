@@ -20,6 +20,11 @@ interface SessionState {
   resetCurrentSession: () => void
   /** 发送消息并驱动流式输出（无会话时先惰性创建再发送） */
   send: (content: string) => Promise<void>
+  /**
+   * 消息重答（最后一轮）：editText 非空 = 编辑并重发；为空 = 重新回答。
+   * 主进程截断最后一轮（广播 ai:session-rewound 由订阅同步两窗）后重跑正常聊天链路。
+   */
+  regenerate: (editText?: string) => Promise<void>
   stop: () => void
   /** 其他窗口新建/删除会话后的跨窗口同步（刷新列表；当前会话被删则回到空会话状态） */
   onSessionsChanged: () => Promise<void>
@@ -156,6 +161,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       })()
     }),
 
+  regenerate: async (editText) => {
+    const { currentSessionId, streaming } = get()
+    if (!currentSessionId || streaming) return
+    try {
+      await api.ai.regenerate({ sessionId: currentSessionId, editText: editText?.trim() || undefined })
+    } catch (err) {
+      // 失败（如轮次进行中被主进程拒绝）不中断界面；重答链路无流式态需要复位
+      console.error('重新回答失败', err)
+    }
+  },
+
   stop: () => api.ai.cancel(),
 
   onSessionsChanged: async () => {
@@ -200,7 +216,10 @@ export function bindPersistentSessionSync(): () => void {
     useSessionStore.setState({ streaming: true, streamingContent: '', streamError: null })
     // 幂等追加：仅在 messages 末尾还没有这条 user 消息时补上，避免发起方收到自身广播时重复
     const last = st.messages[st.messages.length - 1]
-    if (last?.role === 'user' && last.content === payload.content) return
+    if (last?.role === 'user' && last.content === payload.content) {
+      console.log('[bind] streamUser DUP 已存在，跳过 usr=' + payload.content.slice(0, 12))
+      return
+    }
     // 跟随窗口若尚未持有该会话（新会话首条会先广播 stream-user），从事件中即席采纳会话 id，
     // 让新会话的第一个用户气泡立即同步出现，无需等主进程 session:current 或 stream-done
     useSessionStore.setState((s) => ({
@@ -212,21 +231,10 @@ export function bindPersistentSessionSync(): () => void {
     }))
     console.log('[bind] streamUser ADD usr=' + payload.content.slice(0, 12))
   })
-  const unsubActive = api.ai.onActiveSession((sessionId) => {
-    // 仅认领：本地尚未持有会话、且主进程确实有进行中的流时，才拉取该会话补上漏掉的轮次。
-    // 本地已有会话（无论是否等于该 id）一律忽略，绝不顶掉用户正看的会话。
-    if (!sessionId || isStoryRunId(sessionId)) return
-    const st = useSessionStore.getState()
-    if (st.currentSessionId) return
-    void useSessionStore.getState().loadSession(sessionId)
-  })
-  const unsubChunk = api.ai.onStreamChunk((delta) => {
-    const st = useSessionStore.getState()
-    if (!st.currentSessionId) return
-    // 非发起方的镜像：本轮首块时重置流式内容
-    const base = st.streaming ? st.streamingContent : ''
-    useSessionStore.setState({ streaming: true, streamError: null, streamingContent: base + (delta ?? '') })
-  })
+  // ===== 方案A第3步：旧直播链退役 =====
+  // 已删除：onActiveSession 认领补发（快照拉取取代）、onStreamChunk 增量消费（快照取代）。
+  // 保留：streamUser（用户气泡即时同步，非直播显示职责）、streamDone（落盘拉取）、
+  //       streamError（错误态）——这三者属于会话编排，不属于直播显示。
   const unsubDone = api.ai.onStreamDone((payload) => {
     const st = useSessionStore.getState()
     if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
@@ -263,11 +271,18 @@ export function bindPersistentSessionSync(): () => void {
     })
     void refreshSessionIndex()
   })
+  // ===== 消息重答：会话截断广播（ai:regenerate 删除最后一轮后）=====
+  // 两窗用磁盘最新消息列表整体替换本地（旧轮 user+assistant 气泡消失），
+  // 随后的 ai:stream-user 按既有链路补上重发/重跑的用户气泡
+  const unsubRewound = api.ai.onSessionRewound((payload) => {
+    const st = useSessionStore.getState()
+    if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
+    useSessionStore.setState({ messages: payload.messages ?? [], streaming: false, streamingContent: '', streamError: null })
+  })
   return () => {
     unsubUser()
-    unsubActive()
-    unsubChunk()
     unsubDone()
     unsubError()
+    unsubRewound()
   }
 }

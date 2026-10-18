@@ -23,14 +23,22 @@ class WindowManager {
   private pendingVoiceMode: { voiceEnabled: boolean } | null = null
   /** 最近一次广播的语音模式（窗口就绪后补发用） */
   private lastVoiceMode: { voiceEnabled: boolean } | null = null
-  /** 最近一次上报的朗读状态（聊天窗就绪后补发用：窗晚开时补齐跟读进度，避免落定全文直接上屏） */
-  private lastReadingText = ''
-  private lastReadingActive = false
   /** 当前正在进行 AI 流式回复的会话 id（无则 null）。用于窗口重载/新建后就绪时补发，
    *  让重开/热更的窗口能"认领"进行中的会话，避免漏掉该轮的 stream-user/done 而看起来"生成失败" */
   private activeStreamingSession: string | null = null
+  /** 进行中流的累积显示文本快照（随每次 flush 更新）。窗口中途就绪认领会话时随
+   *  ai:active-session 一并补发，让晚开的聊天窗/宠物窗立即对齐流式进度，
+   *  而不是空泡等到下一个 chunk 才从中间接上（2026-10-13 截图案例） */
+  private activeStreamDisplay = ''
+  /** 进行中轮次的用户消息（仅认领补气泡用；user 消息回合结束才落盘，中途打开的窗口
+   *  从磁盘拉不到它，广播又已错过 → 必须由主进程随认领补发）。随轮次生命周期清理 */
+  private activeStreamUser: { sessionId: string; content: string; timestamp: number; meta: import('../../src/types').ChatMessageMeta | null } | null = null
   /** 最近一次推送给桌宠的角色卡形象配置。桌宠 renderer 就绪后补发（推送早于订阅时 IPC 消息会丢） */
   private lastPetCard: PetCardPayload | null = null
+  /** 待新聊天窗加载的会话 id（宠物窗"打开聊天"带过来的）。窗口首建时 did-finish-load
+   *  早于 React 订阅 chat:open-session，事件会丢（偶发"新开窗没有历史"，2026-10-14 16:30 实锤）
+   *  → 缓存到 renderer-ready 补发。消费一次即清 */
+  private pendingChatSessionId: string | null = null
   private pendingPetSpeaks: Array<{
     text: string
     voiceId: string | null
@@ -166,10 +174,9 @@ class WindowManager {
    * 通知桌宠窗口播放语音（由聊天窗口 AI 回复后调用）。
    * 桌宠窗口收到 pet:speak 事件后：调用 TTS 合成 → 播放音频 → 口型同步。
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
+   * displayOnly=true 表示纯旁白块（（）描写）：不合成语音，仅按序上屏文本（段落随语音顺序出现）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }): void {
-    const win = this.pet
-    if (!win || win.isDestroyed()) return
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null }): void {
     const body: {
       text: string
       voiceId: string | null
@@ -178,6 +185,8 @@ class WindowManager {
       follow: boolean
       engine?: 'genie' | 'mimo'
       genieOverride?: import('../../src/types').CharacterGenieOverride | null
+      displayOnly?: boolean
+      segIndex?: number | null
     } = {
       text,
       voiceId,
@@ -186,12 +195,16 @@ class WindowManager {
       follow: payload?.follow ?? true,
       engine: payload?.engine,
       genieOverride: payload?.genieOverride ?? null,
+      displayOnly: payload?.displayOnly ?? false,
+      segIndex: payload?.segIndex ?? null,
     }
-    // 桌宠 renderer 未就绪（首个回答常发生）→ 先缓存，ready 后补发，避免丢声
+    // 桌宠 renderer 未就绪（首个回答常发生）→ 先缓存，ready 后补发，避免丢声（旁白块同样缓存保序）
     if (!this.petSpeakReady) {
       this.pendingPetSpeaks.push(body)
       return
     }
+    const win = this.pet
+    if (!win || win.isDestroyed()) return
     win.webContents.send('pet:speak', body)
   }
 
@@ -231,17 +244,37 @@ class WindowManager {
     else win.webContents.send('chat:voice-mode', this.lastVoiceMode)
   }
 
-  /** 记录当前正在进行 AI 流式回复的会话 id（流式开始置入，结束置 null） */
-  setActiveStreamingSession(sessionId: string | null): void {
+  /** 记录当前正在进行 AI 流式回复的会话 id（流式开始置入，结束置 null）+ 累积显示快照 + 用户消息 */
+  setActiveStreamingSession(
+    sessionId: string | null,
+    displaySnapshot?: string,
+    user?: { sessionId: string; content: string; timestamp: number; meta: import('../../src/types').ChatMessageMeta | null } | null,
+  ): void {
     this.activeStreamingSession = sessionId
+    // user 载荷随轮次生命周期：开始记录、结束清理
+    if (sessionId) {
+      this.activeStreamUser = user ?? null
+    } else {
+      this.activeStreamUser = null
+    }
+    // 快照与会话 id 同生命周期：置 null 时一并清空，避免残留到下一轮
+    if (!sessionId) this.activeStreamDisplay = ''
+    else if (typeof displaySnapshot === 'string') this.activeStreamDisplay = displaySnapshot
   }
 
-  /** 单个窗口 renderer 就绪后补发"进行中的会话 id"（null 表示当前无流式）。
-   *  重载窗口借此认领进行中的会话，避免漏掉该轮事件；故意只发给指定窗口，不广播干扰其它窗口 */
+  /** 流式期间随时更新累积显示快照（flushChunks 增长后调用，供中途就绪的窗口补发） */
+  setActiveStreamDisplay(text: string): void {
+    this.activeStreamDisplay = text
+  }
+
+  /** 单个窗口 renderer 就绪后补发"进行中的会话 id + 累积显示快照 + 用户消息"（null 表示当前无流式）。
+   *  故意只发给指定窗口，不广播干扰其它窗口 */
   resendActiveSession(target: 'pet' | 'chat'): void {
     const win = target === 'pet' ? this.pet : this.chat
     if (!win || win.isDestroyed()) return
-    win.webContents.send('ai:active-session', this.activeStreamingSession)
+    const active = this.activeStreamingSession
+    const display = this.activeStreamingSession ? this.activeStreamDisplay : ''
+    win.webContents.send('ai:active-session', active, display, this.activeStreamUser)
   }
 
   /** 桌宠 renderer 就绪后补发最近一次角色卡形象配置（防推送早于订阅而丢失导致形象空白） */
@@ -264,34 +297,6 @@ class WindowManager {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('session:current', sessionId)
     }
-  }
-
-  /** 宠物窗朗读到某段文本时转发给聊天窗，让其随语音段段显示（null 表示清空） */
-  notifyReadingText(text: string): void {
-    this.lastReadingText = text ?? ''
-    if (this.chat && !this.chat.isDestroyed()) {
-      this.chat.webContents.send('chat:reading-text', text)
-    }
-  }
-
-  /** 桌宠窗朗读是否进行中 → 转发给聊天窗控制光标 */
-  notifyReadingActive(active: boolean): void {
-    console.log('[sync] pet阅读Active→chat', active)
-    this.lastReadingActive = active === true
-    if (this.chat && !this.chat.isDestroyed()) {
-      this.chat.webContents.send('chat:reading-active', active)
-    }
-  }
-
-  /** 聊天窗 renderer 就绪后补发最近一次朗读状态（文本 + 进行中标记）。
-   *  聊天窗晚于朗读开始才被唤出/创建时，此前的 reading-text/active 报告都已丢失，
-   *  不补发会导致落定全文绕过跟读门直接上屏（与桌宠窗不同步，2026-09-29 线上案例）。
-   *  注意必须在 resendVoiceMode 之后调用：onVoiceMode 处理器会清空朗读文本。 */
-  resendReadingState(target: 'chat'): void {
-    const win = this.chat
-    if (!win || win.isDestroyed()) return
-    win.webContents.send('chat:reading-text', this.lastReadingText)
-    win.webContents.send('chat:reading-active', this.lastReadingActive)
   }
 
   /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘（词表方案下为自由情绪词） */
@@ -330,15 +335,25 @@ class WindowManager {
   showChat(sessionId?: string): void {
     if (!this.chat || this.chat.isDestroyed()) {
       this.chat = createChatWindow()
-      // 窗口创建后（DOM 就绪）再把目标会话 id 交给聊天窗加载
-      this.chat.webContents.once('did-finish-load', () => {
-        if (sessionId) this.chat?.webContents.send('chat:open-session', sessionId)
-      })
+      // 首建：React 订阅晚于 did-finish-load，此刻直发 chat:open-session 会丢
+      // （偶发"新开窗没有历史、上一轮回答被挤没"，2026-10-14 16:30 实锤）
+      // → 缓存到 chat:renderer-ready 补发（与 lastPetCard/activeSession 同一模式）
+      if (sessionId) this.pendingChatSessionId = sessionId
       return
     }
     if (sessionId) this.chat.webContents.send('chat:open-session', sessionId)
     if (!this.chat.isVisible()) this.chat.show()
     this.chat.focus()
+  }
+
+  /** 聊天窗 renderer 就绪 → 补发待加载会话（首建竞态的兜底通道） */
+  resendPendingChatSession(): void {
+    if (!this.pendingChatSessionId) return
+    const sid = this.pendingChatSessionId
+    this.pendingChatSessionId = null
+    if (this.chat && !this.chat.isDestroyed()) {
+      this.chat.webContents.send('chat:open-session', sid)
+    }
   }
 
   // ---------------- 设置 ----------------

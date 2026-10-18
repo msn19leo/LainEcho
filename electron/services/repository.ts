@@ -328,13 +328,37 @@ function currentTimeSection(now = new Date()): string {
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
   const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
   const h = now.getHours()
-  const hour12 = h % 12 === 0 ? 12 : h % 12
+  // 0 点的 12h 制表述用"凌晨0点"而非"凌晨12点"——后者罕见且有歧义，模型实测把它当弱锚点
+  // 无视（2026-10-16 00:23 轮实锤：声明"凌晨12点23分"模型仍答"晚上十一点半"）；正午 12 点不变
+  const hour12 = h === 0 ? 0 : h % 12 === 0 ? 12 : h % 12
   const period = h < 6 ? '凌晨' : h < 12 ? '上午' : h < 13 ? '中午' : h < 18 ? '下午' : '晚上'
   const minute = now.getMinutes() === 0 ? '整' : `${String(now.getMinutes()).padStart(2, '0')}分`
   return [
     `【当前真实时间】${date} ${week} ${hhmm}（${period}${hour12}点${minute}）。`,
     '对话中提到"现在""今天""刚才"等时刻一律以此为准；历史消息中的时间是过去的时刻，不代表现在。',
   ].join('\n')
+}
+
+/**
+ * 时间感知关闭时的防幻觉条款：模型无内置时钟，纯静默（什么都不注入）会靠训练先验乱猜
+ * "今天星期五"——显式声明"你不知道时间"后模型行为才可预期（坦诚说不知道而非编造）。
+ */
+const TIME_UNAWARE_SECTION = [
+  '【时间感知已关闭】你没有可靠的时钟感知，不知道现在几点、今天星期几，也无法知道消息之间间隔了多久。',
+  '不要声称或暗示你知道当前时间或日期，被问到时坦诚说"不太确定"；也不要根据时间推断对方的作息或状态。',
+].join('\n')
+
+/**
+ * 记忆年龄前缀（时间感知方案2）：检索打分已有 recency 因子（30 天半衰期），但模型看不到
+ * "多久之前"——两个月前的临时状态会被当现状。以相对时长标注，不写绝对日期（避免时区/
+ * 换算歧义，与时间 Section 的 12h 制免换算口径一致）。受时间感知总开关门控。
+ */
+function formatMemoryAge(createdAt: number, now = Date.now()): string {
+  const ms = Math.max(0, now - createdAt)
+  if (ms < 60 * 60 * 1000) return '（刚刚）'
+  if (ms < 48 * 60 * 60 * 1000) return `（约${Math.round(ms / 3_600_000)}小时前）`
+  if (ms < 60 * 86_400_000) return `（约${Math.round(ms / 86_400_000)}天前）`
+  return `（约${Math.round(ms / (30 * 86_400_000))}个月前）`
 }
 
 /**
@@ -348,6 +372,8 @@ function currentTimeSection(now = new Date()): string {
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入）
  * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：旁白规范段替换为禁括号版本
  * @param emotionPalette 角色绑定的情绪词表（null = 未启用词表，输出格式段维持旧 6 枚举金样原文）
+ * @param timeAwareness 时间感知总开关（缺省/undefined = 开启，向后兼容）：开启 → 当前时间锚点 +
+ *   记忆年龄标注；关闭 → 防时间幻觉条款。记忆检索打分的 recency 因子属于排序逻辑，不受此开关影响
  */
 export function buildSystemPrompt(
   card: CharacterCard | null,
@@ -358,11 +384,25 @@ export function buildSystemPrompt(
   storyDirective?: string | null,
   stripParenNarration?: boolean,
   emotionPalette?: EmotionPaletteRef | null,
+  timeAwareness?: boolean,
+  sceneSection?: string | null,
 ): string {
-  const sections = buildSystemParts(card, memories, profileDigest, proactiveHint, storyDirective, stripParenNarration, emotionPalette)
+  const timeAware = timeAwareness !== false
+  // 方案2 记忆年龄标注：在组装层做映射（不进 buildSystemParts/composeSystemPrompt），金样测试
+  // 直接测这两层、传自己的 memories，不受影响。无 createdAt 的条目（防御）原样透传
+  const effectiveMemories = timeAware
+    ? memories.map((m) =>
+        typeof m.createdAt === 'number' && m.createdAt > 0 ? { ...m, content: `${formatMemoryAge(m.createdAt)}${m.content}` } : m,
+      )
+    : memories
+  const sections = buildSystemParts(card, effectiveMemories, profileDigest, proactiveHint, storyDirective, stripParenNarration, emotionPalette)
   const composed = composeSystemPrompt(sections, { userName }).text
-  // 时间 Section 置于最前：模型先建立"现在"的锚点，再读画像/人设/记忆
-  return `${currentTimeSection()}\n\n${composed}`
+  // 时间 Section 置于最前：模型先建立"现在"的锚点，再读画像/人设/记忆。
+  // 总开关关闭 → 防幻觉条款占位（模型无时钟，纯静默会乱猜，见 TIME_UNAWARE_SECTION 注释）
+  const timeHeader = timeAware ? currentTimeSection() : TIME_UNAWARE_SECTION
+  // 情境 Section 紧随时间之后（先"现在几点"再"现在什么情境"）。组装层拼接（金样零影响）；
+  // 缺省（无摘要/开关关闭/调用方未传）不注入，模型退化为现状
+  return sceneSection ? `${timeHeader}\n\n${sceneSection}\n\n${composed}` : `${timeHeader}\n\n${composed}`
 }
 
 // ---------------- 会话 ----------------
@@ -454,6 +494,107 @@ export async function appendSessionMessages(id: string, extra: ChatMessage[]): P
 }
 
 /**
+ * 删除会话最后一轮（末尾 assistant + 其前最近的 user），返回被删除的 user 内容供重答复用。
+ * 末尾不是 assistant、或其前没有 user 时不动并返回 null（防御：轮次未完成/空会话/消息不足）。
+ * "截断最后一轮 → 重走正常链路"模式（消息重答功能的主进程侧落盘操作）。
+ */
+export async function deleteLastTurnMessages(id: string): Promise<ChatMessage | null> {
+  assertValidResourceId(id, 'session')
+  let removedUser: ChatMessage | null = null
+  await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) return cur
+    const msgs = cur.messages ?? []
+    if (msgs.length === 0) return cur
+    const last = msgs[msgs.length - 1]
+    // 形态1：完整轮（末尾 assistant + 其前 user）→ 两条一起删
+    if (last?.role === 'assistant') {
+      if (msgs.length < 2) return cur
+      const prev = msgs[msgs.length - 2]
+      if (prev?.role !== 'user') return cur
+      removedUser = prev
+      return { ...cur, messages: msgs.slice(0, -2) }
+    }
+    // 形态2：孤立 user（上一轮发送失败/取消落盘的"未收到回复"消息，2026-10-17 实锤）
+    // → 只删它并以原内容重跑（重答=重发）；主动搭话旁白不是用户输入，不参与重答
+    if (last?.role === 'user' && !last.meta?.proactive) {
+      removedUser = last
+      return { ...cur, messages: msgs.slice(0, -1) }
+    }
+    return cur
+  })
+  if (!removedUser) return null
+  // 更新索引 messageCount / updatedAt（title 不回退：由首条 user 派生，重答不影响）
+  const detail = await getSession(id)
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => {
+    const idx = index.findIndex((s) => s.id === id)
+    if (idx === -1) return index
+    const existing = index[idx] as SessionIndexItem
+    index[idx] = { ...existing, messageCount: detail?.messages.length ?? 0, updatedAt: Date.now() }
+    return index
+  })
+  return removedUser
+}
+
+/**
+ * 重发去重：发送前若磁盘末条是**带 error 标记的失败 user** 且内容与本次发送完全相同，
+ * 则移除它（本次发送替代失败尝试）。失败轮落盘 user 携带 error 供"未收到回复"提示展示，
+ * 但用户重发同一条消息时若不替换，历史里会出现两条相邻重复 user（2026-10-17 实锤，
+ * 重复消息进入上下文还可能诱发模型输出劣化）。
+ */
+export async function removeFailedDuplicateUser(id: string, content: string): Promise<void> {
+  assertValidResourceId(id, 'session')
+  const text = content.trim()
+  if (!text) return
+  await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) return cur
+    const msgs = cur.messages ?? []
+    const last = msgs[msgs.length - 1]
+    if (last?.role !== 'user' || !last.error || last.content.trim() !== text) return cur
+    return { ...cur, messages: msgs.slice(0, -1) }
+  })
+}
+
+/**
+ * 存量清理（启动一次性、幂等）：扫描全部会话，移除"失败 user + 紧随其后的同内容重发 user"
+ * 相邻重复对（历史版本未做重发去重时产生的重复，2026-10-17 实锤 19:20 轮）。
+ * 仅当两条**相邻**且内容一致、前一条带 error 标记时才删前一条——保守不误删正常对话。
+ */
+export async function dedupeFailedUserResends(): Promise<void> {
+  try {
+    const index = await listSessions()
+    for (const item of index) {
+      await mutateJson<SessionDetail | null>(paths.sessionFile(item.id), null, (cur) => {
+        if (!cur) return cur
+        const msgs = cur.messages ?? []
+        let changed = false
+        const out: ChatMessage[] = []
+        for (let i = 0; i < msgs.length; i++) {
+          const cur2 = msgs[i]
+          if (!cur2) continue
+          const prev = out[out.length - 1]
+          if (
+            prev &&
+            prev.role === 'user' &&
+            !!prev.error &&
+            cur2?.role === 'user' &&
+            cur2.content.trim() === prev.content.trim() &&
+            !cur2.error
+          ) {
+            // 前一条失败 user 被同内容重发替代 → 丢弃前一条
+            changed = true
+            continue
+          }
+          out.push(cur2)
+        }
+        return changed ? { ...cur, messages: out } : cur
+      })
+    }
+  } catch (err) {
+    console.error('[migrate] 重发去重清理失败', err)
+  }
+}
+
+/**
  * 写入会话的历史摘要（A2 自动压缩产物，落盘复用）。
  * 会话文件不存在（已被删除）时静默忽略；摘要不参与消息数组，UI 不展示。
  */
@@ -464,6 +605,38 @@ export async function updateSessionSummary(id: string, summary: string): Promise
   await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
     if (!cur) return cur
     return { ...cur, summary: text }
+  })
+}
+
+/**
+ * 写入会话的情景摘要缓存（情境服务 Phase 1：每轮由辅助模型异步更新"此刻场景状态"）。
+ * 会话文件不存在时静默忽略；空摘要不写（保留旧值）。
+ */
+export async function updateSessionSceneDigest(id: string, digest: string): Promise<void> {
+  assertValidResourceId(id, 'session')
+  const text = digest?.trim()
+  if (!text) return
+  await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) return cur
+    return { ...cur, sceneDigest: text }
+  })
+}
+
+/**
+ * 手动写入/清空会话的情景摘要缓存（设置窗文本块编辑通道）。
+ * 与 updateSessionSceneDigest 的区别：允许空串清除字段（用户显式清空 = 删除缓存，
+ * 下一轮注入只剩系统层活跃状态行，之后由辅助模型重新生成）。
+ */
+export async function setSessionSceneDigest(id: string, text: string): Promise<void> {
+  assertValidResourceId(id, 'session')
+  const trimmed = text?.trim() ?? ''
+  await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) return cur
+    if (!trimmed) {
+      const { sceneDigest: _removed, ...rest } = cur
+      return rest
+    }
+    return { ...cur, sceneDigest: trimmed }
   })
 }
 
@@ -745,12 +918,23 @@ const DEFAULT_SETTINGS: AppSettings = {
   embeddingBaseURL: '',
   // 嵌入模型名（对应嵌入服务商；Key 走独立加密存储）
   embeddingModel: '',
+  // 翻译/修复辅助模型（P0-2B：ja 翻译与 JSON 结构修复走快速小模型；留空回落主对话模型）
+  translationBaseURL: '',
+  translationModel: '',
+  // AI 时间感知总开关：默认开启（当前时间锚点/对话间隔/记忆年龄/摘要时间线全链路）
+  timeAwarenessEnabled: true,
+  // 语音文本跟随语音逐字显示：默认开启（台词文本按音频播放进度逐字放行）
+  voiceTextFollowAudio: true,
+  // 情景摘要缓存：默认开启（每轮异步更新"此刻场景状态"，注入【当前情景】Section）
+  enableSceneDigest: true,
   // 语义去重相似度阈值（cos ≥ 阈值视为重复）
   memoryDedupThreshold: 0.92,
   // 你的称呼：%player% 占位符的替换值
   userName: '用户',
-  // 文字显示速度：0-100 速度档（越大越快；0=即时显示）
+  // 文字显示速度：0-100 速度档（越大越快；0=即时显示）——桌宠/聊天窗用
   textSpeed: 80,
+  // 剧情窗对话框文字显示速度（独立于通用 textSpeed，仅剧情系统读取）
+  storyTextSpeed: 80,
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -787,9 +971,15 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.memoryRetrievalEnabled !== undefined) next.memoryRetrievalEnabled = patch.memoryRetrievalEnabled
     if (patch.embeddingBaseURL !== undefined) next.embeddingBaseURL = patch.embeddingBaseURL
     if (patch.embeddingModel !== undefined) next.embeddingModel = patch.embeddingModel
+    if (patch.translationBaseURL !== undefined) next.translationBaseURL = patch.translationBaseURL
+    if (patch.translationModel !== undefined) next.translationModel = patch.translationModel
+    if (patch.timeAwarenessEnabled !== undefined) next.timeAwarenessEnabled = patch.timeAwarenessEnabled
+    if (patch.voiceTextFollowAudio !== undefined) next.voiceTextFollowAudio = patch.voiceTextFollowAudio
+    if (patch.enableSceneDigest !== undefined) next.enableSceneDigest = patch.enableSceneDigest
     if (patch.memoryDedupThreshold !== undefined) next.memoryDedupThreshold = patch.memoryDedupThreshold
     if (patch.userName !== undefined) next.userName = patch.userName
     if (patch.textSpeed !== undefined) next.textSpeed = patch.textSpeed
+    if (patch.storyTextSpeed !== undefined) next.storyTextSpeed = patch.storyTextSpeed
     return next
   })
   return { ...DEFAULT_SETTINGS, ...result }

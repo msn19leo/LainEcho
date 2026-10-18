@@ -12,11 +12,13 @@
  */
 import type { AppSettings, ChatMessage, ChatMessageMeta } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
-import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, extractLeadingNarration, splitNarrationGroups, consumeLeadingNarration, stripParenGroups, emotionAdherence } from './emotion'
+import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, consumeLeadingNarration, stripParenGroups, emotionAdherence, splitLeadingNarrGroups, extractScriptChunkDelta, prepareScriptPartial, stripStreamWrappers } from './emotion'
 import { buildModelContext, SUMMARY_MAX_TOKENS, toModelMessage, type ModelMessage } from './context'
 import { estimateMessagesTokens } from './token'
 import { getTTSConfig } from '../ipc/tts.ipc'
 import { readApiKey } from './crypto'
+import { resolveAuxLlmConfig } from './auxModel'
+import { buildSceneSection, updateSceneDigestAfterTurn } from './sceneContext'
 import { extractMemoriesFromSession } from './memoryExtraction'
 import {
   appendSessionMessages,
@@ -32,9 +34,59 @@ import {
 import type { EmotionPaletteRef } from '../../src/types'
 import { retrieveMemories } from './memory/retriever'
 import { windowManager } from '../windows/windowManager'
+import * as turnCoordinator from './turnCoordinator'
 
 /** 降级模式的记忆注入条数（与旧 MAX_MEMORIES 一致） */
 const MAX_MEMORIES = 8
+
+/**
+ * ① 历史格式示范轮数：最近 N 条 assistant 消息以紧凑 dialogue JSON 回传给模型。
+ * 根因（2026-10-15 结构修复高频触发）：落库 assistant.content 是解析后纯文本，回传历史
+ * 全是「（旁白）台词（旁白）台词」形态，JSON 契约只在 system prompt 一处——会话越长，
+ * 纯文本历史的 few-shot 诱导力越强，压过纸面契约 → 模型漂移到引号剧本/退化 JSON。
+ * 回传 JSON 示范让 few-shot 从"诱导漂移"反转为"锚定格式"。只取最近 N 条控 token 预算。
+ */
+const HISTORY_JSON_TURNS = 6
+
+/**
+ * ① 历史格式示范：把最近 N 条含 chunks 的 assistant 消息改写为紧凑 dialogue JSON 内容。
+ * 无 chunks（剧情/旁白/旧消息）与 proactive 旁白自然跳过；JSON.stringify 紧凑序列化零空白。
+ */
+function backfillHistoryJson(history: ChatMessage[]): ChatMessage[] {
+  let quota = HISTORY_JSON_TURNS
+  return history.map((m) => {
+    if (m.role !== 'assistant' || m.meta?.proactive || quota <= 0) return m
+    const chunks = (m.chunks ?? []).filter((c) => typeof c.text === 'string' && c.text.trim())
+    if (chunks.length === 0) return m
+    quota--
+    const json = JSON.stringify({ dialogue: chunks.map((c) => ({ text: c.text, emotion: c.emotion, kind: c.kind ?? 'speak' })) })
+    return { ...m, content: json }
+  })
+}
+
+/** 方案1 轮间间隔标注已移除（2026-10-16）：被逐条绝对时间前缀取代——
+ *  绝对时刻下模型可自行推导时长，相对跳转标注冗余 */
+
+/**
+ * 时间感知（Shinsekai 式逐条绝对时间，2026-10-16）：给每条 user 消息按**自身 timestamp** 注入
+ * `[YYYY-MM-DD HH:mm:ss]` 独立行前缀。历史消息携带"当时的时刻"，"现在几点/我们聊了多久/
+ * 开始说话时几点"均可从历史推导（2026-10-16 00:23 轮实锤：模型被问时间时只能按场景编造）。
+ *
+ * 关键设计：前缀在**组装层动态生成**而非持久化——落盘内容不变，记忆检索发生在组装前、
+ * 用原始 content，天然无嵌入污染（Shinsekai 因持久化前缀需要额外的剥前缀防御，本方案不需要）。
+ * 仅标 user 消息（assistant 时刻可由前后 user 消息推导，省 token）；**剧情轮次不标**（故事
+ * 时间轴优先，真实时间戳会干扰剧情沉浸）。user 消息不被 ①JSON 示范改写（只作用 assistant），
+ * 前缀无冲突。总开关关闭时原样返回。
+ */
+function annotateUserTimestamps(messages: ChatMessage[], enabled: boolean, isStory: boolean): ChatMessage[] {
+  if (!enabled || isStory) return messages
+  return messages.map((m) => {
+    if (m.role !== 'user' || typeof m.timestamp !== 'number' || m.timestamp <= 0) return m
+    const d = new Date(m.timestamp)
+    const ts = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
+    return { ...m, content: `[${ts}]\n${m.content}` }
+  })
+}
 
 /** 当前进行中的轮次（ai:cancel 取消 / 投放闸门判定用） */
 let currentAbort: AbortController | null = null
@@ -104,6 +156,12 @@ export function createSummarizer(settings: AppSettings, apiKey: string, signal?:
 const CHUNK_FLUSH_MS = 16
 /** 单个"情绪块"最多合并的 dialogue 项数：超过即提前结算，保持在"边生成边读"的实时性，避免单块越长越延迟出声 */
 const BLOCK_MAX_ITEMS = 3
+/**
+ * ② 漂移探测阈值（可见正文字符数）：剥掉思考/围栏后累积到此长度仍无任何 `{`，
+ * 判定模型放弃 JSON 契约（剧本/纯文本漂移）→ 切纯文本直通。正常 JSON 输出的 `{`
+ * 在头几个 token 就出现，200 字判据不会误伤。
+ */
+const DRIFT_PROBE_CHARS = 200
 
 /** 聊天轮次入参 */
 export interface ChatTurnParams {
@@ -139,11 +197,29 @@ export interface ChatTurnParams {
   }
 }
 
+/** 轮次执行互斥标志（重答/发送的并发防护用）：runChatTurn 任何调用方（用户消息/主动搭话/剧情）
+ *  在执行期间置位。消息重答（ai:regenerate）据此拒绝"轮次进行中"的重答请求。 */
+let turnBusyCount = 0
+
+/** 当前是否有轮次在执行（LLM 流式/持久化阶段；语音朗读在 runChatTurn 返回后由宠物窗继续） */
+export function isTurnBusy(): boolean {
+  return turnBusyCount > 0
+}
+
 /**
  * 执行一轮完整聊天：旁白/用户消息入史 → 流式生成 → 语音跟读 → 持久化 → 记忆沉淀。
  * @returns 落盘的 assistant 消息；出错时向渲染端广播 stream-error 后 rethrow
  */
 export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> {
+  turnBusyCount++
+  try {
+    return await runChatTurnInner(params)
+  } finally {
+    turnBusyCount--
+  }
+}
+
+async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
   const { sessionId, content, meta, storyDirective, store, spriteId: spriteIdOverride } = params
   if (!content.trim()) throw new Error('消息内容为空')
 
@@ -154,9 +230,20 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
   // 无需等 stream-done 全量拉取才出现（否则跟随窗口会缺用户消息、且中途消息闪变）
   // 剧情轮次（store 覆盖）：完全不经由 ai:stream-* 通道（聊天/宠物窗与剧情彻底隔离），
   // 剧情窗由 story:message 增量同步驱动
-  if (!store) windowManager.broadcastAI('ai:stream-user', { sessionId, content: userMsg.content, timestamp: userMsg.timestamp, meta: meta ?? null })
-  // 记录"进行中的流"所属会话：窗口重载/新建后就绪时补发用于认领，避免漏该轮事件（剧情 run 无此需求）
-  if (!store) windowManager.setActiveStreamingSession(sessionId)
+  if (!store) {
+    windowManager.broadcastAI('ai:stream-user', { sessionId, content: userMsg.content, timestamp: userMsg.timestamp, meta: meta ?? null })
+    // 记录"进行中的流"所属会话：窗口重载/新建后就绪时补发用于认领，避免漏该轮事件（剧情 run 无此需求）。
+    // user 载荷一并记录：user 消息回合结束才落盘，中途打开的窗口认领时补气泡（否则缺用户消息）。
+    // 时间戳兜底：userMsg.timestamp 理论上必有，防御 undefined 不符合 StreamUserPayload 契约
+    const userPayload = { sessionId, content: userMsg.content, timestamp: userMsg.timestamp ?? Date.now(), meta: meta ?? null }
+    windowManager.setActiveStreamingSession(sessionId, '', userPayload)
+    // 方案A：开启回合文档（仅普通聊天轮；剧情轮 store 门隔离零接触）。
+    // voice 标记本轮是否有语音跟读：有语音 → 渲染端文本揭示由语音进度门控（段随语音显示）。
+    // 注意：此处置基于 settings 尚未加载的保守估计，settings 加载后在第一次 flush 前已由
+    // beginTurn 的调用时序保证（beginTurn 在 settings 读取后无法回调），因此这里以
+    // card 未加载前的默认值先建文档，语音可用性由下文 voiceActive 求值后经 markVoice 修正。
+    turnCoordinator.beginTurn(sessionId, { content: userMsg.content, timestamp: userPayload.timestamp, meta: meta ?? null }, false)
+  }
 
   // 进入"思考中"：通知桌宠切换到思考立绘（剧情演出桌宠零参与，跳过）
   if (!store) windowManager.notifyThinking(true)
@@ -173,47 +260,93 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
   // settings 在下方 try 块内加载后赋值；闭包首次调用发生在 onChunk/flush 时，届时必已赋值
   let stripParen = false
   const maybeStrip = (t: string): string => (stripParen ? stripParenGroups(t) : t)
-  // ---- 开头括号旁白前置状态（跟读模式下旁白流式即时上屏，不等语音；台词仍段随语音）----
-  /** 已确认的回答开头连续括号组全文（display 前缀，流式中只会增长） */
-  let leadingNarration = ''
-  /** 已广播给渲染端的旁白字符数（增量发送游标） */
-  let narrationSent = 0
-  /** 前置旁白的括号组数组（语音块剥除用，逐组消费） */
+  // ---- 开头括号剥除状态（旧契约兼容：模型把开头旁白括号带进 speak 项时防重复朗读）----
+  // 新契约（kind 字段）下旁白是独立 narr 项走 displayOnly，不再有前置通道；此状态仅剩
+  // "旧习惯输出把（）写进 speak 项"时的防重复职责，narr 项不经过它。
+  /** 前置旁白的括号组数组（speak 语音块剥除用，逐组消费） */
   let narrationGroups: string[] = []
   /** 语音块已消费的组数游标（跨块推进） */
   let narrationCursor = { count: 0 }
 
-  /** 重置旁白前置状态（空回复重试轮从头流式时调用），并通知渲染端清空已前置旁白重收。
-   *  voiceActiveRef：attempt 1 尚未收到 chunk 时为 false（无需 reset，onVoiceMode 已清空）；
-   *  attempt ≥2 时已被 onChunk 同步为 voiceActive，此时必须广播 reset 清掉上一轮已前置旁白。 */
+  /** 重置括号剥除状态（空回复重试轮从头流式时调用）。前置流已退役，无需广播 reset。 */
   const resetNarrationState = () => {
-    leadingNarration = ''
-    narrationSent = 0
     narrationGroups = []
     narrationCursor = { count: 0 }
-    if (!store && voiceActiveRef) windowManager.broadcastAI('ai:stream-narration', { reset: true })
   }
 
-  /** 从当前流式 partial 同步提取开头旁白到状态（不广播）。
-   *  flushPendingBlock 在块满/情绪变化时可能在两次 flushChunks 之间触发，
-   *  剥除前必须先同步一次，否则刚闭合的括号组未入状态会导致语音块剥不干净、跟读气泡里旁白重复。 */
-  const syncLeadingNarration = () => {
-    if (store) return
-    const narration = extractLeadingNarration(maybeStrip(extractStreamingJsonText(partial)))
-    if (narration !== leadingNarration) {
-      leadingNarration = narration
-      narrationGroups = splitNarrationGroups(narration)
+  // ---- ② 漂移探测与纯文本直通状态（尝试轮内重置，见 attempt 循环）----
+  /** 已判定为剧本漂移：三条 JSON 提取链对纯文本恒零产出，切直通提取（括号/标点规则） */
+  let driftMode = false
+  /** 探测已出结论（命中或排除），不再重复探测 */
+  let driftChecked = false
+  /** ④ 观测：本轮流式起始时刻 / 首个 chunk 到达时刻（漂移判定与耗时归因用） */
+  let streamStartAt = 0
+  let firstChunkAt = 0
+
+  /** ② 直通模式的提取源：剥思考/围栏 + 尾围栏。对游标安全：只动未被消费的尾部区域，
+   *  文档切片与语音链都必须用同一整形源，游标语义才一致 */
+  const scriptSource = () => prepareScriptPartial(partial)
+
+  /** ② 漂移探测（flushChunks 每帧调用，廉价）：可见正文 ≥ DRIFT_PROBE_CHARS 且不含 `{` → 直通 */
+  const probeDrift = () => {
+    if (driftChecked) return
+    const visible = stripStreamWrappers(partial)
+    if (visible.length < DRIFT_PROBE_CHARS) return
+    driftChecked = true
+    if (visible.includes('{')) {
+      console.log('[diag] 漂移探测：前 %d 字含 JSON 结构字符，维持 JSON 提取链', visible.length)
+      return
     }
+    driftMode = true
+    if (!store) turnCoordinator.beginScriptMode()
+    console.log('[diag] 漂移判定：前 %d 字可见文本无 JSON 结构（不含 {）→ 纯文本直通（跳过结构修复）', visible.length)
   }
+
+  /** 方案A：文档切片用的情绪词表（try 块内加载后设置；此前切片用内置词表兜底） */
+  let turnPalette: import('../../src/types').EmotionPaletteRef | null = null
 
   const flushChunks = () => {
     chunkTimer = null
-    const display = maybeStrip(extractStreamingJsonText(partial))
+    probeDrift()
+    // 方案A单源：同一 partial 喂给文档状态机——两窗直播显示的唯一数据源。
+    // 【剧情隔离】syncFromPartial 必须在 store 门内：剧情轮次不创建文档也不喂切片，
+    // 否则剧情内容会经快照泄漏到桌宠窗/聊天窗（2026-10-14 01:14 日志实锤）
+    if (!store) {
+      // 台词模式：文档切片与定型/语音链**同口径剥除（）组**——文档保留旁白会让直播期间
+      // 显示旁白、语音播完落定型（已剥）后消失（2026-10-14 22:46 轮实锤），且旁白不产生
+      // 语音槽位、文档总量却计入旁白字符，进度上限少报。stripParenGroups 只删字符串值里的
+      // 括号组，不碰 JSON 结构字符；未闭合的书写中组同样剥除，闭合前后保持单调。
+      // ② 直通模式：JSON 闭合切片器恒零产出，改走括号/标点规则切片（docPartial 已按
+      // 台词模式剥括号，直通提取器在其中只产出 speak 项，与定型口径一致）
+      if (driftMode) {
+        const docFresh = turnCoordinator.syncFromPartialScript(scriptSource(), turnPalette)
+        void docFresh
+      } else {
+        const docPartial = stripParen ? stripParenGroups(partial) : partial
+        const docFresh = turnCoordinator.syncFromPartial(docPartial, turnPalette)
+        void docFresh
+      }
+    }
+    // ② 直通模式显示源 = 整形后的纯文本（extractStreamingJsonText 对无 text 键文本回放
+    // 原文，但直接用整形源语义更明确）；认领快照与剧情预览共用该值
+    const display = driftMode ? maybeStrip(scriptSource()) : maybeStrip(extractStreamingJsonText(partial))
+    // 提取回退监测：display 长度比上次短 = trailing→out 交接或转义边界导致提取回退，
+    // lastDisplayLen 卡高水位后 delta 跳段 → 流式文本永久缺段（保留 warn 便于诊断）
+    if (display.length < lastDisplayLen) {
+      console.warn(
+        '[stream] 流式提取回退：上次=%d 本次=%d 回退差=%d 帧=%j',
+        lastDisplayLen,
+        display.length,
+        lastDisplayLen - display.length,
+        display.slice(0, 48),
+      )
+    }
     const delta = display.length > lastDisplayLen ? display.slice(lastDisplayLen) : ''
     lastDisplayLen = Math.max(lastDisplayLen, display.length)
+    // 累积显示快照同步给窗口管理器：中途就绪（打开/重载）的窗口认领会话时补发，
+    // 让晚开的窗口立即对齐流式进度而不是空泡干等（2026-10-13 截图案例）
+    if (!store) windowManager.setActiveStreamDisplay(display)
     if (delta) {
-      // 剧情轮次：流式增量不经 ai:stream-* 通道（剧情窗按 run 消息逐段播放，不做流式上屏）
-      if (!store) windowManager.broadcastAI('ai:stream-chunk', delta)
       // 未启用语音：思考立绘显示到首个文本开始输出（首个可读文本块即退出）；剧情轮次桌宠零参与
       if (!store && !voiceActiveRef && needExitThinking) {
         needExitThinking = false
@@ -223,15 +356,6 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     // 剧情轮次流式预览（7.7）：发送提取后的可读文本累积全文（窗端整体替换，重试轮自动纠偏）
     if (store?.storyRunId && display) {
       windowManager.pushStoryStream(store.storyRunId, display)
-    }
-    // 旁白前置：把回答开头的连续括号组实时广播上屏（仅跟读模式；非跟读下 streamingContent
-    // 本就含括号全文）。只发已闭合的括号组（extractLeadingNarration 保证前缀稳定）。
-    if (!store && voiceActiveRef) {
-      syncLeadingNarration()
-      if (leadingNarration.length > narrationSent) {
-        windowManager.broadcastAI('ai:stream-narration', { delta: leadingNarration.slice(narrationSent) })
-        narrationSent = leadingNarration.length
-      }
     }
   }
 
@@ -255,6 +379,8 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     let history: ChatMessage[]
     let retrievalItems: import('../../src/types').MemoryItem[] = []
     let profileDigest: string | null = null
+    /** 本会话的场景摘要缓存（情境服务 Phase 1；剧情轮次不参与） */
+    let prevSceneDigest: string | undefined
     if (store) {
       card = await getCharacterCard(store.cardId)
       history = store.history
@@ -265,6 +391,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       retrievalItems = retrieval.items
       profileDigest = retrieval.profileDigest
       history = session.messages
+      prevSceneDigest = session.sceneDigest
     }
     // 情绪词表分轨（演出词表双轨对等）：演出形象二选一，词表跟着形象走——
     // sprite 模式 → 立绘集词表（剧情轮恒 sprite：run.spriteId > 角色卡绑定 > 全局选中）；
@@ -295,9 +422,23 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
         emotionPalette.defaultEmotion,
       )
     }
+    // 方案A：词表就绪后交给文档切片（此后新入稿分段用正式词表归一化 emotion）
+    turnPalette = emotionPalette
     const systemMessage: ChatMessage = {
       role: 'system',
-      content: buildSystemPrompt(card, retrievalItems, settings.userName, profileDigest, settings.enableProactive, storyDirective, stripParen, emotionPalette),
+      content: buildSystemPrompt(
+        card,
+        retrievalItems,
+        settings.userName,
+        profileDigest,
+        settings.enableProactive,
+        storyDirective,
+        stripParen,
+        emotionPalette,
+        settings.timeAwarenessEnabled,
+        // 情境 Section（情境服务 Phase 1）：仅普通聊天轮注入（剧情轮次不参与）
+        !store && settings.enableSceneDigest ? buildSceneSection(prevSceneDigest) : null,
+      ),
     }
     if (!store) {
       console.log('[memory] 注入条数=%d 画像=%s', retrievalItems.length, profileDigest ? 'yes' : 'no')
@@ -305,7 +446,11 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
 
     // A1+A2 上下文组装：历史（剧情 = run.messages）+ 本轮 user 消息 → 净化 → 预算装填/自动摘要
     // proactive 旁白消息在此附加系统旁白标记（历史中的旁白同样处理，见 toModelMessageWithNarration）
-    const modelMessages = [...history, userMsg].map(toModelMessageWithNarration)
+    // ① 历史格式示范：最近 N 条 assistant 以紧凑 dialogue JSON 回传（见 backfillHistoryJson 注释）
+    // 时间感知（Shinsekai 式逐条绝对时间）：user 消息按自身 timestamp 注入时刻前缀（剧情轮豁免，
+    // 见 annotateUserTimestamps 注释）；userMsg 带当前时间戳，本轮"现在几点"由此锚定
+    const timeAwareMessages = annotateUserTimestamps([...backfillHistoryJson(history), userMsg], settings.timeAwarenessEnabled, !!store)
+    const modelMessages = timeAwareMessages.map(toModelMessageWithNarration)
     // 当前时间已由 system prompt 的【当前真实时间】Section 权威声明（见 repository.buildSystemPrompt），
     // user 消息前缀链已移除——避免双时间源竞争与 24h→12h 制换算幻觉
     const summarize = createSummarizer(settings, apiKey, abort.signal)
@@ -315,6 +460,8 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       contextWindowTokens: settings.contextWindowTokens,
       // 剧情轮次跳过 A2 自动摘要（run 摘要暂不落盘，仅 A1 预算装填）
       enableAutoCompact: store ? false : settings.enableAutoCompact,
+      // 时间感知总开关（方案3 摘要时间线门控）
+      timeAwareness: settings.timeAwarenessEnabled,
       summarize,
     })
     const fullMessages = ctx.messages
@@ -353,50 +500,113 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     const genieOverride = effMode === 'genie' ? (card?.genieOverride ?? null) : null
     // 流式一开始即广播本轮语音模式，让宠物窗提前用跟读展示方式（剧情轮次跳过）
     if (!store) windowManager.notifyVoiceMode({ voiceEnabled: voiceActive })
+    // 方案A：语音可用性求值完成 → 修正文档 voice 标记（渲染端据此门控文本揭示）
+    if (!store) turnCoordinator.markVoice(voiceActive)
     let speechCursor = 0
-    let pendingBlock: { texts: string[]; emotion: string } | null = null
+    let pendingBlock: { texts: string[]; emotion: string; kind: 'speak' | 'narr'; segIndex?: number } | null = null
     /** 是否已通过流式触发过至少一次语音（用于非流式/分块失败的兜底判定） */
     let speechEmitted = false
+    /**
+     * 方案A：语音块 ↔ 文档分段索引对齐。语音链（extractDialogueChunkDelta）与文档切片
+     * （syncFromPartial → extractDialogueObjects）对同一 partial 独立切片，闭合项序列一致：
+     * 第 N 个语音项 = 文档第 N 段。pumpSpeech 每处理一项推进 speechSegIdx，flushPendingBlock
+     * 投放时携带当前项索引，宠物窗经 ai:turn-speaking/spoken 回写文档 state。
+     */
+    let speechSegIdx = 0
     // 结算当前情绪块并触发桌宠语音（语音启用时才发声）
+    // 结算当前块并触发桌宠语音/上屏（语音启用时才发声；narr 块 displayOnly 不朗读）
     const flushPendingBlock = () => {
       const b = pendingBlock
       pendingBlock = null
       if (!b || b.texts.length === 0 || !card || !voiceActive) return
-      // 剥除前先同步一次开头旁白（块满触发的结算可能发生在两次 flushChunks 之间）
-      syncLeadingNarration()
-      // 剥掉已前置上屏的开头括号组，避免语音段上屏时旁白重复；再剥一次全部括号组——
-      // 纯括号块（旁白/动作描写，含模型漏右括号的残组）剥空即跳过投放，绝不朗读
-      const text = consumeLeadingNarration(b.texts.join('\n'), narrationGroups, narrationCursor)
-      if (!stripParenGroups(text).trim()) {
-        speechEmitted = true // 该块为纯旁白（或已被旁白前置通道接管），视为已触发，避免兜底重复投放
+      const rawBlock = b.texts.join('\n')
+      const langOverride = card.ttsOverride?.language ?? null
+      const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
+      // narr 块（kind 权威或（）推断）：零时长槽位按序上屏，不合成不朗读
+      if (b.kind === 'narr') {
+        speechEmitted = true
+        windowManager.speak(rawBlock, voiceId, langOverride, { chunks: [{ text: rawBlock, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: b.segIndex })
+        return
+      }
+      // speak 块：开头括号前置通道消费防重复（旧契约模型把括号带进台词项时）
+      const text = consumeLeadingNarration(rawBlock, narrationGroups, narrationCursor)
+      if (!text.trim()) {
+        speechEmitted = true
         return
       }
       speechEmitted = true
-      const langOverride = card.ttsOverride?.language ?? null
-      const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
       // 不在此处退出思考立绘：speak 仅代表"发起合成"，此刻语音尚未真正发声。
       // 思考立绘的退出改由渲染端在 lipSync 真正开始播放音频时触发（见 PetStage）。
-      windowManager.speak(text, voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride })
+      windowManager.speak(text, voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, segIndex: b.segIndex })
     }
-    // 流式 onChunk 中实时结算：新 dialogue 项并入当前块，情绪变化或块足够大即结算旧块，保持"边生成边读"
-    const pumpSpeech = () => {
-      const { items, cursor } = extractDialogueChunkDelta(partial, speechCursor, emotionPalette)
+    // 流式 onChunk 中实时结算：speak 项并入当前块（同情绪且未满块），narr 项**立即独立结算**
+    // （零时长 displayOnly 上屏，不参与并块——并块会让 narr 与相邻 speak 的 flush 顺序依赖
+    // 下一项到达，块切换竞态曾把整块 narr 吞掉：2026-10-14 02:00 轮 16 字旁白块丢失实锤）
+    const pumpSpeech = (force = false) => {
+      // ② 直通模式：改用括号/标点规则提取器（与文档切片同源整形，产出形状与 JSON 链一致，
+      // 下方的并块/displayOnly/拆分逻辑零改动复用）；force 供流结束冲刷未定稿尾巴
+      const { items, cursor } = driftMode
+        ? extractScriptChunkDelta(scriptSource(), speechCursor, emotionPalette, force)
+        : extractDialogueChunkDelta(partial, speechCursor, emotionPalette)
       speechCursor = cursor
       for (const it of items) {
-        // 台词模式：先剥括号再入块；纯括号项剥空即跳过（不出语音、不进块）
+        // 台词模式：先剥括号再入块；剥空即跳过（narr 内容在台词模式下不出语音也不上屏）
         const text = maybeStrip(it.text).trim()
+        const kind: 'speak' | 'narr' = it.kind === 'narr' ? 'narr' : 'speak'
+        // 本项对应的文档分段索引（块内所有项同索引——宠物窗按块回报，文档段以块为粒度推进）
+        const itemSegIdx = speechSegIdx++
         if (!text) continue
-        if (!pendingBlock) { pendingBlock = { texts: [text], emotion: it.emotion }; continue }
-        if (it.emotion !== pendingBlock.emotion || pendingBlock.texts.length >= BLOCK_MAX_ITEMS) {
+        // narr 项立即结算：独立块，不与任何项合并
+        if (kind === 'narr') {
+          // 混合 narr 项拆分（与文档切片/定型解析同口径）：开头连续（）组为旁白
+          // （零时长 displayOnly 不配音），尾部台词转 speak 并入常规并块（正常配音）——
+          // 整项按旁白处理会让台词部分无语音、样式旁白化（2026-10-15 02:19 轮实锤）
+          const { narr: leadingNarr, rest } = splitLeadingNarrGroups(text)
+          if (leadingNarr && rest.trim() && card && voiceActive) {
+            flushPendingBlock()
+            speechEmitted = true
+            windowManager.speak(
+              leadingNarr,
+              voiceEngine === 'mimo' ? card.voiceId : null,
+              card.ttsOverride?.language ?? null,
+              { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: itemSegIdx },
+            )
+            pendingBlock = { texts: [rest.trim()], emotion: it.emotion, kind: 'speak', segIndex: itemSegIdx }
+            continue
+          }
           flushPendingBlock()
-          pendingBlock = { texts: [text], emotion: it.emotion }
+          pendingBlock = { texts: [text], emotion: it.emotion, kind, segIndex: itemSegIdx }
+          flushPendingBlock()
+          continue
+        }
+        // speak 项开头连续（）组拆为独立 displayOnly 旁白槽位：模型偶发把开头旁白显式标成
+        // kind:speak（2026-10-14 21:30 轮实锤），旁白粘进语音块会被语音门控卡到开播才显示；
+        // 拆出后旁白零时长槽位入队即消费、立即按打字机上屏，与正确标注的 narr 项同节奏。
+        // 剥离口径与文档分段同源（同一 fixUnclosedBrackets 文本），len(narr)+len(rest)=len(text)，
+        // 宠物窗按槽位累计的字符进度与文档揭示总量保持对齐。守卫与 flushPendingBlock 一致。
+        const { narr: leadingNarr, rest } = splitLeadingNarrGroups(text)
+        if (leadingNarr && card && voiceActive) {
+          flushPendingBlock()
+          speechEmitted = true
+          windowManager.speak(
+            leadingNarr,
+            voiceEngine === 'mimo' ? card.voiceId : null,
+            card.ttsOverride?.language ?? null,
+            { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: itemSegIdx },
+          )
+          if (!rest.trim()) continue
+        }
+        const blockText = leadingNarr && card && voiceActive ? rest : text
+        if (!pendingBlock) { pendingBlock = { texts: [blockText], emotion: it.emotion, kind, segIndex: itemSegIdx }; continue }
+        if (it.emotion !== pendingBlock.emotion || pendingBlock.kind !== kind || pendingBlock.texts.length >= BLOCK_MAX_ITEMS) {
+          flushPendingBlock()
+          pendingBlock = { texts: [blockText], emotion: it.emotion, kind, segIndex: itemSegIdx }
         } else {
-          pendingBlock.texts.push(text)
+          pendingBlock.texts.push(blockText)
         }
       }
     }
 
-    console.log('[diag] settings.stream=', settings.stream)
     // 思考型模型（mimo-v2.5 等）的 reasoning 计入 max_tokens 预算：预算太小时思考就把 token
     // 吃光，content 通道为空 → 每轮都要靠重试。max_tokens 上限只影响截断、不影响实际计费，
     // 因此抬到至少 2048 给思考留足余量（与主动搭话旁白生成同款处理）。
@@ -409,14 +619,78 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     let rawOutput = ''
     let parsed: ReturnType<typeof parseDialogueJson> | null = null
     const MAX_ATTEMPTS = 3
+    /** ① LLM 结构修复已用次数（整轮上限 2，防退化轮反复修补） */
+    let repairsUsed = 0
+    /**
+     * ① LLM 结构修复（Shinsekai 式，2026-10-15 03:22 轮"引号剧本"实锤后加）：
+     * 结构化解析失败（空文本）或走了非 JSON 降级（rawEmotions 为空 = 内容来自
+     * 引号剧本/纯文本等漂移形态）时，把模型**原始输出**发回 LLM，要求重新格式化为
+     * 合法的 dialogue JSON（最多 2 次）——恢复分段与逐段情绪，免整体重新生成。
+     * 修复结果再过 parseDialogueJson（含键名回显契约检查）校验；失败返回 null，
+     * 调用方保留降级解析结果（引号剧本已经过 ② 清洗）。
+     */
+    const repairDialogueJson = async (raw: string): Promise<ReturnType<typeof parseDialogueJson> | null> => {
+      // ③ 修复走辅助模型（P0-2B 基建复用）：修复是机械格式化任务，主对话模型（可能是
+      // 思考型/昂贵模型）耗时数秒；辅助快速模型压到 1s 级。未配置辅助模型时回落主模型。
+      const aux = await resolveAuxLlmConfig()
+      // ③ 词表约束：修回的情绪词必须落在词表内——此前修复追回的自创情绪词 6/7 miss 词表
+      // 全部回落默认词，修复的情绪维度等于白修；贴词表后修回的词才有用
+      const paletteWords = emotionPalette.entries.length > 0 ? emotionPalette.entries.map((e) => e.name).join('、') : emotionPalette.defaultEmotion
+      const repairPrompt = (strong: boolean) =>
+        '你是一个 JSON 修复助手。用户输入的内容本应是角色扮演对话的结构化 JSON（格式：{"dialogue": [{"text": "台词或旁白文本", "emotion": "情绪词", "kind": "speak 或 narr"}]}，speak=说出口的台词，narr=（）包裹的动作/心理旁白），但格式损坏了。' +
+        '请将其修复为严格合法的该格式 JSON：只输出修复后的 JSON 对象本体，不要任何解释、代码围栏或额外文本；dialog 数组不得为空；每一项都必须包含 text 与 emotion 字段；必须完整保留原文中的全部台词与旁白文字，不得改写、翻译、增删任何字词。' +
+        `emotion 字段必须从以下词表中为每项选择最贴切的一个：${paletteWords}；kind 只能是 speak 或 narr。` +
+        (strong ? '\n【强制】只输出一个合法 JSON 对象，禁止输出剧本、纯文本、markdown 代码围栏、解释或任何非 JSON 内容。' : '')
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const out = await sendChatCompletion(
+            [
+              { role: 'system', content: repairPrompt(attempt > 1) },
+              { role: 'user', content: raw },
+            ],
+            { model: aux?.model ?? settings.model, baseURL: aux?.baseURL ?? settings.baseURL, apiKey: aux?.apiKey ?? apiKey, temperature: 0.2, stream: false, maxTokensOverride: effectiveMaxTokens, signal: abort.signal },
+          )
+          const trimmed = (out ?? '').trim()
+          if (!trimmed) {
+            console.warn('[chat] LLM 结构修复：第 %d 次输出为空', attempt)
+            continue
+          }
+          const check = parseDialogueJson(stripThink(trimmed), emotionPalette)
+          if (check.text.trim()) {
+            // 修复结果复检：模型可能复读自己的畸形（emotion 值再次内嵌 kind 结构字符 /
+            // 再次普遍为空）——带异常则用强提示词再试一次（attempt<2），两次均异常才接受
+            // （脏情绪回落默认词）
+            const contaminated = check.rawEmotions.some((r) => r.includes('kind') && /[:：]/.test(r))
+            const blankDominant = check.rawEmotions.length >= 3 && check.rawEmotions.filter((r) => !r.trim()).length > check.rawEmotions.length / 2
+            if ((contaminated || blankDominant) && attempt < 2) {
+              console.warn('[chat] LLM 结构修复：第 %d 次结果情绪值仍异常（结构污染/普遍为空），强提示词重试', attempt)
+              continue
+            }
+            return check
+          }
+          console.warn('[chat] LLM 结构修复：第 %d 次结果未通过契约校验 输出=%j', attempt, trimmed.slice(0, 60))
+        } catch (err) {
+          console.warn('[chat] LLM 结构修复请求异常（第 %d 次）', attempt, err)
+        }
+      }
+      return null
+    }
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       // 重置流式累积状态，避免上一次尝试的残片混入
       partial = ''
       lastDisplayLen = 0
       speechCursor = 0
+      speechSegIdx = 0
       pendingBlock = null
       // 旁白前置状态一并重置：重试轮从头流式，渲染端已前置的旁白需清空重新接收
       resetNarrationState()
+      // ② 漂移探测/直通状态随尝试轮重置（重试轮从头流式，重新探测）；④ 计时起点
+      driftMode = false
+      driftChecked = false
+      firstChunkAt = 0
+      streamStartAt = Date.now()
+      // 方案A：重试轮换代——segments 重建、turnId 更新（渲染端见新 id 整体重置清屏）
+      if (!store) turnCoordinator.renewTurn()
       let reasoningText = ''
       rawOutput = await sendChatCompletion(attemptMessages, {
         model: settings.model,
@@ -428,6 +702,7 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
         signal: abort.signal,
         onChunk: (chunk) => {
           voiceActiveRef = voiceActive
+          if (!firstChunkAt) firstChunkAt = Date.now()
           partial += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
           if (!mergeSpeech) pumpSpeech()
@@ -437,6 +712,13 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
         },
       })
       parsed = parseDialogueJson(maybeStrip(stripThink(rawOutput)), emotionPalette)
+      // ④ 流式耗时观测：首块延迟（网络+思考）与总耗时，漂移直通标记一并打出
+      console.log(
+        '[diag] 流式：首块=%dms 总=%dms 提取链=%s',
+        firstChunkAt ? firstChunkAt - streamStartAt : -1,
+        Date.now() - streamStartAt,
+        driftMode ? '直通(纯文本)' : 'json',
+      )
       if (!parsed.text.trim() && reasoningText.trim()) {
         // content 通道为空但思考通道有内容：模型可能把最终 JSON 写进思考里了。
         // 能完整解析出正文就直接用，免去一次完整重试（首回复延迟减半）。
@@ -444,6 +726,58 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
         if (salvaged) {
           console.log('[chat] content 为空，已从思考通道提取到回复（免重试）')
           parsed = salvaged
+        }
+      }
+      // ① LLM 结构修复（Shinsekai 式）：触发条件 = 解析为空、走了非 JSON 降级（rawEmotions
+      // 为空 = 内容来自引号剧本/纯文本等漂移形态，此时正文虽在但分段与逐段情绪丢失）、
+      // 或**情绪值结构污染**（2026-10-16 02:28 轮实锤：模型把 kind 字段连同转义引号写进
+      // emotion 值——值形如 `开心","kind":"narr`，JSON 本身合法、rawEmotions 非空，既有
+      // 条件全部接不住，6 情绪全回落默认词；内容级校验思路：字段值形态可疑也触发修复）、
+      // 或**情绪值普遍为空**（2026-10-17 19:20 轮实锤：6 项 emotion 全是空串——新退化
+      // 形态，正文/分段正常但情绪全回落默认词；空值占比过半且 ≥3 项即触发）
+      // → 把原始输出发回 LLM 重新格式化，恢复结构；失败则保留降级解析结果（引号剧本已经过 ② 清洗）。
+      // ② 直通轮跳过修复：正文已按剧本规则流式投递（doc/语音与直通切片同构），
+      // 修复产出的分段会与已上屏文本错位；且直通轮 emotion 恒默认词（漂移形态的
+      // 逐段情绪本就 miss 词表），修复的增量价值只剩分段，不值得再等一趟 LLM。
+      const emotionContaminated = parsed.rawEmotions.some((r) => r.includes('kind') && /[:：]/.test(r))
+      const emptyEmotionCount = parsed.rawEmotions.filter((r) => !r.trim()).length
+      const emotionBlankDominant = parsed.rawEmotions.length >= 3 && emptyEmotionCount > parsed.rawEmotions.length / 2
+      if (
+        (!parsed.text.trim() || parsed.rawEmotions.length === 0 || emotionContaminated || emotionBlankDominant) &&
+        rawOutput.trim() &&
+        repairsUsed < 2 &&
+        !driftMode
+      ) {
+        repairsUsed++
+        // ④ 修复观测：形态 A=解析为空（含契约剔除），B=非 JSON 降级（剧本漂移），
+        // C=情绪值结构污染，D=情绪值普遍为空
+        const repairForm = !parsed.text.trim()
+          ? 'A(解析为空)'
+          : parsed.rawEmotions.length === 0
+            ? 'B(非JSON降级)'
+            : emotionContaminated
+              ? 'C(情绪值结构污染)'
+              : 'D(情绪值普遍为空)'
+        const repairStart = Date.now()
+        const repaired = await repairDialogueJson(rawOutput.trim())
+        console.log(
+          '[diag] 结构修复：形态=%s rawLen=%d 耗时=%dms 结果=%s',
+          repairForm,
+          rawOutput.trim().length,
+          Date.now() - repairStart,
+          repaired ? '成功' : '失败',
+        )
+        if (repaired && repaired.text.trim()) {
+          // 内容量守卫：修复结果不足降级文本一半 = 疑似改写/缩写 → 保留降级结果
+          const keptLen = parsed.text.trim().length
+          if (!keptLen || repaired.text.trim().length >= keptLen * 0.5) {
+            console.log('[chat] LLM 结构修复成功：恢复 %d 字 / %d 段（免整体重新生成）', repaired.text.length, repaired.chunks.length)
+            parsed = repaired
+          } else {
+            console.warn('[chat] LLM 结构修复结果过短（%d < %d 的一半）→ 保留降级解析结果', repaired.text.trim().length, keptLen)
+          }
+        } else {
+          console.log('[chat] LLM 结构修复未成功，保留降级解析结果')
         }
       }
       if (parsed.text.trim()) break
@@ -472,6 +806,16 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       chunkTimer = null
     }
     flushChunks()
+    // ② 直通轮收尾冲刷：把未达封段条件的尾巴（最后一句可能没有句号）入稿/投放——
+    // JSON 链由下方"结算最后一个未闭合的情绪块"兜底，直通链的等价物是 force 冲刷
+    // （mergeSpeech 模式保持整段一次合成语义：文档冲刷显示，语音走下方兜底整投）
+    if (driftMode) {
+      if (!store) {
+        const tailFresh = turnCoordinator.syncFromPartialScript(scriptSource(), turnPalette, true)
+        void tailFresh
+      }
+      if (!mergeSpeech) pumpSpeech(true)
+    }
     // 结算最后一个未闭合的情绪块
     flushPendingBlock()
     // 未触发"边生成边读"时兜底：整段文本生成完毕后触发语音。
@@ -482,43 +826,71 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
       const langOverride = card.ttsOverride?.language ?? null
       const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
       if (mergeSpeech) {
-        // 兜底投放同样剥掉已前置上屏的开头旁白 + 纯括号块不朗读（剥空即整段无台词，跳过）
-        const mergedText = consumeLeadingNarration(parsed.text, narrationGroups, narrationCursor)
-        if (stripParenGroups(mergedText).trim() && mergedText.trim()) {
+        // 合音模式：只合并 speak 段（narr 段零时长槽位按序上屏，保持与逐段链一致的可见性）
+        const speakChunks = parsed.chunks.filter((c) => (c.kind ?? 'speak') === 'speak')
+        const mergedText = speakChunks.map((c) => c.text).join('\n')
+        if (mergedText.trim()) {
+          // 合音块跨多个文档段：首段索引回报（进度按块推进，合音无中间边界）
+          const firstSpeakIdx = parsed.chunks.findIndex((c) => (c.kind ?? 'speak') === 'speak')
           windowManager.speak(mergedText, voiceId, langOverride, {
             chunks: [{ text: mergedText, emotion: parsed.emotion }],
             follow: true,
             engine: voiceEngine ?? undefined,
             genieOverride,
+            segIndex: firstSpeakIdx,
           })
         }
-      } else {
         for (const c of parsed.chunks) {
+          if ((c.kind ?? 'speak') === 'narr' && c.text.trim()) {
+            windowManager.speak(c.text, voiceId, langOverride, { chunks: [{ text: c.text, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: parsed.chunks.indexOf(c) })
+          }
+        }
+      } else {
+        for (let ci = 0; ci < parsed.chunks.length; ci++) {
+          const c = parsed.chunks[ci]!
+          const kind = c.kind ?? 'speak'
+          // narr 段：displayOnly 按序上屏不朗读（与流式 flushPendingBlock 行为对齐）
+          if (kind === 'narr') {
+            windowManager.speak(c.text, voiceId, langOverride, { chunks: [{ text: c.text, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: ci })
+            continue
+          }
+          // speak 段：剥掉已前置上屏的开头括号（旧契约模型把括号带进台词项时），剥空跳过
           const chunkText = consumeLeadingNarration(c.text, narrationGroups, narrationCursor)
-          if (!stripParenGroups(chunkText).trim()) continue // 纯括号块：旁白/描写不朗读
-          windowManager.speak(chunkText, voiceId, langOverride, { chunks: [{ text: chunkText, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride })
+          if (!chunkText.trim()) continue
+          // 开头连续（）组拆为独立 displayOnly 旁白槽位（与 pumpSpeech 同口径：模型误标
+          // kind:speak 的开头旁白立即上屏，不随语音门控；len(narr)+len(rest)=len(chunkText)）
+          const { narr: leadingNarr, rest } = splitLeadingNarrGroups(chunkText)
+          if (leadingNarr) {
+            windowManager.speak(leadingNarr, voiceId, langOverride, { chunks: [{ text: leadingNarr, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, displayOnly: true, segIndex: ci })
+            if (!rest.trim()) continue
+            windowManager.speak(rest, voiceId, langOverride, { chunks: [{ text: rest, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, segIndex: ci })
+            continue
+          }
+          windowManager.speak(chunkText, voiceId, langOverride, { chunks: [{ text: chunkText, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, segIndex: ci })
         }
       }
     }
 
     // 持久化：user 消息 + assistant 完整回复（剧情轮次写 run 文件，普通聊天写会话）
     const now = Date.now()
-    console.log('[thinking] parseDone needExitThinking=%s voiceActive=%s speechEmitted=%s', needExitThinking, voiceActive, speechEmitted)
     // 情绪依从统计（词表微调 P2a 观测）：模型输出的原始 emotion 命中词表/别名接住的比例，
     // 无效值回落默认词单独计数——回落率持续偏高说明词表需要精简或释义不清（纯日志，零行为影响）
     const rawEmotions = parsed!.rawEmotions
     if (rawEmotions.length > 0) {
-      const miss = rawEmotions.filter((r) => emotionAdherence(r, emotionPalette) === 'miss').length
+      // miss 原始值一并打印：词表外的自由词（英文枚举/近义词/幻觉词）是词表精简与释义调优的输入；
+      // 全部原始值随行打印：观测模型是否过度使用默认词「平静」（词表/提示词调优的依据）
+      const missList = rawEmotions.filter((r) => emotionAdherence(r, emotionPalette) === 'miss')
       console.log(
-        '[chat] 情绪依从：%d/%d 命中词表%s',
-        rawEmotions.length - miss,
+        '[chat] 情绪依从：%d/%d 命中词表 原始值=[%s]%s',
+        rawEmotions.length - missList.length,
         rawEmotions.length,
-        miss > 0 ? `（回落默认词 ${miss} 次）` : '',
+        rawEmotions.join('、'),
+        missList.length > 0 ? `（回落默认词 ${missList.length} 次，原始值见下一行）` : '',
       )
+      if (missList.length > 0) console.log('[chat] 情绪依从 miss 原始值：%j', missList)
     }
     if (!store && needExitThinking && !voiceActive) {
       needExitThinking = false
-      console.log('[thinking] no-voice fallback: exit thinking')
       windowManager.notifyThinking(false)
     }
     const { text, emotion, sentences, emotionSegments, chunks, background } = parsed!
@@ -535,6 +907,25 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     }
     if (store) await store.append([userMsg, asstMsg])
     else await appendSessionMessages(sessionId, [userMsg, asstMsg])
+
+    // 情境摘要异步更新（情境服务 Phase 1）：fire-and-forget 不阻塞、失败保留旧值；剧情轮次不参与
+    if (!store) {
+      void updateSceneDigestAfterTurn({
+        sessionId,
+        prevDigest: prevSceneDigest,
+        userText: userMsg.content,
+        assistantText: asstMsg.content,
+        settings,
+        apiKey,
+      })
+    }
+
+    // 方案A：文档终态（普通聊天轮）。有语音 → reading（跟读中）；无语音 → done。
+    // final 暂用定型解析产物（第 2 步切文档映射生成）；done 快照立即广播不节流。
+    if (!store) {
+      if (voiceActive) turnCoordinator.markReading()
+      else turnCoordinator.finishTurn(asstMsg)
+    }
 
     // 记忆自动沉淀（后台，不阻塞）：proactive 旁白轮次与剧情轮次（store 覆盖）跳过；旁白消息不参与抽取
     if (settings.enableMemoryExtraction && !store && !meta?.proactive) {
@@ -574,13 +965,17 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
     flushChunks()
 
     if (!store) windowManager.broadcastAI('ai:stream-error', { sessionId, error: message, cancelled: abort.signal.aborted })
+    // 方案A：错误路径文档终态（已流出部分作为 final；无文档时内部直接返回）
+    if (!store) {
+      const partialText = partial ? maybeStrip(extractStreamingJsonText(partial)) : ''
+      turnCoordinator.abortTurn(partialText ? { role: 'assistant', content: partialText, timestamp: Date.now() } : undefined)
+    }
     throw err
   } finally {
     if (currentAbort === abort) currentAbort = null
     // 流式结束/出错/取消：清除"进行中的流"标记，避免窗口在之后才就绪时误认领已结束的会话
     if (!store) windowManager.setActiveStreamingSession(null)
     // 退出思考立绘：仅无语音场景在此复位（有语音场景由渲染端 lipSync 播放时负责）；剧情轮次桌宠零参与
-    console.log('[thinking] finally voiceActiveRef=%s needExitThinking=%s', voiceActiveRef, needExitThinking)
     if (!store && !voiceActiveRef && needExitThinking) {
       needExitThinking = false
       windowManager.notifyThinking(false)

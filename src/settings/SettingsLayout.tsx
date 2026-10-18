@@ -20,6 +20,7 @@ import {
   Info,
   SlidersHorizontal,
   MessagesSquare,
+  ScrollText,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -36,11 +37,12 @@ import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { ProactivePanel } from './panels/ProactivePanel'
 import { StoryPanel } from './panels/StoryPanel'
+import { LogPanel } from './panels/LogPanel'
 import { VoicePanel } from './panels/VoicePanel'
 import { AboutPanel } from './panels/AboutPanel'
 import { GeneralPanel } from './panels/GeneralPanel'
 
-export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'proactive' | 'story' | 'data' | 'voice' | 'about'
+export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'memory' | 'proactive' | 'story' | 'data' | 'voice' | 'logs' | 'about'
 
 interface ModuleDef {
   id: ModuleId
@@ -59,6 +61,7 @@ const MODULES: ModuleDef[] = [
   { id: 'proactive', title: '主动搭话', desc: '桌宠在长时间无交互后主动开口，可选先感知屏幕内容再搭话。', icon: MessagesSquare },
   { id: 'story', title: '剧情系统', desc: '剧本导入管理、galgame 式剧情演出（独立剧情窗）与多周目存档。', icon: BookOpen },
   { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
+  { id: 'logs', title: '运行日志', desc: '查看主进程与各窗口的运行日志（级别/来源过滤、搜索、实时滚动），打包版同样可用。', icon: ScrollText },
   { id: 'about', title: '关于与更新', desc: '检查并安装新版本，查看应用信息。', icon: Info },
 ]
 
@@ -267,6 +270,7 @@ function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
       {id === 'proactive' && <ProactivePanel />}
       {id === 'story' && <StoryPanel />}
       {id === 'data' && <DataPanel />}
+      {id === 'logs' && <LogPanel />}
       {id === 'about' && <AboutPanel />}
     </div>
   )

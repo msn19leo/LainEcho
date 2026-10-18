@@ -23,10 +23,28 @@ export const SUMMARY_MARKER = '【历史对话总结】'
 /** 摘要输出 token 上限（摘要走非流式独立请求） */
 export const SUMMARY_MAX_TOKENS = 1024
 
-/** 单条 model 消息的净形状：只保留 role + content */
+/** 摘要时间线的行首时刻格式：M-D HH:mm（相对轻量，无年份——跨年对话极罕见且摘要本就是模糊产物） */
+function formatSummaryTs(ts: number): string {
+  const d = new Date(ts)
+  return `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
+ * 方案3 摘要时间线：旧消息行首标注 [M-D HH:mm]。A2 压缩只传 `role: content`，压缩后的
+ * 会话完全失去时间轴（"那天我们…"无从定位）；时间前缀让摘要有据可依保留时间线索。
+ * 受时间感知总开关门控；无 timestamp 的消息（旧数据）原样输出。
+ */
+function formatSummaryLine(m: ModelMessage, timeAware: boolean): string {
+  const t = timeAware && typeof m.timestamp === 'number' && m.timestamp > 0 ? `[${formatSummaryTs(m.timestamp)}] ` : ''
+  return `${t}${m.role}: ${m.content}`
+}
+
+/** 单条 model 消息的净形状：只保留 role + content（timestamp 供摘要时间线/间隔标注消费，不发给模型） */
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
+  /** 消息时间戳（时间感知方案1/3 的数据通道；仅用于间隔标注与摘要时间线，不作为消息内容发送） */
+  timestamp?: number
 }
 
 /** 上下文构建入参 */
@@ -39,6 +57,8 @@ export interface ContextBuildParams {
   contextWindowTokens: number
   /** 是否启用自动摘要压缩 */
   enableAutoCompact: boolean
+  /** 时间感知总开关（方案3 摘要时间线门控）：开启时摘要输入的旧消息行首标注时刻 */
+  timeAwareness?: boolean
   /** 摘要回调：把旧历史文本压成摘要文本（由调用方用独立 prompt 调模型），失败应 throw */
   summarize: (olderText: string) => Promise<string>
 }
@@ -51,9 +71,9 @@ export interface ContextBuildResult {
   newSummary: string | null
 }
 
-/** 消息净化：剥离 UI 元数据，只保留 {role, content} */
+/** 消息净化：剥离 UI 元数据，只保留 {role, content}（timestamp 一并透传，供时间感知链路消费） */
 export function toModelMessage(m: ChatMessage): ModelMessage {
-  return { role: m.role, content: m.content ?? '' }
+  return { role: m.role, content: m.content ?? '', timestamp: m.timestamp }
 }
 
 /** 构造「历史对话总结」占位消息（带标记，供下次识别替换） */
@@ -100,7 +120,7 @@ function budgetTruncate(
  *   摘要 + 近段再套一次预算装填兜底（A2）
  */
 export async function buildModelContext(params: ContextBuildParams): Promise<ContextBuildResult> {
-  const { systemMessage, messages, contextWindowTokens, enableAutoCompact, summarize } = params
+  const { systemMessage, messages, contextWindowTokens, enableAutoCompact, timeAwareness, summarize } = params
 
   // 未配置上下文窗口（0/未填）→ 不限制，原样返回（保持旧行为）
   if (!(contextWindowTokens > 0)) {
@@ -117,7 +137,8 @@ export async function buildModelContext(params: ContextBuildParams): Promise<Con
     const recent = messages.slice(start)
 
     if (older.length > 0) {
-      const olderText = older.map((m) => `${m.role}: ${m.content}`).join('\n')
+      // 方案3 摘要时间线：行首标注时刻，摘要保留"对话发生在何时"的线索（受总开关门控）
+      const olderText = older.map((m) => formatSummaryLine(m, timeAwareness !== false)).join('\n')
       let summary: string
       try {
         summary = await summarize(olderText)
@@ -147,6 +168,8 @@ export async function buildModelContext(params: ContextBuildParams): Promise<Con
 export interface ForceCompactParams {
   systemMessage: ModelMessage
   messages: ModelMessage[]
+  /** 时间感知总开关（方案3 摘要时间线门控）：开启时摘要输入的旧消息行首标注时刻 */
+  timeAwareness?: boolean
   /** 摘要回调：把旧历史文本压成摘要文本（由调用方用独立 prompt 调模型），失败应 throw */
   summarize: (olderText: string) => Promise<string>
 }
@@ -165,7 +188,7 @@ export interface ForceCompactResult {
  * 失败直接抛出，由调用方（IPC handler）反馈给用户。
  */
 export async function forceCompact(params: ForceCompactParams): Promise<ForceCompactResult> {
-  const { systemMessage, messages, summarize } = params
+  const { systemMessage, messages, timeAwareness, summarize } = params
   if (messages.length <= 1) {
     return { messages: [systemMessage, ...messages], newSummary: null }
   }
@@ -176,7 +199,7 @@ export async function forceCompact(params: ForceCompactParams): Promise<ForceCom
     // 没有可压缩的旧历史（不足 20 条）
     return { messages: [systemMessage, ...messages], newSummary: null }
   }
-  const olderText = older.map((m) => `${m.role}: ${m.content}`).join('\n')
+  const olderText = older.map((m) => formatSummaryLine(m, timeAwareness !== false)).join('\n')
   const summary = await summarize(olderText)
   const summaryMsg = buildSummaryMessage(summary)
   return { messages: [systemMessage, summaryMsg, ...recent], newSummary: summary }

@@ -1,16 +1,14 @@
 /**
- * 主动搭话面板：开关（主动搭话 / 屏幕感知级联）+ 视觉模型独立配置（地址/模型/Key）+
- * 频率与免打扰（每日上限 / 免打扰时段）+ 调度状态实时展示（兴趣值/今日次数/最近搭话时间）。
+ * 主动搭话面板：开关（主动搭话 / 屏幕感知级联）+ 频率与免打扰（每日上限 / 免打扰时段）+
+ * 调度状态实时展示（兴趣值/今日次数/最近搭话时间）。
  *
  * - 屏幕感知开关级联于主动搭话：总开关关闭时禁用（并自动保存关闭态，避免残留开启）
- * - 视觉模型 Key 走独立加密存储（safeStorage），仅回显掩码，不回显明文
- * - 屏幕感知不可用（未配视觉模型/截图失败）时自动降级为普通话题搭话
+ * - 视觉模型（屏幕感知/立绘打标用）在「AI API 配置」面板独立配置；未配置时屏幕感知自动降级为普通话题
  */
 import { useEffect, useState } from 'react'
-import { Eye, Radio, Save, Sparkles } from 'lucide-react'
+import { Eye, Radio, Sparkles } from 'lucide-react'
 import { api } from '../../api'
-import { Button, Input, Switch } from '../../components/ui'
-import { toast } from '../../components/toast'
+import { Switch } from '../../components/ui'
 import { useSettingsStore } from '../../store/settingsStore'
 import type { ProactiveState } from '../../types'
 
@@ -20,14 +18,11 @@ export function ProactivePanel() {
   const loadSettings = useSettingsStore((s) => s.load)
   const saveSettings = useSettingsStore((s) => s.save)
 
-  const [hasVisionKey, setHasVisionKey] = useState(false)
-  const [visionKeyInput, setVisionKeyInput] = useState('')
   /** 调度状态（兴趣值/当日次数/最近搭话时间），订阅广播实时刷新 */
   const [state, setState] = useState<ProactiveState | null>(null)
 
   useEffect(() => {
     if (!settingsLoaded) void loadSettings()
-    void api.settings.hasVisionApiKey().then(setHasVisionKey).catch(() => setHasVisionKey(false))
     void api.proactive.getState().then(setState).catch(() => setState(null))
     // 订阅状态广播：每次成功搭话 / 用户消息重置后刷新
     const unsub = api.proactive.onState((s) => setState(s))
@@ -40,19 +35,6 @@ export function ProactivePanel() {
       ? { enableProactive: true }
       : { enableProactive: false, enableScreenSense: false }
     await saveSettings(patch)
-  }
-
-  /** 保存视觉模型独立 Key（留空 = 保持不变） */
-  const handleSaveVisionKey = async () => {
-    const key = visionKeyInput.trim()
-    if (!key) {
-      toast('请输入 Key（留空则保持不变）')
-      return
-    }
-    await api.settings.saveVisionApiKey(key)
-    setVisionKeyInput('')
-    setHasVisionKey(await api.settings.hasVisionApiKey())
-    toast('视觉模型 API Key 已保存')
   }
 
   return (
@@ -77,7 +59,7 @@ export function ProactivePanel() {
           </div>
           <div className="text-xs text-text-muted">
             与主动搭话同时开启时：角色先"偷看"你的桌面（截图仅内存流转、不落盘），再以看到的内容搭话；
-            未配置视觉模型或感知失败时自动降级为普通话题
+            视觉模型在「AI API 配置」中配置，感知失败或未配置时自动降级为普通话题
           </div>
         </div>
         <Switch
@@ -106,36 +88,7 @@ export function ProactivePanel() {
         </div>
       )}
 
-      {/* 视觉模型配置（独立于主 LLM：地址/模型/Key） */}
-      {settings.enableProactive && settings.enableScreenSense && (
-        <div className="space-y-2 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
-          <div className="text-sm text-text">视觉模型（屏幕感知用，独立配置）</div>
-          <Input
-            value={settings.visionBaseURL}
-            onChange={(e) => void saveSettings({ visionBaseURL: e.target.value })}
-            placeholder="视觉模型 API 地址（OpenAI 兼容 chat/completions，需支持图片输入）"
-          />
-          <div className="flex items-center gap-2">
-            <Input
-              value={settings.visionModel}
-              onChange={(e) => void saveSettings({ visionModel: e.target.value })}
-              placeholder="视觉模型名（如 qwen-vl-plus / gpt-4o-mini）"
-              className="min-w-0 flex-1"
-            />
-            <Input
-              type="password"
-              value={visionKeyInput}
-              onChange={(e) => setVisionKeyInput(e.target.value)}
-              placeholder={hasVisionKey ? 'sk-****（已配置，留空保持不变）' : '视觉模型 API Key（独立于聊天 Key）'}
-              className="min-w-0 flex-1"
-            />
-            <Button variant="outline" onClick={() => void handleSaveVisionKey()} disabled={!visionKeyInput.trim()}>
-              <Save size={13} strokeWidth={2} />
-              保存 Key
-            </Button>
-          </div>
-        </div>
-      )}
+      {/* 视觉模型配置已移至「AI API 配置」面板（屏幕感知/立绘打标共用） */}
 
       {/* 频率与免打扰 */}
       <div className="space-y-3 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">

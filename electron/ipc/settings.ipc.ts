@@ -14,7 +14,8 @@ export function registerSettingsIpc(): void {
     const keyPresent = await hasApiKey()
     const embeddingKeyPresent = await hasSecret(paths.embeddingApiKeyFile)
     const visionKeyPresent = await hasSecret(paths.visionApiKeyFile)
-    return { ...settings, hasApiKey: keyPresent, hasEmbeddingApiKey: embeddingKeyPresent, hasVisionApiKey: visionKeyPresent }
+    const translationKeyPresent = await hasSecret(paths.translationApiKeyFile)
+    return { ...settings, hasApiKey: keyPresent, hasEmbeddingApiKey: embeddingKeyPresent, hasVisionApiKey: visionKeyPresent, hasTranslationApiKey: translationKeyPresent }
   })
 
   ipcMain.handle('settings:save', async (_e, patch: Partial<AppSettings>) => {
@@ -39,6 +40,12 @@ export function registerSettingsIpc(): void {
 
   /** 视觉模型 Key 是否已配置（仅回显掩码用，不返回明文） */
   ipcMain.handle('settings:has-vision-api-key', () => hasSecret(paths.visionApiKeyFile))
+
+  /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密；为空时运行时回落主 LLM Key） */
+  ipcMain.handle('settings:save-translation-api-key', (_e, key: string) => saveSecret(paths.translationApiKeyFile, key))
+
+  /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用，不返回明文） */
+  ipcMain.handle('settings:has-translation-api-key', () => hasSecret(paths.translationApiKeyFile))
 
   /** 获取当前数据目录信息 */
   ipcMain.handle('settings:get-data-dir', () => {

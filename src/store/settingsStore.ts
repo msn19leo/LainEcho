@@ -19,6 +19,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
   memoryRetrievalEnabled: false,
   embeddingBaseURL: '',
   embeddingModel: '',
+  // 翻译/修复辅助模型（P0-2B：ja 翻译与 JSON 结构修复走快速小模型；留空回落主对话模型）
+  translationBaseURL: '',
+  translationModel: '',
+  // AI 时间感知总开关：默认开启（当前时间锚点/对话间隔/记忆年龄/摘要时间线全链路）
+  timeAwarenessEnabled: true,
+  // 语音文本跟随语音逐字显示：默认开启（台词文本按音频播放进度逐字放行）
+  voiceTextFollowAudio: true,
+  // 情景摘要缓存：默认开启（每轮异步更新"此刻场景状态"，注入【当前情景】Section）
+  enableSceneDigest: true,
   memoryDedupThreshold: 0.92,
   // 主动搭话：默认关闭（需用户显式开启；屏幕感知级联于本开关）
   enableProactive: false,
@@ -31,8 +40,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   visionBaseURL: '',
   visionModel: '',
   userName: '用户',
-  // 文字显示速度：0-100 速度档（越大越快；0=即时显示，不逐字）
+  // 文字显示速度：0-100 速度档（越大越快；0=即时显示，不逐字）——桌宠/聊天窗用
   textSpeed: 80,
+  // 剧情窗对话框文字显示速度（独立于通用 textSpeed，仅剧情系统读取）
+  storyTextSpeed: 80,
 }
 
 interface SettingsState {
@@ -71,6 +82,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           memoryRetrievalEnabled: data.memoryRetrievalEnabled,
           embeddingBaseURL: data.embeddingBaseURL,
           embeddingModel: data.embeddingModel,
+          translationBaseURL: data.translationBaseURL,
+          translationModel: data.translationModel,
+          timeAwarenessEnabled: data.timeAwarenessEnabled,
+          voiceTextFollowAudio: data.voiceTextFollowAudio,
+          enableSceneDigest: data.enableSceneDigest,
           memoryDedupThreshold: data.memoryDedupThreshold,
           enableProactive: data.enableProactive,
           enableScreenSense: data.enableScreenSense,
@@ -82,6 +98,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
           visionModel: data.visionModel,
           userName: data.userName,
           textSpeed: data.textSpeed,
+          storyTextSpeed: data.storyTextSpeed,
         },
         hasApiKey: data.hasApiKey,
         loaded: true,

@@ -22,6 +22,7 @@ import { paths, readJson, writeJson } from './storage'
 import type { TTSGenieConfig } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
 import { readApiKey } from './crypto'
+import { resolveAuxLlmConfig } from './auxModel'
 import { getSettings } from './repository'
 
 /** 默认配置 */
@@ -152,13 +153,33 @@ function spawnEnv(dataDir: string): NodeJS.ProcessEnv {
 }
 
 /**
- * 启动 GenieTTS 服务：用 genie_tts 库的内置 start_server 拉起 FastAPI。
- * 启动前必须保证 GenieData 资源就绪（否则 genie 在 import 时会交互式弹卡，导致进程崩溃）。
+ * 启动 GenieTTS 服务（幂等）：
+ *  - 服务已在线（probe 通过）→ 直接返回成功，不重复拉起（杜绝双实例 bind 10048 端口冲突）；
+ *  - 并发调用（连点【启动服务】按钮 / 多段合成同时拉起）经 startPromise 互斥合并为同一次启动；
+ *  - spawn 后轮询等待服务真正可访问（uvicorn/模型初始化需数秒），超时返回失败但进程保留后台继续初始化。
  * @param workPath Genie 环境目录（含 python.exe；可空则用系统 python）
  * @param baseUrl 服务地址（取端口）
  * @param dataDir GenieData 资源目录（不存在则报错，不启动）
  */
 export async function startGenieServer(workPath: string, baseUrl = DEFAULT_CONFIG.baseUrl, dataDir = ''): Promise<{ ok: boolean; error?: string }> {
+  // 幂等前置：服务已在线直接返回
+  if (await probe(baseUrl).catch(() => false)) return { ok: true }
+  // 互斥：已有启动进行中（含合成路径的自动拉起）→ 等它完成后确认在线状态
+  if (startPromise) {
+    await startPromise
+    return (await probe(baseUrl).catch(() => false)) ? { ok: true } : { ok: false, error: '服务启动未就绪，请稍后重试。' }
+  }
+  const run = doStartServer(workPath, baseUrl, dataDir)
+  startPromise = run.then(() => undefined)
+  try {
+    return await run
+  } finally {
+    startPromise = null
+  }
+}
+
+/** 启动内核：资源校验 → spawn → 轮询等待就绪（最多 20s） */
+async function doStartServer(workPath: string, baseUrl: string, dataDir: string): Promise<{ ok: boolean; error?: string }> {
   const python = resolvePython(workPath)
   if (!python) return { ok: false, error: `未在项目路径找到 python：${workPath || '(空)'}` }
 
@@ -184,9 +205,23 @@ export async function startGenieServer(workPath: string, baseUrl = DEFAULT_CONFI
   serverProcess.on('error', (err) => {
     console.error('[genie] 启动失败', err)
   })
-  // 转发 stderr 便于排查
-  serverProcess.stderr?.on('data', (d) => console.error('[genie]', String(d)))
-  return { ok: true }
+  // stderr 转发（内容分级）：uvicorn 的 INFO/启动横幅也写 stderr，一律标 ERR 会污染运行日志——
+  // 行内含 ERROR/Traceback 才记 error，含 WARNING 记 warn，其余按 info。
+  serverProcess.stderr?.on('data', (d) => forwardGenieOutput(String(d)))
+
+  // 轮询等待就绪：模型导入可能比固定 sleep 慢，最多等 20s；超时进程保留后台继续初始化
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 1000))
+    if (await probe(baseUrl).catch(() => false)) return { ok: true }
+  }
+  return { ok: false, error: '服务启动超时（20s），进程仍在后台初始化——请稍后在语音设置里点【检测连通】确认。' }
+}
+
+/** Genie 子进程 stderr 行内容分级转发：ERROR/Traceback → error，WARNING → warn，其余 → info */
+function forwardGenieOutput(text: string): void {
+  if (/ERROR|Traceback/i.test(text)) console.error('[genie]', text)
+  else if (/WARNING/i.test(text)) console.warn('[genie]', text)
+  else console.log('[genie]', text)
 }
 
 /**
@@ -226,20 +261,28 @@ export async function downloadGenieData(dataDir: string): Promise<{ ok: boolean;
  * @returns {path,text} 参考音频绝对路径与文本；解析失败返回 null
  */
 async function resolveDefaultReferenceAudio(onnxModelDir: string): Promise<{ path: string; text: string } | null> {
-  const roleDir = path.dirname(onnxModelDir || '')
-  const promptJson = path.join(roleDir, 'prompt_wav.json')
-  if (!existsSync(promptJson)) return null
-  try {
-    const meta = await readJson<{ Normal?: { wav?: string; text?: string } }>(promptJson, {})
-    const wav = meta?.Normal?.wav
-    const text = meta?.Normal?.text
-    if (!wav || !text) return null
-    const wavPath = path.join(roleDir, 'prompt_wav', wav)
-    if (!existsSync(wavPath)) return null
-    return { path: wavPath, text }
-  } catch {
-    return null
+  // 兜底查找兼容两种目录布局：官方角色 onnx 目录=角色名/tts_models（prompt_wav.json 在父目录）；
+  // GUI 导入模型常直接选角色根目录为 onnx 目录（prompt_wav.json 就在该目录本身）。
+  // 早先只查父目录——onnx 目录=角色根目录时 dirname 跳到 Output，prompt_wav.json 查找落空
+  // （2026-10-17 实锤：Nanami_Chiaki 卡 onnx 目录=角色根目录，卡内参考又非 WAV → 双层落空报错）。
+  const dirs = [path.dirname(onnxModelDir || ''), onnxModelDir || '']
+  for (const dir of dirs) {
+    if (!dir) continue
+    const promptJson = path.join(dir, 'prompt_wav.json')
+    if (!existsSync(promptJson)) continue
+    try {
+      const meta = await readJson<{ Normal?: { wav?: string; text?: string } }>(promptJson, {})
+      const wav = meta?.Normal?.wav
+      const text = meta?.Normal?.text
+      if (!wav || !text) continue
+      const wavPath = path.join(dir, 'prompt_wav', wav)
+      if (!existsSync(wavPath)) continue
+      return { path: wavPath, text }
+    } catch {
+      /* 该目录的 json 损坏则试下一个候选目录 */
+    }
   }
+  return null
 }
 
 /** 加载角色（POST /load_character），角色名/语言变化时才重新加载；可选设置参考音频。
@@ -437,6 +480,21 @@ function hasSpeakableContent(text: string): boolean {
 const MERGE_TARGET_LEN = 32
 /** 单段长度上限（字符）：单句超过此长度时独立成段，避免单段推理过长 */
 const MERGE_MAX_LEN = 48
+/**
+ * 首段合并上限（字符，P0-1 首段小段优先）：Genie 合成 ~0.3-0.4s/字，首段合并到 30-48 字
+ * 意味着第一声要等 10-14s；首段收窄让第一段音频 5-6s 内出声，后续段仍按 32/48 贪心合并
+ * 保音调连贯。首句本身超过上限时按句独立成段，不做句内细切。
+ * 每个语音块的首段都收窄（块 N 的合成与块 N-1 的播放重叠，首段小即每块开播都快）。
+ */
+const MERGE_FIRST_MAX_LEN = 18
+/**
+ * 首段合并下限（字符，复诵参考音频源头治理，2026-10-16 01:26 轮实锤）：首段过短（4-6 字的
+ * 语气片）会让"短文本泡在长参考条件里"的失衡达到极致，模型必然续写参考音频（实测 4 字
+ * 合成 8.1s = 台词 + 参考音频开头，且重载角色重试无效——条件主导的确定性行为）。首段至少
+ * 凑到该长度才封段，**下限优先于上限**（突破 MERGE_FIRST_MAX_LEN 也要凑满），从源头消除
+ * 超短诱因段，同时保持首段较小（10-24 字 ≈ 3-9s，仍明显快于改造前的 48 字）。
+ */
+const MERGE_FIRST_MIN_LEN = 10
 
 /**
  * 按停顿标点把安全化文本切句（标点保留在句尾），供合并分句使用。
@@ -450,19 +508,33 @@ function splitByPunctuation(text: string): string[] {
 
 /**
  * 把句子贪心合并为接近目标长度的段：
- * 相邻句累加到 MERGE_TARGET_LEN 即封段；单句超过 MERGE_MAX_LEN 时独立成段；
- * 合并后无可发声内容的段（如孤立的"……"）会被过滤，避免必然空音频的请求。
+ * 首段按"至少 MERGE_FIRST_MIN_LEN、趋向 MERGE_FIRST_MAX_LEN"封段（下限优先——低于下限继续
+ * 并入下一片，哪怕突破上限，见 MERGE_FIRST_MIN_LEN 注释）；后续段相邻句累加到 MERGE_TARGET_LEN
+ * 即封段；单句超过 MERGE_MAX_LEN 时独立成段；合并后无可发声内容的段（如孤立的"……"）
+ * 会被过滤，避免必然空音频的请求。
  */
 function mergeSentences(sentences: string[]): string[] {
   const segs: string[] = []
   let cur = ''
+  let first = true
   for (const s of sentences) {
     if (s.length > MERGE_MAX_LEN) {
       if (cur) {
         segs.push(cur)
         cur = ''
+        first = false
       }
       segs.push(s)
+      continue
+    }
+    if (first) {
+      // 首段：凑满下限才封段（下限优先于上限，见 MERGE_FIRST_MIN_LEN 注释）
+      cur += s
+      if (cur.length >= MERGE_FIRST_MIN_LEN) {
+        segs.push(cur)
+        cur = ''
+        first = false
+      }
       continue
     }
     if (cur && cur.length + s.length > MERGE_MAX_LEN) {
@@ -478,6 +550,60 @@ function mergeSentences(sentences: string[]): string[] {
   }
   if (cur) segs.push(cur)
   return segs.filter((s) => hasSpeakableContent(s))
+}
+
+/**
+ * 日语缩约形展开：口语缩约形与完整形语义完全一致（完整形仅多一个 i 拍、听感稍正式），
+ * 但 Genie ja G2P 对缩约形（实测"〜てない""〜てる"）会触发 njd2jpcommon convert_pos()
+ * "助動詞 非自立" 警告并提前终止合成（线上案例：58 字文本只出 2.8s 音频，正常应 ~10s）。
+ * 统一展开为完整形规避该缺陷；仅处理て类（で类需前缀锚定防误伤"出る"等独立词，暂不处理）。
+ * 只影响合成读音（标准形），不改显示文本。
+ */
+function expandJaContractions(text: string): string {
+  return text.split('てない').join('ていない').split('てる').join('ている')
+}
+
+/** 各语言参考语速（字/秒）：声库实测正常样本（Nanami_chiaki ≈ 6.2~6.6 ja），取保守均值用于时长预期 */
+const REF_SPEECH_RATE: Record<string, number> = { ja: 5.5, zh: 4.0 }
+/** 时长比例下限：实际时长低于"按参考语速的预期时长"的 55% 判定截断（正常波动 ≈ 0.85~0.95，余量近一倍） */
+const TRUNCATION_RATIO = 0.55
+/** 最小校验字数：短段统计误差大且截断损失小，豁免校验 */
+const TRUNCATION_MIN_CHARS = 20
+/**
+ * 硬截断比例下限：比例 < 0.5 时不论段长短一律判截断。20 字豁免只为 0.5~0.55 温和区间
+ * 的统计噪声设——0.5 以下不存在合法解释：截断只会拉低比例、停顿只会抬高比例，正常语音
+ * 最低 0.78（留 0.28 余量），实测案例 16 字/0.9s = 比例 0.22（2026-10-15 实锤）、17 字/1.0s
+ * = 比例 0.32 恰卡 0.3 旧线之上漏判，"你居然在试探我"整句无音（2026-10-17 实锤后收紧）。
+ * 0.5~0.55 的部分截断（如 19 字/1.8s = 0.53）仍放行：短段截断损失小，重试代价 ~10s
+ * （重载角色）+ 播放阻塞，平衡点刻意留在 0.5。
+ */
+const TRUNCATION_HARD_RATIO = 0.5
+/**
+ * 时长比例上限（复诵参考音频治理，2026-10-15 实锤）：实际时长超过"按参考语速的预期时长"的
+ * 4 倍且绝对时长 > 3s = 疑似复诵参考音频。zero-shot 克隆以参考音频+其转写为生成条件，
+ * 超短目标文本与长条件的占比极端失衡时，模型会"续写"出参考音频的内容（实测「…うん。」
+ * 4 字合成出 8.0s 音频 = 拖腔 + 参考音频原文）。正常语音波动 ≈ 0.85~1.2 倍，表达性拖长音
+ * 极少超过 2 倍——4 倍 + 3s 双门槛不会误伤。上界不做小字段豁免：泄漏恰恰集中在超短段。
+ */
+const LEAK_RATIO = 4.0
+/** 泄漏判定的绝对时长下限（秒）：超短段比例噪声大，绝对时长过小不判泄漏 */
+const LEAK_MIN_SEC = 3.0
+
+/**
+ * 段时长截断判定：音频时长远短于"文本按参考语速的预期时长" = 服务端合成提前终止。
+ * 语速参考：ja 正常 5~7 字/s、zh 3.5~5 字/s；线上截断案例 58 字/2.8s = 20.7 字/s（比例 0.27）。
+ * 短段（< TRUNCATION_MIN_CHARS 字）在温和区间豁免（统计误差大且截断损失小）；
+ * 极端比例（< TRUNCATION_HARD_RATIO = 0.5）不论长短一律判截断（见常量注释）。
+ * 泄漏方向（leaked）不做字数豁免——复诵参考音频恰恰集中在超短段（见 LEAK_RATIO 注释）。
+ */
+function judgeSegmentTruncation(seg: string, pcm: Buffer, lang: string): { truncated: boolean; leaked: boolean; sec: number; expectedSec: number; ratio: number } {
+  const sec = pcm.length / 2 / 32000
+  const rate = REF_SPEECH_RATE[lang] ?? 4.0
+  const expectedSec = seg.length / rate
+  const ratio = expectedSec > 0 ? sec / expectedSec : 1
+  const truncated = ratio < TRUNCATION_RATIO && (seg.length >= TRUNCATION_MIN_CHARS || ratio < TRUNCATION_HARD_RATIO)
+  const leaked = ratio > LEAK_RATIO && sec > LEAK_MIN_SEC
+  return { truncated, leaked, sec, expectedSec, ratio }
 }
 
 /** 估计纯停顿块的静音时长（秒）：基础一拍 + 每个省略号加一拍，封顶 1.5s */
@@ -669,35 +795,96 @@ async function ensureMonoWav(p: string): Promise<string | null> {
 /**
  * 使用 LLM API 将文本翻译为目标语言。
  * 用于日语 TTS 模型：AI 生成中文文本，翻译为日语后交给 GenieTTS 合成。
+ *
+ * 校验防线（2026-10-05，"最后一段语音没输出完就结束/语音异常"根因修复）：
+ *  - 目标 ja 但结果不含日文假名（思考型模型的 reasoning 会计入 max_tokens 预算，预算过小 →
+ *    content 为空；或模型偷懒回显中文原文）→ 强化提示词重试一次；
+ *  - 仍失败则抛错（不再静默回退原文合成）——宁可跳过该块语音（文本照常上屏跟读），
+ *    也不能让日文声库读中文出怪音；上层 PetApp catch 后按既有静默降级处理。
+ * 纯度防线（2026-10-14，"翻译夹杂中文残留/韩文"实锤后补）：
+ *  - 含韩文（Hangul 区，实测 "먼저"）→ 判不纯；
+ *  - 逐句检查：含汉字但整句无假名且长度 ≥4（日文句子必含假名助词/送假名）→ 未翻译的
+ *    中文残句（实测 "那、那算什么呀"）→ 判不纯；
+ *  - 不纯 → 强化提示词重试一次；重试后仍不纯 → **照旧放行合成**（用户选择的降级策略：
+ *    不跳过语音、不回退中文原文，与既有行为一致，仅多一次纠偏机会）。
  */
 async function translateText(text: string, targetLang: 'ja' | 'zh'): Promise<string> {
-  try {
-    const settings = await getSettings()
-    const apiKey = await readApiKey()
-    if (!apiKey || !settings.baseURL.trim() || !settings.model.trim()) {
-      console.warn('[genie] 翻译跳过：未配置 LLM API')
-      return text
-    }
-    const langName = targetLang === 'ja' ? '日语' : '中文'
-    const result = await sendChatCompletion(
-      [
-        { role: 'system', content: `你是一个翻译助手。将用户输入的文本翻译为${langName}，只输出翻译结果，不要任何解释、注释或额外内容。保持原文的情感和语气。` },
-        { role: 'user', content: text },
-      ],
-      {
-        model: settings.model,
-        baseURL: settings.baseURL,
-        apiKey,
-        temperature: 0.3,
-        stream: false,
-        maxTokensOverride: 1024,
-      },
-    )
-    return result.trim() || text
-  } catch (err) {
-    console.error('[genie] 翻译失败，使用原文合成', err)
+  const settings = await getSettings()
+  // P0-2B：翻译走辅助模型（机械任务，主对话模型可能是思考型，延迟 1.3~28.8s 波动）；
+  // 未配置辅助模型时回落主对话模型三件套
+  const aux = await resolveAuxLlmConfig()
+  const useModel = aux?.model ?? settings.model
+  const useBaseURL = aux?.baseURL ?? settings.baseURL
+  const useApiKey = aux?.apiKey ?? (await readApiKey())
+  if (!useApiKey || !useBaseURL.trim() || !useModel.trim()) {
+    console.warn('[genie] 翻译跳过：未配置 LLM API（主或翻译辅助模型）')
     return text
   }
+  const langName = targetLang === 'ja' ? '日语' : '中文'
+  // 结果校验：ja 至少要含日文假名（平/片假名），zh 至少要含汉字——否则视为翻译失败
+  const looksValid = (out: string) =>
+    targetLang === 'ja' ? /[\u3040-\u309F\u30A0-\u30FF]/.test(out) : /[\u4e00-\u9fff]/.test(out)
+  // ja 纯度校验：韩文混入 / 漏翻的中文残句（含汉字但整句无假名，句长 ≥4 过滤「私。」类短句误报）
+  const HANGUL_RE = /[\uAC00-\uD7AF\u1100-\u11FF]/
+  const looksPureJa = (out: string): boolean => {
+    if (HANGUL_RE.test(out)) return false
+    for (const sentence of out.split(/[。！？!?\n…]+/)) {
+      const s = sentence.trim()
+      if (/[\u4e00-\u9fff]/.test(s) && !/[\u3040-\u309F\u30A0-\u30FF]/.test(s) && s.length >= 4) return false
+    }
+    return true
+  }
+  // 思考型模型的 reasoning 计入 max_tokens 预算：1024 被思考耗尽 → content 为空 →
+  // 此前静默回退原文（中文喂日文声库 = "语音异常"根因），抬到 2048 与主对话链路对齐
+  const systemPrompt = (strong: boolean) =>
+    `你是一个翻译助手。将用户输入的文本翻译为${langName}，只输出翻译结果，不要任何解释、注释或额外内容。保持原文的情感和语气。` +
+    (strong
+      ? `\n【强制】结果必须是${langName}文本：禁止输出原文语言、禁止夹杂中文/韩文等其他语言的字词、禁止输出空内容、禁止输出任何思考过程。`
+      : '')
+
+  let lastOutput = ''
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      lastOutput = await sendChatCompletion(
+        [
+          { role: 'system', content: systemPrompt(attempt > 1) },
+          { role: 'user', content: text },
+        ],
+        {
+          model: useModel,
+          baseURL: useBaseURL,
+          apiKey: useApiKey,
+          temperature: 0.3,
+          stream: false,
+          maxTokensOverride: 2048,
+        },
+      )
+    } catch (err) {
+      console.error('[genie] 翻译请求异常（第 %d 次）', attempt, err)
+      continue // 请求异常 → 直接重试一次
+    }
+    const result = lastOutput.trim()
+    if (!result || !looksValid(result)) {
+      console.warn(
+        '[genie] 翻译结果校验失败（第 %d 次）：输出字数=%d 含假名=%s 输出=%j',
+        attempt,
+        result.length,
+        looksValid(result),
+        result.slice(0, 60) || '(空)',
+      )
+      continue
+    }
+    // 纯度校验（仅 ja）：不纯 → 重试一次；重试后仍不纯 → 照旧放行（用户选择的降级策略）
+    if (targetLang === 'ja' && !looksPureJa(result)) {
+      if (attempt < 2) {
+        console.warn('[genie] 翻译结果纯度校验失败（第 %d 次，夹杂中文/韩文）→ 强化提示词重试：输出=%j', attempt, result.slice(0, 60))
+        continue
+      }
+      console.warn('[genie] 翻译结果纯度校验仍失败（已重试）→ 照旧放行合成：输出=%j', result.slice(0, 60))
+    }
+    return result
+  }
+  throw new Error('日语翻译校验失败（两次尝试均未得到有效日文）——跳过该块语音，文本照常上屏')
 }
 
 /**
@@ -744,20 +931,11 @@ async function synthesizeGenieInner(params: {
   const base = normUrl(config.baseUrl)
 
   if (!(await probe(base))) {
-    // 服务未就绪且配置了环境路径 → 自动拉起一次（互斥：并发合成共用同一次启动）
+    // 服务未就绪且配置了环境路径 → 自动拉起（startGenieServer 自带幂等前置 + 互斥 + 等就绪，
+    // 合成路径与【启动服务】按钮共用同一套防重，杜绝双实例 bind 10048）
     if (config.workPath && !serverProcess) {
-      if (!startPromise) {
-        startPromise = startGenieServer(config.workPath, config.baseUrl, config.dataDir).then(() => undefined)
-        void startPromise.finally(() => {
-          startPromise = null
-        })
-      }
-      await startPromise
-      // 轮询等待就绪：模型导入可能比固定 sleep 慢，最多等 20s
-      for (let i = 0; i < 20; i++) {
-        if (await probe(base)) break
-        await new Promise((r) => setTimeout(r, 1000))
-      }
+      const started = await startGenieServer(config.workPath, config.baseUrl, config.dataDir)
+      if (!started.ok) throw new Error(started.error ?? 'GenieTTS 服务启动失败。')
     }
     if (!(await probe(base))) {
       throw new Error('GenieTTS 服务未运行。请在设置中先【启动服务】并等待就绪，或确认地址/端口正确。')
@@ -814,36 +992,44 @@ async function synthesizeGenieInner(params: {
   }
 
   // 文本预处理（整组剔除（）心理/动作内容）规避 G2P 越界崩溃；随后按语言分段合成
-  const safeText = sanitizeGenieText(synthText)
-  if (!safeText) {
+  const sanitized = sanitizeGenieText(synthText)
+  if (!sanitized) {
     // 整段都在括号里（纯心理/动作/场景，无可朗读台词）
     throw new Error('该段内容均为心理/动作描写（括号内），没有可朗读的台词')
   }
+  // ja 缩约形展开（てない→ていない、てる→ている，读音同义零损失）：规避 Genie ja G2P 的
+  // convert_pos() 缺陷（缩约形触发"助動詞 非自立"警告后合成提前终止，详见 expandJaContractions）
+  const safeText = lang === 'ja' ? expandJaContractions(sanitized) : sanitized
   // 纯停顿块短路（如「……」「！？」——语气字已归一为「唔」，一般不会再落到这里）：
   // 无可发声内容时调用 /tts 必然返回空音频，且重载角色重试也无法改变结果。
   // 直接返回一段短静音保留"停顿"演出节拍，不发起请求、不重载、不打错误。
   if (!hasSpeakableContent(safeText)) {
     const seconds = estimatePauseSeconds(safeText)
-    console.log('[genie] 无可发声内容（纯停顿块），返回 %.2fs 静音节拍：%s', seconds, safeText)
+    console.log('[genie] 无可发声内容（纯停顿块），返回 %ss 静音节拍：%s', seconds.toFixed(2), safeText)
     return buildSilenceWav(seconds)
   }
-  // 分段策略：中文模式由客户端按标点切句并贪心合并为目标段长（30-48 字），逐段合成后拼接——
+  // 分段策略：客户端按标点切句并贪心合并为目标段长（30-48 字），逐段合成后拼接（ja/zh 同规则）——
   // 服务端 split_sentence=true 同样是逐句独立推理，但句子切得太碎：每句都注入一次完整参考音频
   // 条件，"短文本泡在长条件里"的比例失衡会显著放大模型复诵参考音频（复读）的概率；
-  // 合并后注入次数与文本占比同时改善。日文模式维持整段一次合成（split=false）不变。
-  const segments = lang !== 'ja' ? mergeSentences(splitByPunctuation(safeText)) : [safeText]
+  // 合并后注入次数与文本占比同时改善。ja 并入分段（原整段一次合成）：单次推理变短，
+  // G2P 异常（convert_pos 截断）的暴露面与单次损失同步缩小。
+  const segments = mergeSentences(splitByPunctuation(safeText))
   if (segments.length === 0) {
     // 理论上不可达（整体无可发声内容已被上游短路拦截），防御性回退整段合成
     segments.push(safeText)
   }
 
-  // 逐段合成（每段失败自动重试一次：重载角色可复位服务端推理状态），全部成功后拼接 PCM。
+  // 逐段合成（每段失败/判定截断自动重试一次：重载角色可复位服务端推理状态），全部成功后拼接 PCM。
   // 任一段重试后仍失败 → 放弃整段并向上报错（上层兜底：文本顶上跟读气泡），避免缺段语音。
   const pcms: Buffer[] = []
   for (const seg of segments) {
-    let pcm: Buffer | null = null
+    let bestPcm: Buffer | null = null
+    let bestVerdict: ReturnType<typeof judgeSegmentTruncation> | null = null
     let segErr: unknown = null
+    let attempts = 0
+    let truncated = false
     for (let attempt = 1; attempt <= 2; attempt++) {
+      attempts = attempt
       if (attempt > 1) {
         // 重试前强制重载角色（复位服务端推理状态），稍等片刻给 worker 恢复时间
         loadedCharacter = ''
@@ -856,24 +1042,88 @@ async function synthesizeGenieInner(params: {
       }
       try {
         const raw = await genieFetchRaw(base, name, seg)
-        pcm = raw ? rawToPcm(raw) : null
+        const pcm = raw ? rawToPcm(raw) : null
+        if (pcm) {
+          const verdict = judgeSegmentTruncation(seg, pcm, lang)
+          // 取舍方向随判定不同：截断取较长版本（重试大概率更长，取长无损失）；
+          // 泄漏（复诵参考音频）取较短版本（重试大概率更短）
+          const prefer = verdict.leaked
+            ? !bestVerdict || verdict.sec < bestVerdict.sec
+            : !bestVerdict || verdict.sec > bestVerdict.sec
+          if (prefer) {
+            bestPcm = pcm
+            bestVerdict = verdict
+          }
+          truncated = verdict.truncated
+          if (!truncated && !verdict.leaked) break // 时长正常，提前结束
+          if (verdict.leaked) {
+            console.warn(
+              '[genie] 段时长校验判定过长（疑似复诵参考音频，第 %d 次）：字数=%d 实际=%ss 预期=%ss 比例=%s%s',
+              attempt,
+              seg.length,
+              verdict.sec.toFixed(1),
+              verdict.expectedSec.toFixed(1),
+              verdict.ratio.toFixed(2),
+              attempt === 1 ? ' —— 重载角色后重试一次' : ' —— 重试后仍长，按预期上限裁剪尾部',
+            )
+          } else {
+            console.warn(
+              '[genie] 段时长校验判定截断（第 %d 次）：字数=%d 实际=%ss 预期=%ss 比例=%s%s',
+              attempt,
+              seg.length,
+              verdict.sec.toFixed(1),
+              verdict.expectedSec.toFixed(1),
+              verdict.ratio.toFixed(2),
+              attempt === 1 ? ' —— 重载角色后重试一次' : ' —— 重试后仍短，放行较长时间版本',
+            )
+          }
+        } else {
+          // 空音频/无效 PCM：走重试
+          truncated = false
+        }
       } catch (err) {
         segErr = err
-        pcm = null
         console.warn('[genie] 合成请求异常（第 %d 次）：%s', attempt, err instanceof Error ? err.message : String(err))
       }
-      if (pcm) break
-      loadedCharacter = '' // 服务端推理状态可能已被污染，强制下次重载角色
       if (attempt === 1) {
-        console.warn('[genie] 段合成%s，重载角色后自动重试一次', segErr ? '请求异常' : '为空音频')
+        loadedCharacter = '' // 服务端推理状态可能已被污染，强制下次重载角色
+        console.warn(
+          '[genie] 段合成%s，重载角色后自动重试一次',
+          bestVerdict?.leaked ? '超长（疑似复诵参考音频）' : bestPcm ? '时长不足（疑似截断）' : segErr ? '请求异常' : '为空音频',
+        )
         await new Promise((r) => setTimeout(r, 800))
       }
     }
-    if (!pcm) {
+    if (!bestPcm) {
       if (segErr) throw segErr instanceof Error ? segErr : new Error(String(segErr))
       throw new Error(`GenieTTS 生成为空音频（段：${seg.slice(0, 30)}${seg.length > 30 ? '…' : ''}）`)
     }
-    pcms.push(pcm)
+    // 复诵参考音频兜底：重试后仍超长 → 按预期上限硬裁尾部（截掉的部分正是复读内容；
+    // 台词发声主体在段首，裁剪不损伤台词本体）。rawToPcm 为 32kHz 单声道 int16（2 字节/采样）。
+    // 超短段（<8 字）上限降档收紧为 max(预期×2, 1.5s)——预期×4 的余量会保留约 2s 的参考音频
+    // 头部（2026-10-16 01:26 轮实锤：4 字段裁到 2.9s 仍含 2.2s 泄漏被用户听到）；慢速拖腔被
+    // 裁尾对超短语气段可接受。
+    if (bestPcm && bestVerdict?.leaked) {
+      const leakCapSec = seg.length < 8 ? Math.max(bestVerdict.expectedSec * 2, 1.5) : bestVerdict.expectedSec * LEAK_RATIO
+      const maxBytes = Math.floor(leakCapSec * 32000) * 2
+      if (bestPcm.length > maxBytes) {
+        console.warn(
+          '[genie] 复诵参考音频兜底：段 %ss 超过预期上限 %ss，裁剪尾部',
+          (bestPcm.length / 2 / 32000).toFixed(1),
+          leakCapSec.toFixed(1),
+        )
+        bestPcm = bestPcm.subarray(0, maxBytes)
+      }
+    }
+    // 诊断埋点（排查"长语音提前结束"与"复诵参考音频"）：字数 / 语种 / PCM 实际时长 /
+    // 实际/预期时长比例（下界=截断、上界=复诵，一维归因）/ 尝试次数。
+    // 人工核对口径：中文正常约 3.5~5 字/秒、日文约 5~7 字/秒（含标点停顿），明显偏短 = 模型截断；
+    // 出现"段合成请求异常/为空音频"warn + 上层"[pet] TTS 合成失败" = 弃段（该块音频整体丢失）。
+    // 注意 util.format 不支持 %.1f 精度修饰（会原样输出并导致参数错位），秒数须先 toFixed 再用 %s。
+    const secNum = bestPcm.length / 2 / 32000
+    const finalRatio = seg.length > 0 ? secNum / (seg.length / (REF_SPEECH_RATE[lang] ?? 4.0)) : 1
+    console.log('[genie] 段合成完成：语种=%s 字数=%d 时长=%ss 比例=%s 尝试=%d次%s', lang, seg.length, secNum.toFixed(1), finalRatio.toFixed(2), attempts, truncated ? '（截断重试后仍短，已放行较长版本）' : '')
+    pcms.push(bestPcm)
   }
   // 拼接各段 PCM（32kHz 单声道 int16）封装为 WAV；段尾标点的停顿由 Genie 生成，无需额外静音
   const wav = wrapToWav(pcms)

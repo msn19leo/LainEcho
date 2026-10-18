@@ -2,8 +2,9 @@
  * 主进程入口：单实例锁、窗口创建、托盘、自定义协议、IPC 注册。
  */
 import { app } from 'electron'
+import { initLogger } from './services/logger'
 import { ensureDataDirs } from './services/storage'
-import { pruneEmptySessions, migrateSpriteEmotionMaps } from './services/repository'
+import { pruneEmptySessions, migrateSpriteEmotionMaps, dedupeFailedUserResends } from './services/repository'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
 import { migrateMemoryPerspectives } from './services/memoryExtraction'
 import { startProactiveScheduler } from './services/proactive/scheduler'
@@ -14,6 +15,9 @@ import { windowManager } from './windows/windowManager'
 
 // pet-res:// 特权 scheme 必须在 app ready 之前注册
 registerPetSchemesPrivileged()
+
+// 日志系统尽早初始化：后续所有主进程 console 输出自动落盘（渲染端经 api.logs.forward 转发）
+initLogger()
 
 // Windows 通知/任务栏归属
 app.setAppUserModelId('com.lainecho.pet')
@@ -27,6 +31,8 @@ if (!gotLock) {
     await ensureDataDirs()
     // 清理历史遗留的空会话（无消息 = 从未使用）
     await pruneEmptySessions().catch((err) => console.error('清理空会话失败', err))
+    // 重发去重清理（一次性、幂等）：移除"失败 user + 同内容重发 user"相邻重复对
+    await dedupeFailedUserResends().catch((err) => console.error('重发去重清理失败', err))
     registerPetProtocolHandler()
     registerAllIpc()
     windowManager.init()

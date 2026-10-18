@@ -317,19 +317,20 @@ textarea {
 }
 
 /* ============================================================================
- * 打字机光标 —— 流光渐变闪烁（动效强度 7）
+ * 打字机光标 —— 打字推进中静态常显（不闪），等待新文本时闪烁（.streaming-cursor--waiting）。
+ * 颜色 = 主题按钮的背景色 var(--gradient-brand)（浅色模式柔和浅蓝底 / 深色模式暗青底，
+ * 与主题切换按钮完全同源，经 background-clip:text 填充到光标字形上），用户指明以按钮
+ * 背景色为准（非文字色）；替换早先的渐变流光+辉光（用户反馈观感违和）。
  * ========================================================================== */
 .streaming-cursor::after {
   content: '▍';
   margin-left: 1px;
-  background: linear-gradient(
-    180deg,
-    var(--primary-400) 0%,
-    var(--accent-500) 100%
-  );
+  background: var(--gradient-brand);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
+}
+.streaming-cursor--waiting::after {
   animation: stream-blink 0.9s ease-in-out infinite;
 }
 
@@ -337,11 +338,9 @@ textarea {
   0%,
   100% {
     opacity: 1;
-    filter: drop-shadow(0 0 4px var(--primary-glow));
   }
   50% {
-    opacity: 0.3;
-    filter: drop-shadow(0 0 2px var(--accent-glow));
+    opacity: 0.25;
   }
 }
 

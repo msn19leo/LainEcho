@@ -4,13 +4,27 @@
 import { dialog, ipcMain } from 'electron'
 import type { SessionDetail, SessionIndexItem } from '../../src/types'
 import { sessionToMarkdown } from '../services/markdownExporter'
-import { createSession, getSession, listSessions, removeSession, renameSession } from '../services/repository'
+import { createSession, getSession, listSessions, removeSession, renameSession, setSessionSceneDigest } from '../services/repository'
 import { windowManager } from '../windows/windowManager'
 
 export function registerSessionIpc(): void {
   ipcMain.handle('session:list', (): Promise<SessionIndexItem[]> => listSessions())
 
   ipcMain.handle('session:get', (_e, id: string): Promise<SessionDetail> => getSession(id))
+
+  /** 读取最近活跃会话的情景摘要缓存（设置窗查看/编辑；与主动搭话投放目标同口径=listSessions 首个） */
+  ipcMain.handle('session:scene-digest-get', async () => {
+    const index = await listSessions()
+    const latest = index[0]
+    if (!latest) return null
+    const detail = await getSession(latest.id)
+    return { sessionId: latest.id, title: latest.title, digest: detail.sceneDigest ?? '' }
+  })
+
+  /** 保存指定会话的情景摘要缓存（设置窗手动编辑；空串=清空缓存） */
+  ipcMain.handle('session:scene-digest-set', async (_e, params: { sessionId: string; text: string }) => {
+    await setSessionSceneDigest(params.sessionId, params.text ?? '')
+  })
 
   ipcMain.handle('session:create', async (_e, params: { characterCardId: string }): Promise<SessionIndexItem> => {
     if (!params?.characterCardId) throw new Error('缺少角色卡')

@@ -648,6 +648,9 @@ function buildStoryDirective(rt: RunRuntime, prompt?: string): string {
   const lines = [base]
   // 生成时长收敛（7.7 性能第一批）：硬性约束分段数量与每段长度，直接减少生成 token、缩短整轮等待
   lines.push('分段与长度硬性要求：dialogue 数组只输出 2~4 项，每项 1~2 句话（20~60 字），宁可少而精，不要长篇大论。')
+  // kind 契约（与普通聊天一致）：每项必须带 kind 字段，speak=台词、narr=不可发声的动作/心理/环境描写；
+  // narr 段在剧情窗渲染为旁白样式且不朗读。kind+括号双重标记，防漏标被误朗读。
+  lines.push('输出契约补充：dialogue 每一项除 text 与 emotion 外必须带 "kind" 字段——"speak" 表示角色说出口的台词（不加括号），"narr" 表示动作/心理/环境等不发声的描写（text 必须用（）包裹）。')
   if (prompt) lines.push(`本段导演指令：${prompt}`)
   // AI 背景联动（7.3）：仅当剧本作者写过 background 事件（allowAiBackground）且未启用覆盖背景时注入说明；
   // 作者没写背景切换 = 不允许 AI 自行切背景（防止模型因台词/旁白提及景物而误切同名词背景）

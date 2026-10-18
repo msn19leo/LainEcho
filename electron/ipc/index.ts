@@ -4,6 +4,7 @@
 import { registerAiIpc } from './ai.ipc'
 import { registerCharacterCardIpc } from './characterCard.ipc'
 import { registerMemoryIpc } from './memory.ipc'
+import { registerLogsIpc } from './logs.ipc'
 import { registerModelIpc } from './model.ipc'
 import { registerModelSettingsIpc } from './modelSettings.ipc'
 import { registerProactiveIpc } from './proactive.ipc'
@@ -20,6 +21,7 @@ export function registerAllIpc(): void {
   registerAiIpc()
   registerCharacterCardIpc()
   registerMemoryIpc()
+  registerLogsIpc()
   registerModelIpc()
   registerModelSettingsIpc()
   registerProactiveIpc()

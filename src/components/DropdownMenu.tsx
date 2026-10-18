@@ -313,7 +313,13 @@ interface PositionedMenuProps {
 
 export function PositionedMenu({ x, y, open, items, onClose }: PositionedMenuProps) {
   if (!open) return null
-  return (
+  // Portal 到 body：聊天窗/桌宠窗的气泡祖先链上常带 glass（backdrop-filter）或
+  // framer-motion transform——这些属性会把 fixed 子元素变成相对该祖先定位，菜单整体
+  // 偏移（2026-10-17 实锤：聊天窗右键菜单出现在点击位置偏右方）。挂到 body 后 fixed
+  // 恒相对视口，x/y 语义恢复正确。钳位避免贴边溢出。
+  const left = Math.max(8, Math.min(x, window.innerWidth - 190))
+  const top = Math.max(8, Math.min(y, window.innerHeight - 100))
+  return createPortal(
     <>
       <div
         className="fixed inset-0 z-40"
@@ -323,11 +329,12 @@ export function PositionedMenu({ x, y, open, items, onClose }: PositionedMenuPro
           onClose()
         }}
       />
-      <div className={cn(PANEL_CLASS, 'fixed z-50 min-w-[176px]')} style={{ left: x, top: y }}>
+      <div className={cn(PANEL_CLASS, 'fixed z-50 min-w-[176px]')} style={{ left, top }}>
         {items.map((item) => (
           <ItemButton key={item.key} item={item} onDone={onClose} />
         ))}
       </div>
-    </>
+    </>,
+    document.body,
   )
 }

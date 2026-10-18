@@ -35,6 +35,9 @@ export class LipSyncController {
   private rmsPeak = 0
   /** 当前播放状态（用于 ticker 判断是否需要应用口型参数） */
   private playing = false
+  /** 当前播放的起始 AudioContext 时钟与时长（播放进度推算用） */
+  private playT0 = 0
+  private playDur = 0
 
   // ---- 口型映射调参常量 ----
   /** EMA 平滑：新值权重（0.65 峰值更跟手；归一化已消除大部分抖动来源） */
@@ -99,6 +102,8 @@ export class LipSyncController {
     // 淡入淡出：消除每段硬起硬止的 click/pop（开局第一段最明显）
     const t0 = ctx.currentTime
     const dur = audioBuffer.duration
+    this.playT0 = t0
+    this.playDur = dur
     const fadeIn = Math.min(LipSyncController.FADE_IN_SEC, dur)
     const fadeOut = Math.min(LipSyncController.FADE_OUT_SEC, dur / 2)
     const tEnd = t0 + dur
@@ -192,5 +197,11 @@ export class LipSyncController {
   /** 当前是否正在播放音频 */
   get isPlaying(): boolean {
     return this.playing
+  }
+
+  /** 当前语音播放进度（0~1）：按 AudioContext 时钟与 buffer 时长推算；未播放返回 1 */
+  get progress(): number {
+    if (!this.playing || !this.audioContext || this.playDur <= 0) return 1
+    return Math.min(1, Math.max(0, (this.audioContext.currentTime - this.playT0) / this.playDur))
   }
 }

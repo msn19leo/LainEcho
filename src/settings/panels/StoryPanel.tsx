@@ -71,7 +71,8 @@ function TextSpeedSample({ speed }: { speed: number }) {
 }
 
 export function StoryPanel() {
-  const textSpeed = useSettingsStore((s) => s.settings.textSpeed ?? DEFAULT_TEXT_SPEED)
+  // 剧情窗文字速度：独立设置（storyTextSpeed），不影响桌宠/聊天窗的通用 textSpeed
+  const textSpeed = useSettingsStore((s) => s.settings.storyTextSpeed ?? DEFAULT_TEXT_SPEED)
   const saveSettings = useSettingsStore((s) => s.save)
   const [scripts, setScripts] = useState<ScriptCardItem[] | null>(null)
   const [runs, setRuns] = useState<StoryRunIndexItem[]>([])
@@ -835,7 +836,7 @@ export function StoryPanel() {
           </div>
         )}
       </section>
-      {/* 文字显示速度（与通用设置共用同一全局设置，实时作用于剧情窗对话框） */}
+      {/* 文字显示速度（剧情系统独立设置，仅作用于剧情窗对话框） */}
       <section className="glass rounded-[var(--radius-xl)] p-4">
         <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-text">
           <Type size={15} className="text-primary-400" />
@@ -844,7 +845,7 @@ export function StoryPanel() {
         <Card className="p-4">
           <div className="space-y-3">
             <p className="text-xs leading-relaxed text-text-2">
-              控制剧情窗对话框里文字的逐字显示快慢（与「通用设置」中的文字速度为同一设置，数值越大越快）。
+              控制剧情窗对话框里文字的逐字显示快慢（剧情系统独立设置，与「通用设置」中桌宠/聊天窗的文字速度互不影响；数值越大越快）。
             </p>
             <Slider
               label="速度"
@@ -853,7 +854,7 @@ export function StoryPanel() {
               max={100}
               step={1}
               defaultValue={DEFAULT_TEXT_SPEED}
-              onChange={(v) => void saveSettings({ textSpeed: Math.round(v) })}
+              onChange={(v) => void saveSettings({ storyTextSpeed: Math.round(v) })}
               format={(v) => `${v}`}
             />
             <div className="rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--bg-surface)]/70 px-4 py-3">

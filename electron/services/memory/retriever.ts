@@ -45,14 +45,15 @@ function recencyFactor(createdAt: number): number {
  * @param fallbackLimit 降级模式的注入条数（沿用 MAX_MEMORIES）
  */
 export async function retrieveMemories(cardId: string, query: string, fallbackLimit: number): Promise<RetrievedMemories> {
+  // 画像压缩稿：两种模式下只要存在即注入（分层压缩的常驻层）。
+  // 提到 try 外：画像注入不依赖嵌入向量，检索链路失败（如嵌入服务未启动触发 fetch failed）
+  // 也不应连带丢画像——此前 catch 路径硬编码 profileDigest: null 导致"画像生效却永不注入"。
+  const profile = await getActiveProfile(cardId).catch(() => null)
   try {
     const settings = await getSettings()
     // 嵌入配置：独立于主 LLM（embeddingBaseURL + 独立 Key + embeddingModel），任一缺失即降级
     const cfg = await resolveEmbeddingConfig()
     const configured = settings.memoryRetrievalEnabled && cfg !== null
-
-    // 画像压缩稿：两种模式下只要存在即注入（分层压缩的常驻层）
-    const profile = await getActiveProfile(cardId)
 
     if (!configured) {
       const items = await listConfirmedMemories(cardId, fallbackLimit)
@@ -104,9 +105,9 @@ export async function retrieveMemories(cardId: string, query: string, fallbackLi
       mode: 'vector',
     }
   } catch (err) {
-    // 检索链路任何异常都不阻塞聊天
+    // 检索链路任何异常都不阻塞聊天；降级注入仍带画像（画像不依赖嵌入向量）
     console.warn('[memory-retrieval] 检索失败，回退最近条注入：', err instanceof Error ? err.message : err)
     const items = await listConfirmedMemories(cardId, fallbackLimit).catch(() => [] as MemoryItem[])
-    return { items, profileDigest: null, mode: 'recent' }
+    return { items, profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
   }
 }
