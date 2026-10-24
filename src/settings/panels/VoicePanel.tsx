@@ -15,7 +15,7 @@ import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, Play, Plus, Trash2, XCircle, Pencil, PlugZap, Rocket, Loader2, FolderOpen, FileAudio } from 'lucide-react'
 import { api } from '../../api'
 import type { TTSConfig, VoiceReference, TTSLanguage, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../types'
-import { Button, Card, ConfirmModal, Field, Input, Loading, Modal, PanelHeader } from '../../components/ui'
+import { Button, Card, ConfirmModal, Field, Input, Loading, Modal, PanelHeader, Slider } from '../../components/ui'
 import { toast } from '../../components/toast'
 
 /** 测试合成的按语言默认文本 */
@@ -359,6 +359,7 @@ export function VoicePanel() {
         voiceId: isGenie ? null : targetVoice!.id,
         engine: isGenie ? 'genie' : 'mimo',
         genieOverride: isGenie && selectedModelId ? { ttsModelId: selectedModelId } : null,
+        speed: config?.ttsSpeed ?? 1,
       })
       if (!audio) {
         setTestResult({ ok: false, message: '合成返回空音频' })
@@ -450,6 +451,21 @@ export function VoicePanel() {
               {config.mergeSpeech ? '已开启' : '已关闭'}
             </button>
           </Field>
+          <Field
+            label="TTS 语速"
+            hint="模型测试试听的语速倍率（1 = 原速）。主进程合成后对音频重采样变速，过快/过慢会有明显变调。"
+          >
+            <div className="w-full max-w-[280px]">
+              <Slider
+                value={config.ttsSpeed ?? 1}
+                min={0.75}
+                max={1.5}
+                step={0.05}
+                onChange={(v) => void handleSaveConfig({ ttsSpeed: Math.round(v * 100) / 100 })}
+                format={(v) => `${v.toFixed(2)}x`}
+              />
+            </div>
+          </Field>
         </div>
       </Card>
 
@@ -461,7 +477,7 @@ export function VoicePanel() {
             <div className="mb-3">
               <span className="text-[13px] font-medium text-text-2">GenieTTS 服务配置</span>
               <p className="mt-0.5 text-xs text-text-muted">
-                配置 GenieTTS 服务地址与环境，应用可自动拉起服务并合成。
+                配置服务地址与 Python 运行环境，留空则用系统 python 启动服务。
               </p>
             </div>
 
@@ -473,12 +489,12 @@ export function VoicePanel() {
                   placeholder="http://127.0.0.1:8000"
                 />
               </Field>
-              <Field label="GenieTTS 环境/项目目录" hint="含 python.exe 的目录（装了 genie-tts）；留空则用系统 python 启动服务">
+              <Field label="Python 环境目录" hint="需含 python.exe 或 venv\Scripts\python.exe，且该环境已 pip install genie-tts。留空则用系统 python启动服务。">
                 <div className="flex gap-2">
                   <Input
                     value={genieCfg.workPath}
                     onChange={(e) => void handleSaveGenie({ workPath: e.target.value })}
-                    placeholder="例如 E:\Genie_TTS_GUI（可留空）"
+                    placeholder="例如 D:\pyenv\genie（可留空）"
                   />
                   <Button variant="outline" onClick={() => void handleStartGenie()} disabled={starting}>
                     <Rocket size={14} strokeWidth={2.25} />
@@ -486,7 +502,7 @@ export function VoicePanel() {
                   </Button>
                 </div>
               </Field>
-              <Field label="GenieData 资源目录" hint="genie-tts 运行所需资源。请从 https://github.com/High-Logic/Genie-TTS 下载后放置于此目录">
+              <Field label="GenieData 资源目录" hint="运行所需资源（GenieData）。可从 https://github.com/High-Logic/Genie-TTS 下载。">
                 <div className="flex gap-2">
                   <Input
                     value={genieCfg.dataDir}

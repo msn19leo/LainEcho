@@ -7,9 +7,7 @@
  * - 任一步失败返回 null（策略层降级为普通话题搭话），绝不阻塞、绝不抛出到调度循环。
  */
 import { desktopCapturer, screen } from 'electron'
-import { readSecret } from '../crypto'
-import { getSettings } from '../repository'
-import { paths } from '../storage'
+import { resolveProfile } from '../apiProfiles'
 import { normalizeBaseURL } from '../aiClient'
 
 /** 转述缓存有效期（毫秒）：画面未变时直接复用，避免重复调用视觉模型 */
@@ -23,7 +21,7 @@ const VLM_MAX_TOKENS = 512
 /** 截图 JPEG 质量 */
 const JPEG_QUALITY = 80
 
-/** 视觉模型配置（独立于主 LLM：visionBaseURL + 独立 Key + visionModel） */
+/** 视觉模型配置（档案制：激活档案的 地址 + Key + 模型 三元组） */
 export interface VisionConfig {
   baseURL: string
   apiKey: string
@@ -33,12 +31,9 @@ export interface VisionConfig {
 /** 转述缓存：上次转述文本 + 当时画面的 dhash + 时间 */
 let cache: { text: string; hash: boolean[]; at: number } | null = null
 
-/** 读取视觉模型配置；任一项缺失返回 null（导出供立绘打标等其它 VLM 场景复用同一独立配置） */
+/** 读取视觉模型配置；未启用/配置不完整返回 null（导出供立绘打标等其它 VLM 场景复用同一独立配置） */
 export async function resolveVisionConfig(): Promise<VisionConfig | null> {
-  const settings = await getSettings()
-  const apiKey = await readSecret(paths.visionApiKeyFile).catch(() => null)
-  if (!settings.visionBaseURL.trim() || !settings.visionModel.trim() || !apiKey) return null
-  return { baseURL: settings.visionBaseURL, apiKey, model: settings.visionModel }
+  return resolveProfile('vision')
 }
 
 /**

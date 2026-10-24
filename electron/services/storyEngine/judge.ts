@@ -9,7 +9,7 @@
  */
 import type { ChatMessage, StoryAiJudge } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { readApiKey } from '../crypto'
+import { resolveProfile } from '../apiProfiles'
 import { getSettings } from '../repository'
 import type { RunRuntime } from './engine'
 
@@ -71,13 +71,14 @@ function matchOption(output: string, options: StoryAiJudge['options']): StoryAiJ
  */
 export async function judgeEnding(rt: RunRuntime, judge: StoryAiJudge): Promise<StoryAiJudge['options'][number] | null> {
   try {
-    const settings = await getSettings()
-    const apiKey = await readApiKey()
-    if (!apiKey || !settings.baseURL.trim() || !settings.model.trim()) {
-      console.warn('[story] AI 判定跳过：未配置 LLM API（回退缺省章节）')
+    // 主模型三元组走档案解析（档案制）：未激活档案时视为判定失败（回退缺省章节）
+    const mainCfg = await resolveProfile('main')
+    if (!mainCfg) {
+      console.warn('[story] AI 判定跳过：未配置主模型档案（回退缺省章节）')
       return null
     }
     const optionList = judge.options.map((o) => `- ${o.id}：${o.label}`).join('\n')
+    const settings = await getSettings()
     const userContent =
       `【判定要求】\n${judge.prompt}\n\n` +
       `【候选结局】\n${optionList}\n\n` +
@@ -89,9 +90,9 @@ export async function judgeEnding(rt: RunRuntime, judge: StoryAiJudge): Promise<
         { role: 'user', content: userContent },
       ],
       {
-        model: settings.model,
-        baseURL: settings.baseURL,
-        apiKey,
+        model: mainCfg.model,
+        baseURL: mainCfg.baseURL,
+        apiKey: mainCfg.apiKey,
         temperature: 0.3,
         stream: false,
         // 思考型模型的 reasoning 计入 max_tokens：给足余量避免思考耗尽预算、content 为空

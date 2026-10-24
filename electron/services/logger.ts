@@ -19,12 +19,13 @@ import { app, BrowserWindow } from 'electron'
 import fs from 'fs'
 import path from 'path'
 import { format } from 'node:util'
+import { getRootDir } from './storage'
 import type { LogEntry, LogEntrySource } from '../../src/types'
 
 export type { LogEntry }
 
-/** 日志目录：userData/logs（卸载随 deleteAppDataOnUninstall 一并清理） */
-export const LOG_DIR = () => path.join(app.getPath('userData'), 'logs')
+/** 日志目录：跟随数据根目录（自定义数据目录时日志一并落在该目录下，默认仍是 %APPDATA%/LainEcho/logs） */
+export const LOG_DIR = () => path.join(getRootDir(), 'logs')
 /** 当前会话日志文件（固定名，UI 与人工查看入口） */
 const LATEST_NAME = 'latest.log'
 /** 单文件上限：超过即滚出为备份 */

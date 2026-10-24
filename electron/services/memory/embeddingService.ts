@@ -1,7 +1,7 @@
 /**
  * 嵌入服务：调用 OpenAI 兼容 /embeddings 端点把文本转为向量。
  *
- * - 使用独立配置（embeddingBaseURL + 独立 Key + embeddingModel），与主 LLM 服务完全解耦；
+ * - 使用激活的嵌入档案（档案制），与主 LLM 服务完全解耦；
  * - 不下载任何本地模型，零磁盘占用；
  * - 批量输入分批（MAX_BATCH）+ 429/5xx 有限重试退避；
  * - 输出向量做 L2 归一化，检索时余弦相似度退化为点积。
@@ -15,7 +15,7 @@ const MAX_RETRIES = 2
 /** 重试基础退避（毫秒），按次数指数增长 */
 const RETRY_BACKOFF_MS = 1200
 
-/** 嵌入请求所需配置（由调用方从 settings + readApiKey 组装） */
+/** 嵌入请求所需配置（由调用方从激活的嵌入档案解析组装） */
 export interface EmbeddingConfig {
   baseURL: string
   apiKey: string

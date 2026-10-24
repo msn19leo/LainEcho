@@ -228,8 +228,8 @@ export default function PetApp() {
 
   /** 待合成的文本队列（入队顺序 = 播放顺序；index 为合成分段索引，null 表示单段整条；
    *  cumChars = 入队时分配的"含本槽位"累计字符数，消费时按它上行进度） */
-  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: string; kind?: 'speak' | 'narr'; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null; segIndex?: number | null; cumChars?: number }>>([])
-  /** 已合成待播放的音频队列（附带块文本与情绪：跟读时用块文本逐字显示、切立绘用情绪；
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: string; kind?: 'speak' | 'narr'; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null; segIndex?: number | null; cumChars?: number; speed?: number | null }>>([])
+  /** 已合成待播放的音频队列（附带块文本与状态：跟读时用块文本逐字显示、切立绘用状态；
    *  cumChars 透传自文本队列）。buffer=null 为 displayOnly 纯旁白的零时长槽位 */
   const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer | null; index: number | null; emotion: string; text: string; kind: 'speak' | 'narr'; cumChars?: number }>>([])
   /**
@@ -314,7 +314,7 @@ export default function PetApp() {
   }
 
   /**
-   * 合成循环：从文本队列取一个合成分段合成音频（携带分段索引与情绪）放入音频队列，串行不并发。
+   * 合成循环：从文本队列取一个合成分段合成音频（携带分段索引与状态）放入音频队列，串行不并发。
    */
   const synthesizeLoop = async () => {
     if (isSynthesizingRef.current) return
@@ -336,7 +336,7 @@ export default function PetApp() {
         audioQueueRef.current.push({ buffer: null, index: next.index, emotion: next.emotion, text: next.text, kind: 'narr', cumChars: next.cumChars })
         return
       }
-      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride, emotion: next.emotion, engine: next.engine, genieOverride: next.genieOverride })
+      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride, emotion: next.emotion, engine: next.engine, genieOverride: next.genieOverride, speed: next.speed ?? undefined })
       // 合完时若已被新一轮/终止清场，丢弃这段，避免旧音频串到新一轮（杂音/串场）
       if (audio && speechRoundRef.current === round) {
         audioQueueRef.current.push({ buffer: audio, index: next.index, emotion: next.emotion, text: next.text, kind: 'speak', cumChars: next.cumChars })
@@ -375,7 +375,7 @@ export default function PetApp() {
 
   /**
    * 播放循环：取出音频播放；跟读模式下按"已朗读文本 + 当前块进度"驱动内容框逐字显示，
-   * 并在块边界按该块情绪切换立绘（立绘随情绪切换保留、不降级）。
+   * 并在块边界按该块状态切换立绘（立绘随状态切换保留、不降级）。
    */
   const playLoop = async () => {
     if (isPlayingRef.current) return
@@ -448,7 +448,7 @@ export default function PetApp() {
       }
     }
     try {
-      // 块边界：切立绘到该块情绪（每个情绪变化处都切换，一个不丢；旁白槽位 index=null 不切）
+      // 块边界：切立绘到该块状态（每个状态变化处都切换，一个不丢；旁白槽位 index=null 不切）
       if (next.index !== null) {
         stageRef.current?.setEmotion(next.emotion)
       }
@@ -528,7 +528,7 @@ export default function PetApp() {
   // "（）输出时缺失、结束后才补进气泡"，2026-10-13 日志 4 例实锤）。
   useEffect(() => {
     const unsub = api.pet.onSpeak((payload) => {
-      const { text, voiceId, languageOverride, chunks, follow, engine, genieOverride, displayOnly } = payload ?? {}
+      const { text, voiceId, languageOverride, chunks, follow, engine, genieOverride, displayOnly, ttsSpeed } = payload ?? {}
       if (!text?.trim()) return
       console.log(`[sync] pet onSpeak text=${text.slice(0, 16)} chunks=${chunks?.length ?? 0} engine=${engine ?? '?'} displayOnly=${!!displayOnly}`)
       const isFollow = follow === true
@@ -553,6 +553,7 @@ export default function PetApp() {
           emotion: '平静',
           kind: 'narr',
           cumChars: takeProgressChars(t.length),
+          speed: ttsSpeed ?? null,
         })
         void synthesizeLoop()
         return
@@ -573,6 +574,7 @@ export default function PetApp() {
           engine,
           genieOverride: genieOverride ?? null,
           cumChars: 0,
+          speed: ttsSpeed ?? null,
         }))
       if (items.length === 0) return
       // 入队即分配累计字符数（同一 speak 块的所有合成分段共享该块的累计值——进度按块放行）

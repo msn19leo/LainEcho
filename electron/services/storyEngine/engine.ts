@@ -464,7 +464,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
           content: `（剧情演出：${event.prompt}）`,
           meta: { ...meta, storyKind: 'narration' },
           storyDirective: buildStoryDirective(rt, event.prompt),
-          spriteId: rt.run.spriteId, // 演出词表：AI 情绪值域与解析按 run 绑定的立绘集
+          spriteId: rt.run.spriteId, // 演出词表：AI 状态值域与解析按 run 绑定的立绘集
           store: { cardId: rt.run.cardId, history: [...rt.run.messages], append: (msgs) => appendTurnMessages(rt, msgs), storyRunId: rt.run.runId },
         })
         broadcastMessageSync(rt)
@@ -501,7 +501,7 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
             content: text,
             meta: { ...meta, storyKind: 'free' },
             storyDirective: buildStoryDirective(rt),
-            spriteId: rt.run.spriteId, // 演出词表：AI 情绪值域与解析按 run 绑定的立绘集
+            spriteId: rt.run.spriteId, // 演出词表：AI 状态值域与解析按 run 绑定的立绘集
             store: { cardId: rt.run.cardId, history: [...rt.run.messages], append: (msgs) => appendTurnMessages(rt, msgs), storyRunId: rt.run.runId },
           })
           broadcastMessageSync(rt)

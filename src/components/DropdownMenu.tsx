@@ -24,7 +24,9 @@ export interface MenuItem {
 }
 
 const PANEL_CLASS =
-  'overflow-y-auto overscroll-contain rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-panel)]/95 py-1 shadow-[var(--shadow-card-hover)] backdrop-blur-[20px]'
+  // app-no-drag：向下/向上翻转的面板可能盖到无边框窗的标题栏拖拽带（app-drag），Electron 的
+  // 拖拽区在窗口层拦截鼠标——不标记 no-drag 的话，压在标题栏上的下拉选项点不到（2026-10-22 实锤）
+  'app-no-drag overflow-y-auto overscroll-contain rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-panel)]/95 py-1 shadow-[var(--shadow-card-hover)] backdrop-blur-[20px]'
 
 /** 弹层最小宽度，避免触发器太窄时菜单挤成一列 */
 const PANEL_MIN_W = 168

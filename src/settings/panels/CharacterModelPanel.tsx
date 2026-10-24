@@ -50,10 +50,14 @@ export function CharacterModelPanel() {
   const [sprites, setSprites] = useState<CharacterSprite[]>([])
   const [importingSprite, setImportingSprite] = useState(false)
   const [deletingSprite, setDeletingSprite] = useState<CharacterSprite | null>(null)
-  /** 正在编辑情绪演出的立绘集（非空 = 弹窗打开）：词表 + 默认情绪 + 说话/思考立绘 */
+  /** 正在编辑状态演出的立绘集（非空 = 弹窗打开）：词表 + 默认状态 + 说话/思考立绘 */
   const [emotionEditing, setEmotionEditing] = useState<CharacterSprite | null>(null)
-  /** 正在编辑情绪词表的 Live2D 模型（非空 = 弹窗打开）：模型侧演出词表（词+释义+表情联动+默认情绪） */
+  /** 立绘弹窗标题的状态词数量（编辑器增删词条时实时回调同步，标题不滞后） */
+  const [spriteWordCount, setSpriteWordCount] = useState<number | null>(null)
+  /** 正在编辑状态词表的 Live2D 模型（非空 = 弹窗打开）：模型侧演出词表（词+释义+表情联动+默认状态） */
   const [paletteEditing, setPaletteEditing] = useState<Live2DModelMeta | null>(null)
+  /** 模型词表词条数（弹窗标题展示；词表存在独立文件，打开弹窗时异步拉取） */
+  const [paletteWordCount, setPaletteWordCount] = useState<number | null>(null)
   /** 可用的动作组列表（从模型 model3.json 读取） */
   const [motionGroups, setMotionGroups] = useState<string[]>([])
   /** 可用的表情列表（从选中模型的 exp3.json 读取） */
@@ -211,7 +215,7 @@ export function CharacterModelPanel() {
     }
   }
 
-  /** 导入立绘集（文件夹，含多张情绪切图） */
+  /** 导入立绘集（文件夹，含多张状态切图） */
   const handleImportSprite = async () => {
     setImportingSprite(true)
     try {
@@ -242,10 +246,29 @@ export function CharacterModelPanel() {
     }
   }
 
-  /** 打开立绘集的"情绪演出"编辑弹窗（词表 + 默认情绪 + 说话/思考立绘） */
+  /** 打开立绘集的"状态演出"编辑弹窗（词表 + 默认状态 + 说话/思考立绘） */
   const openEmotionMap = (s: CharacterSprite) => {
+    setSpriteWordCount(s.emotions.length)
     setEmotionEditing(s)
   }
+
+  // 模型词表词条数：打开模型弹窗时异步拉取（词表在 data/model-palettes.json，meta 上无此数据）
+  useEffect(() => {
+    if (!paletteEditing) {
+      setPaletteWordCount(null)
+      return
+    }
+    let alive = true
+    void api.model
+      .getPalette(paletteEditing.id)
+      .then((p) => {
+        if (alive) setPaletteWordCount(p?.entries.length ?? 0)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [paletteEditing])
 
   /** 词表保存成功：刷新列表并同步弹窗内的立绘集快照（避免编辑器草稿被旧数据覆盖） */
   const handlePaletteSaved = async () => {
@@ -421,7 +444,7 @@ export function CharacterModelPanel() {
                   }}
                 >
                   <Smile size={13} strokeWidth={2} />
-                  情绪演出
+                  状态演出
                 </Button>
                 <Button
                   variant="outline"
@@ -659,7 +682,7 @@ export function CharacterModelPanel() {
         </Button>
       </div>
       <p className="text-xs leading-relaxed text-text-muted">
-        立绘集 = 一个含多张情绪切图的文件夹（png/jpg/webp）。导入后在「角色卡 → 外观」中把立绘集与情绪映射绑定到角色。
+        立绘集 = 一个含多张状态切图的文件夹（png/jpg/webp）。导入后在「角色卡 → 外观」中把立绘集与状态映射绑定到角色。
       </p>
 
       {sprites.length === 0 ? (
@@ -668,7 +691,7 @@ export function CharacterModelPanel() {
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}>
               <Images size={17} strokeWidth={1.75} color="var(--primary-400)" />
             </div>
-            <div className="flex-1 text-sm text-text-muted">还没有立绘集。导入包含情绪切图的文件夹即可。</div>
+            <div className="flex-1 text-sm text-text-muted">还没有立绘集。导入包含状态切图的文件夹即可。</div>
           </div>
         </Card>
       ) : (
@@ -696,7 +719,7 @@ export function CharacterModelPanel() {
                   )}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-text-muted selectable">
-                  {s.images.length} 张图 · {formatRelativeTime(s.createdAt)} 导入
+                  {s.images.length} 张图 · 状态词 {s.emotions.length} · {formatRelativeTime(s.createdAt)} 导入
                 </div>
               </div>
               <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openRename('sprite', s.id, s.name) }}>
@@ -705,7 +728,7 @@ export function CharacterModelPanel() {
               </Button>
               <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); openEmotionMap(s) }}>
                 <Smile size={14} strokeWidth={2} />
-                情绪映射
+                状态映射
               </Button>
               <Button variant="danger" size="sm" onClick={(e) => { e.stopPropagation(); setDeletingSprite(s) }}>
                 删除
@@ -771,26 +794,32 @@ export function CharacterModelPanel() {
         onClose={() => setDeletingSprite(null)}
       />
 
-      {/* 情绪演出编辑弹窗：情绪词表（唯一情绪配置入口）+ 说话/思考立绘 */}
+      {/* 状态演出编辑弹窗：状态词表（唯一状态配置入口）+ 说话/思考立绘（所见即所得图片标注，需宽弹窗） */}
       <Modal
         open={!!emotionEditing}
         onClose={() => setEmotionEditing(null)}
-        title={`情绪演出 · ${emotionEditing?.name ?? ''}`}
-        width={560}
+        title={`状态演出 · ${emotionEditing?.name ?? ''}（状态词 ${spriteWordCount ?? emotionEditing?.emotions.length ?? 0}）`}
+        width={860}
         footer={
           <Button variant="ghost" onClick={() => setEmotionEditing(null)}>
             关闭
           </Button>
         }
       >
-        {emotionEditing && <SpritePaletteEditor sprite={emotionEditing} onSaved={() => void handlePaletteSaved()} />}
+        {emotionEditing && (
+          <SpritePaletteEditor
+            sprite={emotionEditing}
+            onSaved={() => void handlePaletteSaved()}
+            onEntriesChange={setSpriteWordCount}
+          />
+        )}
       </Modal>
 
-      {/* 模型情绪词表编辑弹窗（Live2D 模型卡入口）：词+释义+表情联动+默认情绪（与立绘集词表双轨对等） */}
+      {/* 模型状态词表编辑弹窗（Live2D 模型卡入口）：词+释义+表情联动+默认状态（与立绘集词表双轨对等） */}
       <Modal
         open={!!paletteEditing}
         onClose={() => setPaletteEditing(null)}
-        title={`情绪演出 · ${paletteEditing?.name ?? ''}`}
+        title={`状态演出 · ${paletteEditing?.name ?? ''}${paletteWordCount != null ? `（状态词 ${paletteWordCount}）` : ''}`}
         width={560}
         footer={
           <Button variant="ghost" onClick={() => setPaletteEditing(null)}>

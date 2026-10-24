@@ -29,11 +29,11 @@ export interface EventTypeDesc {
 export const EVENT_DESCRIPTORS: EventTypeDesc[] = [
   { type: 'narration', label: '旁白', fields: [{ key: 'text', label: '旁白文本', kind: 'text', required: true }] },
   { type: 'player', label: '玩家独白', fields: [{ key: 'text', label: '独白文本', kind: 'text', required: true }] },
-  { type: 'dialogue', label: '角色台词', fields: [{ key: 'text', label: '台词文本', kind: 'text', required: true }, { key: 'emotion', label: '情绪', kind: 'emotion' }] },
+  { type: 'dialogue', label: '角色台词', fields: [{ key: 'text', label: '台词文本', kind: 'text', required: true }, { key: 'emotion', label: '状态', kind: 'emotion' }] },
   { type: 'ai_dialogue', label: 'AI 自由演绎', fields: [{ key: 'prompt', label: '导演指令（这段演出的要求）', kind: 'text', required: true }] },
   { type: 'background', label: '切换背景', fields: [{ key: 'image', label: '背景图（下拉选择剧本内图片或背景库；也可手填）', kind: 'background', required: true }] },
   { type: 'music', label: '音乐', fields: [{ key: 'file', label: '音乐文件（下拉选择剧本内音频；也可手填，点工具栏「导入素材」添加）', kind: 'music' }, { key: 'loop', label: '循环播放', kind: 'boolean' }, { key: 'stop', label: '停止当前音乐', kind: 'boolean' }] },
-  { type: 'modify_character', label: '切换立绘情绪', fields: [{ key: 'emotion', label: '情绪', kind: 'emotion', required: true }] },
+  { type: 'modify_character', label: '切换立绘状态', fields: [{ key: 'emotion', label: '状态', kind: 'emotion', required: true }] },
   { type: 'set_var', label: '设置变量', fields: [{ key: 'name', label: '变量名', kind: 'string', required: true }, { key: 'value', label: '值', kind: 'string', required: true }], custom: true },
   { type: 'free_dialogue', label: '自由对话', fields: [{ key: 'maxRounds', label: '最大轮数', kind: 'number' }, { key: 'endHint', label: '结束语（旁白）', kind: 'text' }] },
   { type: 'choices', label: '选项', fields: [], custom: true },

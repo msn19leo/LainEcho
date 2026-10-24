@@ -16,7 +16,7 @@
  */
 import type { ChatMessage, MemoryCategory, StoryConsolidateResult } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { readApiKey } from '../crypto'
+import { resolveProfile } from '../apiProfiles'
 import { resolveEmbeddingConfig, syncMemoryVectors } from '../memory/memoryVectors'
 import {
   addPendingMemory,
@@ -141,9 +141,9 @@ export async function consolidateStoryMemory(runId: string, opts?: { manual?: bo
     const slice = run.messages.slice(cursor)
     if (slice.length === 0) return { ok: true, nothing: true }
 
-    // API Key 加密存取（与主对话/画像整理同源；缺失时提示但不阻塞演出）
-    const apiKey = await readApiKey()
-    if (!apiKey) return { ok: false, error: '未配置 API Key，无法沉淀记忆' }
+    // 主模型三元组走档案解析（档案制，与主对话/画像整理同源；缺失时提示但不阻塞演出）
+    const mainCfg = await resolveProfile('main')
+    if (!mainCfg) return { ok: false, error: '未配置主模型档案，无法沉淀记忆' }
     const card = await getCharacterCard(run.cardId)
     const cardName = card?.name?.trim() || '角色'
 
@@ -169,9 +169,9 @@ export async function consolidateStoryMemory(runId: string, opts?: { manual?: bo
         { role: 'user', content: `以下是这段经历的记录：\n${material}\n\n请整理记忆：` },
       ],
       {
-        model: settings.model,
-        baseURL: settings.baseURL,
-        apiKey,
+        model: mainCfg.model,
+        baseURL: mainCfg.baseURL,
+        apiKey: mainCfg.apiKey,
         temperature: 0.2,
         stream: false,
         maxTokensOverride: CONSOLIDATE_MAX_TOKENS,
@@ -182,7 +182,7 @@ export async function consolidateStoryMemory(runId: string, opts?: { manual?: bo
       // 模型无有效输出（JSON 解析失败/摘要过短/content 被思考预算占空）：游标不动，可重试
       console.log(
         '[story-memory] 沉淀无有效摘要 model=%s 素材 %d 字符，原始返回（前 300 字符）：%s',
-        settings.model,
+        mainCfg.model,
         material.length,
         (raw ?? '').trim().slice(0, 300),
       )

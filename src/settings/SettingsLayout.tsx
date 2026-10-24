@@ -54,9 +54,9 @@ interface ModuleDef {
 const MODULES: ModuleDef[] = [
   { id: 'general', title: '通用设置', desc: '一些不便归入其它模块的通用设置。', icon: SlidersHorizontal },
   { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Bot },
-  { id: 'model', title: '角色模型', desc: 'Live2D 模型导入与管理。', icon: PersonStanding },
+  { id: 'model', title: '角色模型', desc: 'Live2D 模型 / 2D 立绘导入与管理。', icon: PersonStanding },
   { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
-  { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。', icon: AudioLines },
+  { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。或者使用本地语音模型（Genie-TTS）。', icon: AudioLines },
   { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
   { id: 'proactive', title: '主动搭话', desc: '桌宠在长时间无交互后主动开口，可选先感知屏幕内容再搭话。', icon: MessagesSquare },
   { id: 'story', title: '剧情系统', desc: '剧本导入管理、galgame 式剧情演出（独立剧情窗）与多周目存档。', icon: BookOpen },

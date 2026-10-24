@@ -9,7 +9,7 @@
 import type { CharacterPersona, MemoryCategory, MemoryItem } from '../../../src/types'
 
 /**
- * 输出格式段模板（情绪演出指令）：约束 AI 输出结构化 JSON dialogue 数组（每项必带 emotion），
+ * 输出格式段模板（状态演出指令）：约束 AI 输出结构化 JSON dialogue 数组（每项必带 emotion），
  * 供解析驱动桌宠形象按节拍切换立绘。listBlock/exampleBlock 按角色词表填充。
  */
 function emotionTemplate(listBlock: string, exampleBlock: string): string {
@@ -43,9 +43,9 @@ ${exampleBlock}`
 }
 
 /**
- * 按角色情绪词表生成输出格式段（系统内唯一入口，palette 缺省 = 内置最小词表）。
+ * 按角色状态词表生成输出格式段（系统内唯一入口，palette 缺省 = 内置最小词表）。
  * 值域块与示例块都来自词表：每词附中文释义；示例取非默认词轮转填充、括号旁白行固定用默认词。
- * @param palette 角色绑定的情绪词表（缺省/未打标立绘集 = 内置最小词表，仅"平静"）
+ * @param palette 角色绑定的状态词表（缺省/未打标立绘集 = 内置最小词表，仅"平静"）
  */
 export function buildEmotionPrompt(palette?: { entries: Array<{ name: string; gloss: string }>; defaultEmotion: string } | null): string {
   const pal = palette && palette.entries.length > 0
@@ -57,10 +57,10 @@ export function buildEmotionPrompt(palette?: { entries: Array<{ name: string; gl
   for (let i = 0; i < items.length; i += 4) lines.push('  ' + items.slice(i, i + 4).join(' / '))
   const defEntry = pal.entries.find((e) => e.name === pal.defaultEmotion)
   const defLabel = defEntry ? pal.defaultEmotion : pal.entries[0]!.name
-  const listBlock = `- "emotion" 只能从本角色的情绪表中选取（共 ${pal.entries.length} 个）：
+  const listBlock = `- "emotion" 是演出状态词，只能从本角色的状态表中选取（共 ${pal.entries.length} 个）：可能是情绪（开心/害羞），也可能是姿态/行为（解释/警告/沉思）——按台词内容选最贴切的一个：
 ${lines.join('\n')}
   匹配不到时：使用 ${defLabel}${defEntry?.gloss.trim() ? `(${defEntry.gloss.trim()})` : ''}。`
-  // 示例情绪值替换：优先取 3 个非默认词（不足时循环复用），括号旁白行固定用默认词
+  // 示例状态值替换：优先取 3 个非默认词（不足时循环复用），括号旁白行固定用默认词
   const others = pal.entries.map((e) => e.name).filter((n) => n !== defLabel)
   const pick = (i: number) => (others.length > 0 ? others[i % others.length]! : defLabel)
   const exampleBlock = `示例（你唯一允许的输出形态，前后无任何多余字符）：
@@ -254,7 +254,7 @@ export const PROACTIVE_HINT_PROMPT = `（你可以主动发起话题，不需要
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入，金样输出不变）
  * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：用 DIALOGUE_ONLY_PROMPT
  *   替换 NARRATION_PROMPT 注入。缺省 false，金样输出不变。
- * @param emotionPalette 角色绑定的情绪词表（缺省/null = 未启用词表，输出格式段维持金样原文）
+ * @param emotionPalette 角色绑定的状态词表（缺省/null = 未启用词表，输出格式段维持金样原文）
  */
 export function buildSystemParts(
   card: { name?: string; persona?: Partial<CharacterPersona> | null; messageExample?: string } | null,

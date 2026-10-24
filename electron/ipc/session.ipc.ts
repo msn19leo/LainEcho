@@ -12,13 +12,19 @@ export function registerSessionIpc(): void {
 
   ipcMain.handle('session:get', (_e, id: string): Promise<SessionDetail> => getSession(id))
 
-  /** 读取最近活跃会话的情景摘要缓存（设置窗查看/编辑；与主动搭话投放目标同口径=listSessions 首个） */
+  /**
+   * 读取会话的情景摘要缓存（设置窗查看/编辑）：
+   * 优先聊天窗当前选中的会话（windowManager.currentSessionId，切会话后编辑块立即跟随——
+   * 切到未聊过的会话 = 空缓存，观感即"切换后清空"）；尚未上报时回落最近活跃会话（listSessions 首个）。
+   */
   ipcMain.handle('session:scene-digest-get', async () => {
     const index = await listSessions()
-    const latest = index[0]
-    if (!latest) return null
-    const detail = await getSession(latest.id)
-    return { sessionId: latest.id, title: latest.title, digest: detail.sceneDigest ?? '' }
+    if (index.length === 0) return null
+    const currentId = windowManager.getCurrentSessionId()
+    const target = (currentId ? index.find((s) => s.id === currentId) : undefined) ?? index[0]
+    if (!target) return null
+    const detail = await getSession(target.id)
+    return { sessionId: target.id, title: target.title, digest: detail.sceneDigest ?? '' }
   })
 
   /** 保存指定会话的情景摘要缓存（设置窗手动编辑；空串=清空缓存） */

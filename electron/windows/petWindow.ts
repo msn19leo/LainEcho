@@ -63,7 +63,22 @@ export function createPetWindow(): BrowserWindow {
     const [w, h] = win.getSize()
     if (w !== PET_WIDTH || h !== currentPetHeight) {
       win.setSize(PET_WIDTH, currentPetHeight)
+      // 这次尺寸回正是拖动过程中唯一由我们发起的第二次窗口写入：它会把窗口插回普通层，
+      // 置顶属性随之被清掉（表现为桌宠被其它窗口盖住、且点不到、无法自愈）。写完立刻补回置顶。
+      win.setAlwaysOnTop(true)
     }
+  })
+
+  // 兜底：原生拖动（app-region: drag）由系统移动窗口，松手时可能重排 z-order。
+  // 拖动静止 200ms 后重新写一次置顶，保证松手后回到置顶带最前（不抢焦点）。
+  let moveTimer: ReturnType<typeof setTimeout> | null = null
+  win.on('move', () => {
+    if (moveTimer) clearTimeout(moveTimer)
+    moveTimer = setTimeout(() => {
+      moveTimer = null
+      if (win.isDestroyed()) return
+      win.setAlwaysOnTop(true)
+    }, 200)
   })
 
   // 透明窗口首次绘制完成后再显示，避免白屏闪烁
@@ -106,6 +121,10 @@ export function createPetWindow(): BrowserWindow {
   win.on('hide', stopCursorTracking)
   win.on('closed', () => {
     stopCursorTracking()
+    if (moveTimer) {
+      clearTimeout(moveTimer)
+      moveTimer = null
+    }
     if (petWin === win) petWin = null
   })
 

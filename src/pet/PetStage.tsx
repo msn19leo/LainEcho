@@ -33,7 +33,7 @@ export interface PetStageHandle {
   getPlayProgress: () => number
   /** 停止播放语音并清零口型参数 */
   stopSpeak: () => void
-  /** 按句更新当前情绪（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动；词表方案下为自由情绪词） */
+  /** 按句更新当前状态（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动；词表方案下为自由状态词） */
   setEmotion: (emotion: string) => void
   /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后调用） */
   resize: () => void
@@ -45,6 +45,73 @@ interface PetStageProps {
 }
 
 const IDLE_MS = 10_000
+
+// ===== 立绘 alpha 归一化（修复"横向姿态立绘显小"）=====
+// 立绘渲染按整张 PNG 画布 object-contain 拟合：眺望等横向延展姿态的画布更宽，contain 受宽度
+// 约束整图等比缩小 → 角色显小（2026-10-22 截图实锤）。改为按"非透明内容包围盒"拟合：首显时
+// 解码扫描 alpha 边界（降采样 ≤512 扫描，误差亚像素级，按 URL 缓存一次），渲染按内容框等比
+// 缩放，透明边不参与缩放——所有状态的角色本体尺寸一致。
+type SpriteBBox = { w: number; h: number; x: number; y: number; bw: number; bh: number }
+const spriteBBoxCache = new Map<string, Promise<SpriteBBox | null>>()
+
+function loadSpriteBBox(url: string): Promise<SpriteBBox | null> {
+  const hit = spriteBBoxCache.get(url)
+  if (hit) return hit
+  const p = (async (): Promise<SpriteBBox | null> => {
+    try {
+      // fetch → blob → createImageBitmap：blob 解码不污染 canvas（pet-res:// 直绘 img 会 taint，
+      // getImageData 直接抛 SecurityError）；PetStage 既有路径已验证 pet-res 可 fetch
+      const blob = await (await fetch(url)).blob()
+      const bmp = await createImageBitmap(blob)
+      try {
+        const maxSide = 512
+        const k = Math.min(1, maxSide / Math.max(bmp.width, bmp.height))
+        const sw = Math.max(1, Math.round(bmp.width * k))
+        const sh = Math.max(1, Math.round(bmp.height * k))
+        const canvas = document.createElement('canvas')
+        canvas.width = sw
+        canvas.height = sh
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+        if (!ctx) return null
+        ctx.drawImage(bmp, 0, 0, sw, sh)
+        const data = ctx.getImageData(0, 0, sw, sh).data
+        let minX = sw
+        let minY = sh
+        let maxX = -1
+        let maxY = -1
+        for (let y = 0; y < sh; y++) {
+          for (let x = 0; x < sw; x++) {
+            // alpha 阈值 8：忽略近全透明杂边（抗锯齿羽化边不参与包围盒）
+            if ((data[(y * sw + x) * 4 + 3] ?? 0) > 8) {
+              if (x < minX) minX = x
+              if (x > maxX) maxX = x
+              if (y < minY) minY = y
+              if (y > maxY) maxY = y
+            }
+          }
+        }
+        if (maxX < 0) return null // 全透明（异常图）→ 回退整画布拟合
+        const inv = 1 / k
+        const box: SpriteBBox = {
+          w: bmp.width,
+          h: bmp.height,
+          x: Math.floor(minX * inv),
+          y: Math.floor(minY * inv),
+          bw: Math.ceil((maxX - minX + 1) * inv),
+          bh: Math.ceil((maxY - minY + 1) * inv),
+        }
+        console.log('[pet] 立绘 alpha 包围盒：%s 画布=%dx%d 内容=(%d,%d) %dx%d', url.slice(-40), box.w, box.h, box.x, box.y, box.bw, box.bh)
+        return box
+      } finally {
+        bmp.close()
+      }
+    } catch {
+      return null // 解码失败 → 渲染端回退整画布 contain（旧行为）
+    }
+  })()
+  spriteBBoxCache.set(url, p)
+  return p
+}
 
 export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -64,17 +131,22 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const [mode, setMode] = useState<RenderMode>('live2d')
   /** 立绘模式下当前展示的立绘（null = 不显示） */
   const [sprite, setSprite] = useState<{ url: string; name: string } | null>(null)
+  /** 立绘 alpha 包围盒解析态（按 url）：ready=按内容框拟合；pending=暂不渲染防尺寸跳变；error=回退整画布拟合 */
+  const [spriteBBoxState, setSpriteBBoxState] = useState<{ url: string; status: 'pending' | 'ready' | 'error'; box: SpriteBBox | null } | null>(null)
+  /** 立绘展示层容器元素 + 内容盒实测尺寸（内容框拟合的可用空间，窗口/聊天区变化时跟随） */
+  const [spriteLayerEl, setSpriteLayerEl] = useState<HTMLDivElement | null>(null)
+  const [spriteLayerSize, setSpriteLayerSize] = useState<{ w: number; h: number } | null>(null)
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
   const currentScaleRef = useRef(1)
   /** 当前渲染模式引用（供 effect 闭包读取最新值，避免依赖数组重跑） */
   const modeRef = useRef<RenderMode>('live2d')
   /** 角色卡显式设定的形象模式（null = 跟随全局当前形象），由 onCardChanged 维护 */
   const cardModeRef = useRef<RenderMode | null>(null)
-  /** 当前情绪词（词表方案下为自由词，由 AI 回复情绪联动更新） */
+  /** 当前状态词（词表方案下为自由词，由 AI 回复状态联动更新） */
   const currentEmotionRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
-  /** 当前立绘集词表的默认情绪词（空闲/重置态的默认展示跟随它；resolveSprite 时刷新） */
+  /** 当前立绘集词表的默认状态词（空闲/重置态的默认展示跟随它；resolveSprite 时刷新） */
   const paletteDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
-  /** 上次已执行默认态迁移的默认情绪词（迁移基准）：仅当词表默认词相对它变化且空闲时才迁移。
+  /** 上次已执行默认态迁移的默认状态词（迁移基准）：仅当词表默认词相对它变化且空闲时才迁移。
    *  不能用 paletteDefaultRef 当基准——refreshPalette 会先把它刷成新值，把"值变化"提前消费掉 */
   const migratedDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
   /** 当前生效演出词表快照（演出词表双轨，模式分轨）：sprite 模式 = 立绘集词表（查图）；
@@ -84,7 +156,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const spriteIdRef = useRef<string | null>(null)
   /** 全局当前立绘集 id（modelSettings.selectedSpriteId，角色卡未绑定立绘时回退用） */
   const selectedSpriteIdRef = useRef<string | null>(null)
-  /** 桌面立绘展示状态：idle(情绪态) / speaking(说话) / thinking(思考) */
+  /** 桌面立绘展示状态：idle(状态词展示) / speaking(说话) / thinking(思考) */
   const displayStateRef = useRef<'idle' | 'speaking' | 'thinking'>('idle')
   /** 上一帧说话状态（检测翻转以触发说话立绘切换） */
   const lastSpeakingRef = useRef(false)
@@ -100,6 +172,34 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const live2dAttemptRef = useRef(false)
   /** 模型设置是否已就绪（首次 get() 返回后置 true；就绪前不做兜底加载） */
   const settingsLoadedRef = useRef(false)
+
+  // 立绘 url 变化 → 解析 alpha 包围盒（模块级缓存，同 url 只扫一次；pending 态渲染层暂留空防尺寸跳变）
+  useEffect(() => {
+    if (!sprite) {
+      setSpriteBBoxState(null)
+      return
+    }
+    const url = sprite.url
+    let alive = true
+    setSpriteBBoxState({ url, status: 'pending', box: null })
+    void loadSpriteBBox(url).then((box) => {
+      if (alive && sprite.url === url) setSpriteBBoxState({ url, status: box ? 'ready' : 'error', box })
+    })
+    return () => {
+      alive = false
+    }
+  }, [sprite])
+
+  // 立绘展示层容器尺寸观测（窗口缩放/聊天区展开变化时重算内容框拟合）
+  useEffect(() => {
+    if (!spriteLayerEl) return
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect
+      if (r && r.width > 0 && r.height > 0) setSpriteLayerSize({ w: r.width, h: r.height })
+    })
+    ro.observe(spriteLayerEl)
+    return () => ro.disconnect()
+  }, [spriteLayerEl])
 
   /** 解析当前立绘模式实际使用的立绘集 id：角色卡绑定优先，否则全局当前立绘集 */
   function getEffectiveSpriteId(): string | null {
@@ -159,7 +259,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     stopSpeak: () => {
       lipSyncRef.current.stop()
     },
-    /** 按句更新情绪：写 emotion 并重应用立绘/表情 */
+    /** 按句更新状态：写 emotion 并重应用立绘/表情 */
     setEmotion: (emotion: string) => {
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
@@ -248,12 +348,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
   /**
    * 立绘模式：解析当前应显示的立绘图并设置 to sprite state。
-   * 规则（词表方案单链）：情绪查表 = 词表命中→软链→默认图；未打标集 = 内置最小词表（解析落首图）。
-   * 说话图为系统演出态：仅在情绪解析图等于默认图时让位。
+   * 规则（词表方案单链）：状态查表 = 词表命中→软链→默认图；未打标集 = 内置最小词表（解析落首图）。
+   * 说话图为系统演出态：仅在状态解析图等于默认图时让位。
    * 失败不再静默：打 warn 日志 + 显示 spriteNotice，短暂等待后自动重试一次（连续失败有上限）。
    * @param gen 本次解析的代数（applySprite 递增；过期代数的所有状态写入被丢弃）
    * @param spriteId 绑定的立绘集 id
-   * @param emotion 当前情绪词（默认"平静"）
+   * @param emotion 当前状态词（默认"平静"）
    */
   async function resolveSprite(
     gen: number,
@@ -275,13 +375,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         throw new Error(`立绘集不存在或没有图片（id=${spriteId}）`)
       }
       const has = (f: string | null | undefined) => !!f && spr.images.some((i) => i.filePath === f)
-      // 词表默认情绪词刷新 + 默认态跟随迁移（值变化触发，2026-10-18 回归修复）：
+      // 词表默认状态词刷新 + 默认态跟随迁移（值变化触发，2026-10-18 回归修复）：
       // 仅当词表默认词相对"上次已迁移基准"变化且当前空闲（variant=idle）才迁移——
-      // 保留"改默认情绪 → 空闲立绘立即跟随"的目标（说话/思考变体期间不迁移，变体结束后
+      // 保留"改默认状态 → 空闲立绘立即跟随"的目标（说话/思考变体期间不迁移，变体结束后
       // 下一次 idle 解析自然跟随）。
       // 【回归教训】早先的"空闲态无条件跟随新默认词"（2026-10-17 方案1）把"迁移"写成了
       // "每次 idle 解析都重置"：轮内任何回 idle 的瞬间（语音段间隙 lipSync end、块边界
-      // setEmotion 恰逢 idle）都把 AI 轮内情绪抹平为默认词——实锤"立绘切为委屈后，后面
+      // setEmotion 恰逢 idle）都把 AI 轮内状态抹平为默认词——实锤"立绘切为委屈后，后面
       // 开心/害羞全部丢失、语音期间全程说话图"（平静让位说话图规则被重置误触发）。
       // 正确语义=默认词值变化事件触发迁移，而非 idle 状态触发重置。
       const newDefault = paletteFromSprite(spr).defaultEmotion
@@ -291,12 +391,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         emotion = newDefault // 查表同步用迁移后的词（emotion 参数来自调用方的 currentEmotionRef 快照）
       }
       paletteDefaultRef.current = newDefault
-      // 情绪查表（词表单链）：命中词条图 → 未命中落默认情绪图；未打标集（内置最小词表）= 首图
+      // 状态查表（词表单链）：命中词条图 → 未命中落默认状态图；未打标集（内置最小词表）= 首图
       const emotionFile = resolvePaletteImage(spr, emotion)
-      // 说话图使用条件（用户定案）：正在说话且情绪=「平静」——平静是唯一让位给说话图的情绪；
-      // 默认情绪可设为其它词（如害羞），说话时显示害羞图而非说话图
+      // 说话图使用条件（用户定案）：正在说话且状态=「平静」——平静是唯一让位给说话图的状态；
+      // 默认状态可设为其它词（如害羞），说话时显示害羞图而非说话图
       const calmFile = resolvePaletteImage(spr, BUILTIN_DEFAULT_EMOTION)
-      // 变体立绘优先：思考 > 说话 > 情绪查表图
+      // 变体立绘优先：思考 > 说话 > 状态查表图
       let file: string | null = null
       if (variant === 'thinking' && has(spr.thinkingImage)) {
         file = spr.thinkingImage
@@ -328,7 +428,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     }
   }
 
-  /** 立绘模式统一重新解析当前立绘（依据当前情绪 + 说话/思考状态） */
+  /** 立绘模式统一重新解析当前立绘（依据当前状态 + 说话/思考状态） */
   function applySprite() {
     if (modeRef.current !== 'sprite') return
     spriteGenRef.current++
@@ -342,11 +442,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
   /**
    * 获取当前生效的表情名。优先级从高到低：
-   *   情绪词表联动（当前情绪词命中词表条目且配了 expression，且模型存在该表情）→ 全局设置。
+   *   状态词表联动（当前状态词命中词表条目且配了 expression，且模型存在该表情）→ 全局设置。
    * 返回空串表示不应用表情。
    */
   function getEffectiveExpression(): string {
-    // P2b 情绪表情联动：AI 输出的情绪词（主进程已归一化到词表词）→ 词表条目.expression
+    // P2b 状态表情联动：AI 输出的状态词（主进程已归一化到词表词）→ 词表条目.expression
     const entry = paletteEntriesRef.current.find((e) => e.name === currentEmotionRef.current)
     const emotionExpr = entry?.expression?.trim()
     if (emotionExpr && expressionListRef.current.some((e) => e.name === emotionExpr)) {
@@ -390,7 +490,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
    * 根据当前设置（expressionEnabled + 生效表情名）和已加载的表情列表，
    * 更新 currentExpressionParamsRef。每帧由 ticker 读取并应用到 coreModel。
    * 参考 airi 的 expression-controller.ts：不使用 SDK 的 Expression Manager，直接管理参数。
-   * P2b：表情名由 getEffectiveExpression 决定——情绪词表联动优先，回落全局静态表情。
+   * P2b：表情名由 getEffectiveExpression 决定——状态词表联动优先，回落全局静态表情。
    */
   function updateCurrentExpression() {
     const anim = settingsRef.current.animation
@@ -406,7 +506,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   /**
    * 刷新当前生效演出词表快照（演出词表双轨，模式分轨——与主进程 chatTurn 同口径）：
    * sprite 模式 → 立绘集词表（getEffectiveSpriteId）；live2d 模式 → Live2D 模型词表（角色卡绑定 > 全局选中）。
-   * 默认情绪词一并刷新（空闲/重置态跟随当前模式词表）；词表为空 = 内置最小词表（仅"平静"）。
+   * 默认状态词一并刷新（空闲/重置态跟随当前模式词表）；词表为空 = 内置最小词表（仅"平静"）。
    */
   async function refreshPalette() {
     try {
@@ -787,7 +887,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (cardId) {
         useCharacterStore.setState({ currentCardId: cardId })
       }
-      // 记录形象呈现相关配置（立绘/渲染模式）；情绪演出由立绘集词表驱动（resolveSprite 内查表）
+      // 记录形象呈现相关配置（立绘/渲染模式）；状态演出由立绘集词表驱动（resolveSprite 内查表）
       spriteIdRef.current = spriteId ?? null
       // 角色卡显式设定的形象模式（null = 跟随全局当前形象）
       cardModeRef.current = renderMode ?? null
@@ -874,11 +974,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applySettings(settings)
     })
 
-    // 订阅 AI 回复情绪：立绘切图 / Live2D 切表情（情绪联动核心；词表方案下为自由情绪词）
+    // 订阅 AI 回复状态：立绘切图 / Live2D 切表情（状态联动核心；词表方案下为自由状态词）
     unsubEmotion = api.pet.onEmotion((emotion: string) => {
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
-        // 回复完成：退出思考态，回到情绪/空闲态
+        // 回复完成：退出思考态，回到状态/空闲态
         displayStateRef.current = 'idle'
         applySprite()
       } else {
@@ -891,7 +991,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       console.log('[thinking] pet onThinking=%s mode=%s', thinking, modeRef.current)
       if (modeRef.current !== 'sprite') return
       if (thinking) {
-        // 新一轮输入：情绪归到词表默认词（用户切换默认情绪后重置态跟随变化）
+        // 新一轮输入：状态归到词表默认词（用户切换默认状态后重置态跟随变化）
         currentEmotionRef.current = paletteDefaultRef.current
         displayStateRef.current = 'thinking'
       } else if (displayStateRef.current === 'thinking') {
@@ -951,36 +1051,80 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         </div>
       )}
 
-      {/* 2D 立绘展示层：仅立绘模式显示，覆盖在 Live2D 画布上方（避免切换后与 Live2D 并存） */}
+      {/* 2D 立绘展示层：仅立绘模式显示，覆盖在 Live2D 画布上方（避免切换后与 Live2D 并存）。
+          内容框拟合：按 alpha 包围盒等比缩放（眺望等横向姿态不再因画布更宽而显小）；
+          包围盒解析中不渲染（防整画布尺寸闪现后跳变）；解析失败回退整画布 contain（旧行为） */}
       {mode === 'sprite' && sprite && (
         <motion.div
+          ref={setSpriteLayerEl}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 0.25 }}
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-4"
         >
-          <img
-            src={sprite.url}
-            alt={sprite.name}
-            draggable={false}
-            className="max-h-full max-w-full select-none object-contain"
-            style={{
-              transform: `translate(${settingsRef.current.spriteView.x}px, ${settingsRef.current.spriteView.y}px) scale(${settingsRef.current.spriteView.scale})`,
-            }}
-            onError={() => {
-              if (!sprite) return
-              const url = sprite.url
-              const last = spriteImgRetryAtRef.current[url] ?? 0
-              if (Date.now() - last < 30_000) {
-                console.warn('[pet] 立绘图片加载失败（30 秒内已重试过，等待自动重试）:', url)
-                setSpriteNotice('2D 立绘图片暂时无法加载，将自动重试')
-                return
-              }
-              spriteImgRetryAtRef.current[url] = Date.now()
-              console.warn('[pet] 立绘图片加载失败，重新解析一次:', url)
-              applySprite()
-            }}
-          />
+          {(() => {
+            const view = `translate(${settingsRef.current.spriteView.x}px, ${settingsRef.current.spriteView.y}px) scale(${settingsRef.current.spriteView.scale})`
+            const imgProps = {
+              src: sprite.url,
+              alt: sprite.name,
+              draggable: false,
+              onError: () => {
+                if (!sprite) return
+                const url = sprite.url
+                const last = spriteImgRetryAtRef.current[url] ?? 0
+                if (Date.now() - last < 30_000) {
+                  console.warn('[pet] 立绘图片加载失败（30 秒内已重试过，等待自动重试）:', url)
+                  setSpriteNotice('2D 立绘图片暂时无法加载，将自动重试')
+                  return
+                }
+                spriteImgRetryAtRef.current[url] = Date.now()
+                console.warn('[pet] 立绘图片加载失败，重新解析一次:', url)
+                applySprite()
+              },
+            }
+            const bb =
+              spriteBBoxState && spriteBBoxState.url === sprite.url ? spriteBBoxState : null
+            if (bb && bb.status === 'ready' && bb.box && spriteLayerSize) {
+              // 内容高度撑满 + 绝对定位强制居中：角色本体跨状态等大；宽姿态（眺望等）水平溢出
+              // 由窗口左右对称裁掉（两臂各裁一点）。flex 居中对超宽子元素的溢出方向不可靠
+              //（实锤单侧裁切），改用 left/top 50% + translate(-50%,-50%) 保证对称溢出
+              const box = bb.box
+              const s = spriteLayerSize.h / box.bh
+              return (
+                <div
+                  className="absolute"
+                  style={{ left: '50%', top: '50%', width: box.bw * s, height: box.bh * s, transform: 'translate(-50%, -50%)' }}
+                >
+                  <div className="relative h-full w-full" style={{ transform: view }}>
+                    <img
+                      {...imgProps}
+                      className="select-none"
+                      style={{
+                        position: 'absolute',
+                        left: -box.x * s,
+                        top: -box.y * s,
+                        width: box.w * s,
+                        height: box.h * s,
+                        maxWidth: 'none',
+                        maxHeight: 'none',
+                      }}
+                    />
+                  </div>
+                </div>
+              )
+            }
+            if (bb && bb.status === 'pending') {
+              return null // 包围盒解析中：先不渲染，防"整画布尺寸 → 内容尺寸"跳变
+            }
+            // 解析失败（异常图/解码失败）→ 回退整画布 contain（旧行为）
+            return (
+              <img
+                {...imgProps}
+                className="max-h-full max-w-full select-none object-contain"
+                style={{ transform: view }}
+              />
+            )
+          })()}
         </motion.div>
       )}
 

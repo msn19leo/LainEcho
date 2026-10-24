@@ -97,7 +97,7 @@ export function StoryPanel() {
   // ---- AI 辅助写剧本（草稿可编辑，校验通过后手动导入） ----
   const [premise, setPremise] = useState('')
   const [draftCardId, setDraftCardId] = useState('')
-  /** 情绪词表来源（AI 写剧本的 emotion 值域；空 = 跟随参考角色卡绑定，再退内置最小词表） */
+  /** 状态词表来源（AI 写剧本的 emotion 值域；空 = 跟随参考角色卡绑定，再退内置最小词表） */
   const [draftSpriteSetId, setDraftSpriteSetId] = useState('')
   const [draft, setDraft] = useState('')
   const [draftErrors, setDraftErrors] = useState<Array<{ file: string; message: string }>>([])
@@ -327,7 +327,7 @@ export function StoryPanel() {
     setMusicProgress((p) => ({ ...p, cur: v }))
   }
 
-  /** AI 生成剧本草稿（产物仅回显编辑，不直接入库）；情绪词表按所选立绘集（缺省跟随参考角色卡绑定） */
+  /** AI 生成剧本草稿（产物仅回显编辑，不直接入库）；状态词表按所选立绘集（缺省跟随参考角色卡绑定） */
   const handleGenerateDraft = async () => {
     if (!premise.trim() || generating) return
     setGenerating(true)
@@ -636,7 +636,7 @@ export function StoryPanel() {
             />
           </label>
           <label className="flex items-center gap-3">
-            <span className="shrink-0 text-xs text-text-muted">情绪词表来源（emotion 值域）</span>
+            <span className="shrink-0 text-xs text-text-muted">状态词表来源（emotion 值域）</span>
             <SelectMenu
               value={draftSpriteSetId}
               onChange={setDraftSpriteSetId}
@@ -727,7 +727,7 @@ export function StoryPanel() {
               options={(sprites ?? []).map((s) => ({ value: s.id, label: s.name }))}
               className="w-full"
             />
-            {/* 开演前一致性提示（P1，不阻塞）：剧本创作词表与本次演出词表不同 → 事件情绪可能降级 */}
+            {/* 开演前一致性提示（P1，不阻塞）：剧本创作词表与本次演出词表不同 → 事件状态词可能降级 */}
             {(() => {
               const script = scripts?.find((s) => s.id === scriptId)
               if (!script?.spriteSetId || !spriteId || script.spriteSetId === spriteId) return null
@@ -735,7 +735,7 @@ export function StoryPanel() {
               const perfName = sprites?.find((s) => s.id === spriteId)?.name ?? spriteId
               return (
                 <span className="mt-1.5 block rounded-[var(--radius-md)] border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-amber-500">
-                  剧本按「{boundName}」的词表创作，本次演出用「{perfName}」——事件中不在演出词表内的情绪将降级为默认图。仍可演出（换皮重演属合法玩法）。
+                  剧本按「{boundName}」的词表创作，本次演出用「{perfName}」——事件中不在演出词表内的状态词将降级为默认图。仍可演出（换皮重演属合法玩法）。
                 </span>
               )
             })()}

@@ -1,51 +1,52 @@
 /**
- * 设置 IPC：API 配置（含 safeStorage 加密的 Key）+ 数据目录管理。
+ * 设置 IPC：API 服务商档案（全局档案库 CRUD，Key 走 safeStorage 加密）+ 数据目录管理。
+ * Key 明文只在主进程内存中出现；settings:get 仅按档案回传 hasKey 布尔值供掩码回显。
  */
 import { ipcMain, dialog } from 'electron'
 import type { AppSettings } from '../../src/types'
-import { hasApiKey, saveApiKey, hasSecret, saveSecret } from '../services/crypto'
+import { deleteProfile, hasProfileKey, listProfileModels, upsertProfile } from '../services/apiProfiles'
 import { getSettings, saveSettings } from '../services/repository'
-import { getDataDirInfo, migrateDataDir, resetDataDir, paths } from '../services/storage'
+import { getDataDirInfo, migrateDataDir, resetDataDir } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
+/** 读取设置并给每个档案附加传输态 hasKey（掩码回显用，不返回明文） */
+async function getSettingsWithProfileKeyState(): Promise<AppSettings> {
+  const settings = await getSettings()
+  const profiles = await Promise.all(
+    (settings.profiles ?? []).map(async (p) => ({ ...p, hasKey: await hasProfileKey(p.id) })),
+  )
+  return { ...settings, profiles }
+}
+
 export function registerSettingsIpc(): void {
-  ipcMain.handle('settings:get', async () => {
-    const settings = await getSettings()
-    const keyPresent = await hasApiKey()
-    const embeddingKeyPresent = await hasSecret(paths.embeddingApiKeyFile)
-    const visionKeyPresent = await hasSecret(paths.visionApiKeyFile)
-    const translationKeyPresent = await hasSecret(paths.translationApiKeyFile)
-    return { ...settings, hasApiKey: keyPresent, hasEmbeddingApiKey: embeddingKeyPresent, hasVisionApiKey: visionKeyPresent, hasTranslationApiKey: translationKeyPresent }
-  })
+  ipcMain.handle('settings:get', () => getSettingsWithProfileKeyState())
 
   ipcMain.handle('settings:save', async (_e, patch: Partial<AppSettings>) => {
-    const result = await saveSettings(patch)
-    // 设置变更广播给桌宠窗：同步「模型上下文窗口」等展示字段（如 token 用量显示里的窗口值）
+    await saveSettings(patch)
+    // 广播携带档案 Key 状态（hasKey），设置窗切换激活档案后掩码回显不丢；
+    // 设置变更同步给桌宠窗：「模型上下文窗口」等展示字段（如 token 用量显示里的窗口值）
+    const result = await getSettingsWithProfileKeyState()
     windowManager.broadcastAI('settings:changed', result)
     return result
   })
 
-  ipcMain.handle('settings:save-api-key', (_e, key: string) => saveApiKey(key))
+  /** 新建/更新服务商档案（upsert；key 非空时保存该档案的 API Key），变更后广播同步各窗口 */
+  ipcMain.handle('settings:save-profile', async (_e, input: { id?: string; name: string; baseURL: string; model: string; key?: string }) => {
+    const profile = await upsertProfile(input)
+    windowManager.broadcastAI('settings:changed', await getSettingsWithProfileKeyState())
+    return profile
+  })
 
-  ipcMain.handle('settings:has-api-key', () => hasApiKey())
+  /** 删除服务商档案（被引用时抛错由渲染端 toast 展示），变更后广播同步各窗口 */
+  ipcMain.handle('settings:delete-profile', async (_e, id: string) => {
+    await deleteProfile(id)
+    windowManager.broadcastAI('settings:changed', await getSettingsWithProfileKeyState())
+  })
 
-  /** 保存嵌入服务独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
-  ipcMain.handle('settings:save-embedding-api-key', (_e, key: string) => saveSecret(paths.embeddingApiKeyFile, key))
-
-  /** 嵌入服务 Key 是否已配置（仅回显掩码用，不返回明文） */
-  ipcMain.handle('settings:has-embedding-api-key', () => hasSecret(paths.embeddingApiKeyFile))
-
-  /** 保存屏幕感知视觉模型独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
-  ipcMain.handle('settings:save-vision-api-key', (_e, key: string) => saveSecret(paths.visionApiKeyFile, key))
-
-  /** 视觉模型 Key 是否已配置（仅回显掩码用，不返回明文） */
-  ipcMain.handle('settings:has-vision-api-key', () => hasSecret(paths.visionApiKeyFile))
-
-  /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密；为空时运行时回落主 LLM Key） */
-  ipcMain.handle('settings:save-translation-api-key', (_e, key: string) => saveSecret(paths.translationApiKeyFile, key))
-
-  /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用，不返回明文） */
-  ipcMain.handle('settings:has-translation-api-key', () => hasSecret(paths.translationApiKeyFile))
+  /** 拉取档案服务商的可用模型列表（OpenAI 兼容 /models）；Key 明文不出主进程 */
+  ipcMain.handle('settings:list-models', (_e, input: { profileId?: string; baseURL?: string; key?: string }) =>
+    listProfileModels(input ?? {}),
+  )
 
   /** 获取当前数据目录信息 */
   ipcMain.handle('settings:get-data-dir', () => {

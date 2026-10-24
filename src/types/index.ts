@@ -5,18 +5,18 @@
 
 export type ChatRole = 'system' | 'user' | 'assistant'
 
-/** 句子级情绪段：从某一句起切换到该情绪（炉语联动用） */
+/** 句子级状态段：从某一句起切换到该状态（炉语联动用） */
 export interface EmotionSegment {
   /** 起始消息内句子索引（0 基，来自 splitSentences） */
   startSentence: number
-  /** 情绪词：词表方案的自由词（如"傲娇"），历史数据可能是旧 6 枚举 */
+  /** 状态词：词表方案的自由词（如"傲娇"），历史数据可能是旧 6 枚举 */
   emotion: string
 }
 
 /** 语音合成分段：一次回复的一个"对话段"（JSON dialogue 一项），整段一次合成，段内不再按标点切碎 */
 export interface DialogueChunk {
   text: string
-  /** 情绪词：词表方案的自由词，历史数据可能是旧 6 枚举 */
+  /** 状态词：词表方案的自由词，历史数据可能是旧 6 枚举 */
   emotion: string
   /**
    * 段落类型（多气泡渲染与语音门控用，缺省 = 按文本是否被（）包裹推断）：
@@ -58,6 +58,8 @@ export interface ChatMessageMeta {
    * 引擎校验其在背景清单内后走现有 background 事件通道。
    */
   storyBackground?: string
+  /** 用户主动点「停止」取消本轮（主进程落盘 + stream-error 广播携带）；「未收到回复」提示据此豁免 */
+  cancelled?: boolean
 }
 
 export interface ChatMessage {
@@ -72,13 +74,13 @@ export interface ChatMessage {
    */
   error?: string
   /**
-   * AI 回复的结构化情绪标签（仅 assistant 消息；缺省 = 未解析/默认情绪）。
-   * 词表方案下为自由情绪词（命中绑定立绘集的词表），历史数据为旧 6 枚举。
+   * AI 回复的结构化状态标签（仅 assistant 消息；缺省 = 未解析/默认状态）。
+   * 词表方案下为自由状态词（命中绑定立绘集的词表），历史数据为旧 6 枚举。
    */
   emotion?: string
   /** 按标点切分的句子序列（语音/朗读句级同步与高亮共用，仅 assistant 消息） */
   sentences?: string[]
-  /** 句子级情绪切换点（内嵌 {@emo:xxx} 解析所得，仅 assistant 消息） */
+  /** 句子级状态切换点（内嵌 {@emo:xxx} 解析所得，仅 assistant 消息） */
   emotionSegments?: EmotionSegment[]
   /** 语音合成分段（JSON dialogue 逐项，段级合成与切换立绘用，仅 assistant 消息） */
   chunks?: DialogueChunk[]
@@ -204,11 +206,13 @@ export interface CharacterCard {
   voiceMode: CharacterVoiceMode
   /** 角色级 Genie-TTS 覆盖（voiceMode='genie' 时；null = 跟随全局 Genie 配置） */
   genieOverride: CharacterGenieOverride | null
+  /** 角色 TTS 语速倍率（0.75–1.5，null/1 = 原速）：主进程合成后对音频重采样变速，两引擎通用 */
+  ttsSpeed: number | null
 
   // --- 形象呈现（2D 立绘 / Live2D 并行切换）---
   /** 形象渲染模式：'live2d'（默认）| 'sprite'（2D 静态立绘） */
   renderMode: RenderMode | null
-  /** 绑定的立绘集 id（null = 未绑定；renderMode='sprite' 时生效；情绪演出由立绘集词表驱动） */
+  /** 绑定的立绘集 id（null = 未绑定；renderMode='sprite' 时生效；状态演出由立绘集词表驱动） */
   spriteId: string | null
 
   /** 角色级配置覆盖（null = 跟随全局）--- */
@@ -221,7 +225,7 @@ export interface CharacterCard {
   updatedAt: number
 }
 
-/** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式（情绪演出由立绘集词表驱动，桌宠自行拉取） */
+/** 桌宠窗口切换角色卡的形象同步负载：Live2D 模型 + 立绘/渲染模式（状态演出由立绘集词表驱动，桌宠自行拉取） */
 export interface PetCardPayload {
   /** 角色卡 id（宠物窗用于同步当前角色名的名牌显示） */
   cardId?: string | null
@@ -243,6 +247,7 @@ export type CharacterCardInput = Pick<
   | 'voiceId'
   | 'voiceMode'
   | 'genieOverride'
+  | 'ttsSpeed'
   | 'ttsOverride'
   | 'renderMode'
   | 'spriteId'
@@ -280,6 +285,8 @@ export interface TTSConfig {
   engine: 'genie' | 'mimo'
   /** 整段合音（默认为关）：开启时一段回复的多个合成分段合并为整段一次合成（音调更连贯），代价是失去逐句实时朗读与逐句切立绘。中文/日文均适用。 */
   mergeSpeech?: boolean
+  /** TTS 语速倍率（0.75–1.5，默认 1.0）：主进程合成后对音频重采样变速，供模型试听测试用 */
+  ttsSpeed?: number
 }
 
 /** GenieTTS(本地声库语音服务) 配置 */
@@ -301,7 +308,7 @@ export interface TTSModelCard {
   characterName: string
   /** 角色 onnx 模型目录（包含转换后的 *.onnx） */
   onnxModelDir: string
-  /** 参考音频路径（可选，用于语气/情绪素材；留空用声库默认） */
+  /** 参考音频路径（可选，用于语气/状态素材；留空用声库默认） */
   refAudioPath: string
   /** 参考音频对应文本（可选） */
   refAudioText: string
@@ -383,9 +390,47 @@ export interface SessionDetail {
 /** 主题模式：dark / light / system（跟随系统 prefers-color-scheme） */
 export type ThemeMode = 'dark' | 'light' | 'system'
 
+/**
+ * API 服务商档案（全局档案库）：一份可复用的「地址 + 模型 + Key」组合。
+ * - 档案本体（名称/地址/模型）随 settings.json 明文保存，不含敏感信息；
+ * - Key 按档案独立加密落盘（secure/keys/<id>.enc，safeStorage/DPAPI），明文不出主进程；
+ * - 各模型类型（主/辅/视觉/嵌入）通过 activeXxxProfileId 引用其中一个档案。
+ */
+export interface ApiProfile {
+  /** 档案 id（prof_ 前缀 + 12 位十六进制，会拼入 Key 密文文件路径） */
+  id: string
+  /** 展示名，如「DeepSeek 官方」「硅基流动」 */
+  name: string
+  /** API 地址（OpenAI 兼容） */
+  baseURL: string
+  /** 模型名 */
+  model: string
+  /**
+   * 该档案是否已配置 Key（仅 settings:get 传输时由主进程填充，用于掩码回显；
+   * 渲染端回传/落盘时忽略此字段）
+   */
+  hasKey?: boolean
+}
+
 /** 非敏感 API 配置（settings.json） */
 export interface AppSettings {
+  /**
+   * 全局服务商档案库（档案制配置）：主/辅/视觉/嵌入模型各自引用其中一个档案。
+   * 旧版单配置字段（baseURL/model/translationXxx/visionXxx/embeddingXxx）已废弃，
+   * 仅保留给启动迁移读取一次，运行时不再读取。
+   */
+  profiles: ApiProfile[]
+  /** 主模型激活的档案 id（null = 未配置） */
+  activeMainProfileId: string | null
+  /** 辅助模型激活的档案 id（null = 未启用，回落主模型激活的档案） */
+  activeAuxProfileId: string | null
+  /** 视觉模型激活的档案 id（null = 未启用，屏幕感知降级/打标不可用，不回落主模型） */
+  activeVisionProfileId: string | null
+  /** 嵌入模型激活的档案 id（null = 未启用，记忆向量检索关闭） */
+  activeEmbeddingProfileId: string | null
+  /** @deprecated 旧版主模型地址，仅启动迁移读取；运行时以激活档案为准 */
   baseURL: string
+  /** @deprecated 旧版主模型名，仅启动迁移读取；运行时以激活档案为准 */
   model: string
   temperature: number
   maxTokens: number
@@ -411,22 +456,21 @@ export interface AppSettings {
   proactiveLlmNarration: boolean
   /** 免打扰时段（'HH:MM' 24 小时制；start/end 任一为空 = 不启用；支持跨零点，如 23:00-08:00） */
   quietHours: { start: string; end: string }
-  /** 视觉模型 API 地址（屏幕感知/立绘打标共用；OpenAI 兼容 chat/completions，需支持图片输入；独立必填不回落主模型） */
+  /** @deprecated 旧版视觉模型地址，仅启动迁移读取；运行时以激活档案为准 */
   visionBaseURL: string
-  /** 视觉模型名（Key 走独立加密存储，不随 settings 明文保存；未配置时屏幕感知降级普通话题、打标不可用） */
+  /** @deprecated 旧版视觉模型名，仅启动迁移读取；运行时以激活档案为准 */
   visionModel: string
   /** 是否启用记忆向量检索（按当前对话语义检索相关记忆注入；关闭或未配置嵌入模型时回退「最近 N 条」） */
   memoryRetrievalEnabled: boolean
-  /** 嵌入 API 地址（OpenAI 兼容 /embeddings 端点；独立于主 LLM 的 baseURL，灵活性更高） */
+  /** @deprecated 旧版嵌入 API 地址，仅启动迁移读取；运行时以激活档案为准 */
   embeddingBaseURL: string
-  /** 嵌入模型名（对应 embeddingBaseURL 的服务商；Key 走独立加密存储，不随 settings 明文保存） */
+  /** @deprecated 旧版嵌入模型名，仅启动迁移读取；运行时以激活档案为准 */
   embeddingModel: string
   /**
-   * 翻译/修复辅助模型 API 地址（留空回落主对话模型 baseURL）：ja 翻译与 JSON 结构修复是
-   * 机械型小任务，建议配置非思考的快速小模型，把首声关键路径上的这两次串行调用压到秒级
+   * @deprecated 旧版辅助模型地址，仅启动迁移读取；运行时以激活档案为准
    */
   translationBaseURL: string
-  /** 翻译/修复辅助模型名（留空回落主对话模型；Key 走独立加密存储，为空回落主 LLM Key） */
+  /** @deprecated 旧版辅助模型名，仅启动迁移读取；运行时以激活档案为准 */
   translationModel: string
   /**
    * AI 时间感知总开关：开启时向模型发送当前真实时间锚点、对话间隔标注、记忆年龄标注与
@@ -439,6 +483,25 @@ export interface AppSettings {
    * （可能快于语音播完）。旁白无音频可跟随，恒按文字显示速度输出；剧情系统不受影响
    */
   voiceTextFollowAudio: boolean
+  /**
+   * 语音段截断二次重试时重载模型（默认开，仅 Genie 本地声库）：段时长过短（截断）先免重载
+   * 直接重试一次；仍截断时开启则重载角色模型后兜底重试一次（多花 8~13s 换完整重试机会），
+   * 关闭则直接放行较短音频（响应更快）。2026-10-22 实验实锤：同状态重发三次全部完整，
+   * 截断非确定性行为——免重载重试是主路径，重载只是未知的"真·模型状态坏"场景的保险
+   */
+  truncationReloadRetry: boolean
+  /**
+   * Genie 本地声库多句段严格判定（默认开）：多句段（内部含 。！？）使用单独的截断阈值，
+   * 且取消 20 字豁免；关闭后全部回落单句阈值（原行为）。仅影响 Genie 合成
+   */
+  genieMultiSentenceStrict: boolean
+  /**
+   * 多句段截断阈值（默认 0.9，范围 0.5~1.0）：实际时长 / 预期时长低于该值判定截断。
+   * 仅在 genieMultiSentenceStrict 开启时对多句段生效
+   */
+  genieMultiSentenceTruncationRatio: number
+  /** 单句截断阈值（默认 0.55，范围 0.3~0.9）：普通单句的截断比例阈值 */
+  genieTruncationRatio: number
   /**
    * 情景摘要缓存（默认开）：每轮结束后由辅助模型异步更新"此刻场景状态"（用户活动/角色状态/
    * 场景氛围），下一轮注入【当前情景】Section——消除长上下文中旁白/台词与当前场景错位。
@@ -465,16 +528,16 @@ export interface Live2DModelMeta {
   createdAt: number
 }
 
-// ---------------- 情绪标签（结构化情绪输出） ----------------
+// ---------------- 状态标签（结构化状态输出） ----------------
 
 /**
- * 内置默认情绪词（词表方案唯一保留字）：
+ * 内置默认状态词（词表方案唯一保留字）：
  * 立绘集未打标/未建词表时，自动获得仅含该词的最小词表（解析落首图/说话图）。
  * 历史 6 枚举（neutral/happy/...）不再是值域，仅在归一化别名表中作为旧词识别。
  */
 export const BUILTIN_DEFAULT_EMOTION = '平静'
 
-/** 内置默认情绪的释义（prompt 与最小词表共用） */
+/** 内置默认状态的释义（prompt 与最小词表共用） */
 export const BUILTIN_DEFAULT_GLOSS = '从容放松'
 
 /**
@@ -493,18 +556,18 @@ export function builtinPalette(): EmotionPaletteRef {
 /** 立绘渲染模式：Live2D 动画 或 2D 静态切图（并行切换，统一形象层分发） */
 export type RenderMode = 'live2d' | 'sprite'
 
-/** 立绘集内单张图片：按情绪映射的目标文件（相对 sprites/{id}/） */
+/** 立绘集内单张图片：按状态映射的目标文件（相对 sprites/{id}/） */
 export interface CharacterSpriteImage {
   /** 文件名（含扩展名，相对 userData/sprites/{id}/） */
   filePath: string
 }
 
 /**
- * 情绪词表条目：立绘集的细粒度情绪（词表方案的事实源，导入打标自动生成 + 编辑器可改）。
- * prompt 的 emotion 值域 = 词表全部 name；解析链 = 精确命中 → 默认情绪。
+ * 状态词表条目：立绘集的细粒度状态（词表方案的事实源，导入打标自动生成 + 编辑器可改）。
+ * prompt 的 emotion 值域 = 词表全部 name；解析链 = 精确命中 → 默认状态。
  */
 export interface SpritePaletteEntry {
-  /** 情绪词（唯一，2-4 个中文字为宜，如"傲娇"） */
+  /** 状态词（唯一，2-4 个中文字为宜，如"傲娇"） */
   name: string
   /** 中文释义（注入 prompt，帮助模型选词） */
   gloss: string
@@ -513,11 +576,11 @@ export interface SpritePaletteEntry {
 }
 
 /**
- * Live2D 模型情绪词表条目（模型侧演出词表：情绪演出 = 切表情，与立绘集词表对等）。
- * Live2D 模型与立绘集是二选一的演出形象，各自拥有独立的情绪词表。
+ * Live2D 模型状态词表条目（模型侧演出词表：状态演出 = 切表情，与立绘集词表对等）。
+ * Live2D 模型与立绘集是二选一的演出形象，各自拥有独立的状态词表。
  */
 export interface ModelPaletteEntry {
-  /** 情绪词（唯一，2-4 个中文字为宜） */
+  /** 状态词（唯一，2-4 个中文字为宜） */
   name: string
   /** 中文释义（注入 prompt，帮助模型选词） */
   gloss: string
@@ -526,27 +589,27 @@ export interface ModelPaletteEntry {
 }
 
 /** Live2D 模型演出词表（纯「词→表情」映射，存 data/model-palettes.json）。
- *  无默认情绪概念：AI 输出词未命中词条 → 不联动表情（回落全局静态表情）；
- *  归一化兜底词固定取「平静」（在表内）或第一个词条，仅用于 prompt 契约与情绪归一。 */
+ *  无默认状态概念：AI 输出词未命中词条 → 不联动表情（回落全局静态表情）；
+ *  归一化兜底词固定取「平静」（在表内）或第一个词条，仅用于 prompt 契约与状态归一。 */
 export interface ModelPalette {
   entries: ModelPaletteEntry[]
 }
 
 /**
- * 情绪词表视图（供主进程归一化与 prompt 注入使用的最小结构）。
+ * 状态词表视图（供主进程归一化与 prompt 注入使用的最小结构）。
  * 演出词表双轨对等：sprite 模式 = 立绘集词表（paletteFromSprite）；live2d 模式 = 模型词表。
  * 任一词表为空时由 builtinPalette 返回内置最小词表（仅"平静"），系统内永远只有词表一条链。
  */
 export interface EmotionPaletteRef {
   entries: Array<{ name: string; gloss: string }>
-  /** 默认情绪：必须是 entries 中某词的 name；兜底终点（系统唯一保留字） */
+  /** 默认状态：必须是 entries 中某词的 name；兜底终点（系统唯一保留字） */
   defaultEmotion: string
 }
 
 /**
  * 立绘集元信息（sprites/index.json）。
- * 一个立绘集 = 导入的一个文件夹，内含多张情绪切图（png/jpg/webp 等）。
- * 情绪演出唯一事实源 = emotions 词表；未打标时运行时按内置最小词表（仅"平静"）处理。
+ * 一个立绘集 = 导入的一个文件夹，内含多张状态切图（png/jpg/webp 等）。
+ * 状态演出唯一事实源 = emotions 词表；未打标时运行时按内置最小词表（仅"平静"）处理。
  */
 export interface CharacterSprite {
   id: string
@@ -554,9 +617,9 @@ export interface CharacterSprite {
   name: string
   /** 该立绘集下的图片列表 */
   images: CharacterSpriteImage[]
-  /** 情绪词表（唯一事实源；空数组 = 未打标，运行时按内置最小词表处理） */
+  /** 状态词表（唯一事实源；空数组 = 未打标，运行时按内置最小词表处理） */
   emotions: SpritePaletteEntry[]
-  /** 默认情绪词（词表非空时必为 emotions 中某词；空串 = 未设置） */
+  /** 默认状态词（词表非空时必为 emotions 中某词；空串 = 未设置） */
   defaultEmotion: string
   /** 说话立绘图（相对文件路径，空 = 未配置）：解析图等于默认图且正在说话时使用 */
   speakingImage: string | null
@@ -580,7 +643,7 @@ export function paletteFromSprite(
 }
 
 /**
- * 词表链解析：情绪词 → 精确命中词条的图；未命中 → 默认情绪词条的图。
+ * 词表链解析：状态词 → 精确命中词条的图；未命中 → 默认状态词条的图。
  * 内置最小词表（未打标集，单词条无图）的"平静"定义为首图——链上不存在通用首图兜底。
  * 直接查 spr.emotions 原始词条（含 image）；未打标集（emotions 空）= 首图。
  * @returns 命中的立绘文件名；词条图缺失且非内置最小词表时返回 null（由调用方按 说话图 兜底）
@@ -600,7 +663,7 @@ export function resolvePaletteImage(
   // 1) 精确命中词条的图
   const direct = byName.get(emotion.trim())
   if (direct && has(direct.image)) return direct.image
-  // 2) 未命中：默认情绪词条的图（词表图必填，正常恒有；异常配置返回 null 由调用方按说话图兜底）
+  // 2) 未命中：默认状态词条的图（词表图必填，正常恒有；异常配置返回 null 由调用方按说话图兜底）
   const defEntry = byName.get(defName)
   return defEntry && has(defEntry.image) ? defEntry.image : null
 }
@@ -748,6 +811,14 @@ export interface StreamErrorPayload {
   error: string
   /** true 表示用户主动点击「停止」（cancel），非真实错误 */
   cancelled?: boolean
+  /**
+   * 失败轮落盘的权威 user 消息（携带 error 原因或 meta.cancelled 标记）：
+   * 渲染端用它原子对齐本地列表（就地替换末条同文 user 或补挂缺失气泡），
+   * 避免为取失败标记再做一次异步往返造成提示条状态闪变。
+   */
+  userMessage?: ChatMessage
+  /** 已流出部分收成的 assistant 消息（仅部分输出时存在）；渲染端原子追加，失败后已流出的文本不消失 */
+  partialMessage?: ChatMessage
 }
 
 /** AI 流式用户消息广播（跟随窗口即时补上用户气泡） */
@@ -947,7 +1018,7 @@ export interface ScriptMeta {
   cover?: string
   /** 绑定角色卡（一期单角色；cardId 为系统角色卡 id，如 card_xxxxxxxxxxxx） */
   characters?: Array<{ cardId?: string }>
-  /** 创作词表来源：绑定的立绘集 id（情绪下拉按该集词表生成；缺省 = 未绑定，按内置最小词表"平静"处理） */
+  /** 创作词表来源：绑定的立绘集 id（状态下拉按该集词表生成；缺省 = 未绑定，按内置最小词表"平静"处理） */
   spriteSetId?: string
   /** 绑定词表的内容指纹（表单保存时写入）：打开剧本时比对检测"词表已变" */
   vocabHash?: string
@@ -1161,11 +1232,11 @@ export interface EditorReadResult {
     spriteSetId: string | null
     /** 绑定立绘集的词表词列表（未绑定时为内置最小词表词 ["平静"]） */
     emotionWords: string[] | null
-    /** 绑定立绘集的默认情绪词（未启用词表时为 null） */
+    /** 绑定立绘集的默认状态词（未启用词表时为 null） */
     paletteDefault: string | null
     /** 词表指纹与 story.yaml 记录不一致（词表在绑定后被编辑过）；无记录时为 false */
     paletteChanged: boolean
-    /** 事件中引用但不在当前词表的未知情绪词（去重；旧英文枚举词经别名表归一后仍落默认） */
+    /** 事件中引用但不在当前词表的未知状态词（去重；旧英文枚举词经别名表归一后仍落默认） */
     staleWords: string[]
     /** 手写剧本默认只读：仅 story.yaml 带 editedVia: form 时允许表单写回 */
     editedVia: boolean
@@ -1235,14 +1306,19 @@ export interface LogEntry {
  */
 export interface WindowApi {
   ai: {
-    /** 发送消息；主进程组装 system prompt（人设+记忆）、发起流式请求、持久化 */
-    sendMessage: (params: { sessionId: string; messages: ChatMessage[] }) => Promise<ChatMessage>
+    /**
+     * 发送消息；主进程组装 system prompt（人设+记忆）、发起流式请求、持久化。
+     * 返回落盘的 assistant 消息；轮次从未开始的拒绝（busy/校验）仍 reject，
+     * 轮次执行失败返回 null（失败态已由 stream-error 广播驱动，调用方无需处理）。
+     */
+    sendMessage: (params: { sessionId: string; messages: ChatMessage[] }) => Promise<ChatMessage | null>
     /**
      * 消息重答：删除最后一轮（user+assistant）后重跑正常聊天链路。
      * editText 非空 = 编辑并重发（用编辑后文本）；为空 = 重新回答（原 user 内容）。
      * 轮次进行中（LLM/持久化阶段）由主进程 busy 标志拒绝。
+     * 返回语义同 sendMessage：轮次执行失败返回 null，前置拒绝 reject。
      */
-    regenerate: (params: { sessionId: string; editText?: string }) => Promise<ChatMessage>
+    regenerate: (params: { sessionId: string; editText?: string }) => Promise<ChatMessage | null>
     /** 订阅会话截断广播（重答删除最后一轮后）：两窗用磁盘最新消息列表替换本地（旧轮气泡消失） */
     onSessionRewound: (cb: (payload: { sessionId: string; messages: ChatMessage[] }) => void) => () => void
     onStreamDone: (cb: (payload: StreamDonePayload) => void) => () => void
@@ -1326,7 +1402,7 @@ export interface WindowApi {
   session: {
     list: () => Promise<SessionIndexItem[]>
     get: (id: string) => Promise<SessionDetail>
-    /** 读取最近活跃会话的情景摘要缓存（设置窗查看/编辑；无会话返回 null） */
+    /** 读取当前会话（聊天窗选中）的情景摘要缓存；未上报时回落最近活跃会话。无会话返回 null */
     getSceneDigest: () => Promise<{ sessionId: string; title: string; digest: string } | null>
     /** 保存指定会话的情景摘要缓存（手动编辑；空串=清空缓存） */
     setSceneDigest: (sessionId: string, text: string) => Promise<void>
@@ -1346,7 +1422,7 @@ export interface WindowApi {
     expressionList: (modelId: string) => Promise<ExpressionMeta[]>
     /** 读取 Live2D 模型演出词表（data/model-palettes.json；未配置 = null，运行时按内置最小词表兜底） */
     getPalette: (modelId: string) => Promise<ModelPalette | null>
-    /** 保存 Live2D 模型演出词表（词 + 释义 + 表情联动 + 默认情绪，全量写回） */
+    /** 保存 Live2D 模型演出词表（词 + 释义 + 表情联动 + 默认状态，全量写回） */
     updatePalette: (modelId: string, palette: ModelPalette) => Promise<void>
     /**
      * 扫描模型文件夹自动识别表情（*.exp3.json）/动作（*.motion3.json）文件，
@@ -1371,31 +1447,30 @@ export interface WindowApi {
     importFromFolder: () => Promise<CharacterSprite | null>
     /** 删除指定立绘集（同时删除资源目录与索引条目） */
     remove: (spriteId: string) => Promise<void>
-    /** 更新立绘集展示资产：名称 / 情绪词表 / 说话立绘 / 思考立绘 */
+    /** 更新立绘集展示资产：名称 / 状态词表 / 说话立绘 / 思考立绘 */
     update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
-    /** 视觉打标：对指定立绘集逐张生成情绪词建议（产物不落库，回填编辑器确认）；未配置视觉模型时返回 ok:false */
+    /** 视觉打标：对指定立绘集逐张生成状态词建议（产物不落库，回填编辑器确认）；未配置视觉模型时返回 ok:false */
     annotate: (spriteId: string) => Promise<{ ok: boolean; suggestions?: Array<{ filePath: string; name: string; desc: string }>; failed?: number; error?: string }>
     /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }
   settings: {
-    /** 返回非敏感配置 + 是否已配置 Key（不回显明文；hasEmbeddingApiKey/hasVisionApiKey/hasTranslationApiKey 为独立服务 Key 状态） */
-    get: () => Promise<AppSettings & { hasApiKey: boolean; hasEmbeddingApiKey: boolean; hasVisionApiKey: boolean; hasTranslationApiKey: boolean }>
+    /** 返回非敏感配置（含档案库，每个档案携带 hasKey 供掩码回显；不回显任何明文） */
+    get: () => Promise<AppSettings>
     save: (settings: Partial<AppSettings>) => Promise<void>
-    saveApiKey: (key: string) => Promise<void>
-    hasApiKey: () => Promise<boolean>
-    /** 保存嵌入服务独立 API Key（safeStorage 加密落盘，与主 LLM Key 隔离） */
-    saveEmbeddingApiKey: (key: string) => Promise<void>
-    /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
-    hasEmbeddingApiKey: () => Promise<boolean>
-    /** 保存屏幕感知视觉模型独立 API Key（safeStorage 加密落盘） */
-    saveVisionApiKey: (key: string) => Promise<void>
-    /** 视觉模型 Key 是否已配置（仅回显掩码用） */
-    hasVisionApiKey: () => Promise<boolean>
-    /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密落盘；为空时运行时回落主 LLM Key） */
-    saveTranslationApiKey: (key: string) => Promise<void>
-    /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用） */
-    hasTranslationApiKey: () => Promise<boolean>
+    /**
+     * 新建/更新服务商档案（upsert，按 id 缺省新建）：key 非空时保存该档案的 API Key
+     * （safeStorage 加密落盘）；key 为 undefined = 保持原 Key 不变
+     */
+    saveProfile: (profile: { id?: string; name: string; baseURL: string; model: string; key?: string }) => Promise<ApiProfile>
+    /** 删除档案（正在被某类模型引用时抛错；连同其 Key 密文一并清除） */
+    deleteProfile: (id: string) => Promise<void>
+    /**
+     * 拉取档案服务商的可用模型列表（OpenAI 兼容 GET {baseURL}/models）。
+     * 编辑已有档案时 key 可省略（主进程按 profileId 读存储密钥，明文不出主进程）；
+     * 新建未保存档案时传表单现值
+     */
+    listModels: (input: { profileId?: string; baseURL?: string; key?: string }) => Promise<string[]>
     /** 获取当前数据目录信息（当前路径、默认路径、是否自定义） */
     getDataDir: () => Promise<{ current: string; default: string; isCustom: boolean }>
     /** 选择新目录并迁移数据，成功后需手动重启应用 */
@@ -1424,7 +1499,7 @@ export interface WindowApi {
     /** 打开聊天窗口，并可指定要进入的会话 id（宠物窗点开时带当前会话） */
     openChatWithSession: (sessionId: string) => void
     openSettings: () => void
-    /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖 + 立绘/渲染模式 + 情绪映射） */
+    /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖 + 立绘/渲染模式 + 状态映射） */
     setPetCard: (payload: PetCardPayload) => void
     quit: () => void
     /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步）。
@@ -1461,8 +1536,8 @@ export interface WindowApi {
      *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放；
      *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本（零时长槽位）；
      *  segIndex：本块对应的回合文档分段索引（方案A进度回报用，null/缺省 = 不参与回报） */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null }) => void) => () => void
-    /** 订阅 AI 回复情绪事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘；词表方案下为自由情绪词） */
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null; /** 角色 TTS 语速倍率（主进程随分段下发，null = 原速） */ ttsSpeed?: number | null }) => void) => () => void
+    /** 订阅 AI 回复状态事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘；词表方案下为自由状态词） */
     onEmotion: (cb: (emotion: string) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
@@ -1496,8 +1571,9 @@ export interface WindowApi {
     removeReference: (id: string) => Promise<void>
     /** 合成语音：传入文本与参考音频 id，返回 wav 格式的 ArrayBuffer。
      *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）；
-     *  engine=genie 时 voiceId 可空（本地声库语音服务不需要参考音频）。 */
-    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null }) => Promise<ArrayBuffer | null>
+     *  engine=genie 时 voiceId 可空（本地声库语音服务不需要参考音频）；
+     *  speed 为语速倍率（0.75–1.5，缺省 1 = 原速），主进程合成后对音频重采样变速。 */
+    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; speed?: number }) => Promise<ArrayBuffer | null>
     /** 重命名参考音频，返回更新后的对象 */
     renameReference: (id: string, name: string) => Promise<VoiceReference>
     /** 读取 GenieTTS(本地声库语音服务) 配置 */
@@ -1583,7 +1659,7 @@ export interface WindowApi {
     uploadBackgrounds: () => Promise<{ ok: boolean; added?: string[]; error?: string }>
     /** 删除背景库文件 */
     removeBackground: (name: string) => Promise<{ ok: boolean; error?: string }>
-    /** AI 辅助写剧本：梗概（+可选参考角色卡 +可选情绪词表来源立绘集）→ 单文件 YAML 剧本草稿（含校验报告，不直接入库）；指定立绘集时草稿注入 spriteSetId/vocabHash（导入即绑定） */
+    /** AI 辅助写剧本：梗概（+可选参考角色卡 +可选状态词表来源立绘集）→ 单文件 YAML 剧本草稿（含校验报告，不直接入库）；指定立绘集时草稿注入 spriteSetId/vocabHash（导入即绑定） */
     generateDraft: (params: { premise: string; cardId?: string | null; spriteSetId?: string | null }) => Promise<StoryDraftResult>
     /** 导入 AI 剧本草稿：schema 全量校验通过后拆分写入剧本库 */
     importDraft: (draft: string) => Promise<{ ok: boolean; scriptId?: string; errors: Array<{ file: string; message: string }>; error?: string }>

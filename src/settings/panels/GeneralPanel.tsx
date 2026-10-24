@@ -75,6 +75,10 @@ export function GeneralPanel() {
   const stripParenNarration = useSettingsStore((s) => s.settings.stripParenNarration)
   const timeAwarenessEnabled = useSettingsStore((s) => s.settings.timeAwarenessEnabled ?? true)
   const voiceTextFollowAudio = useSettingsStore((s) => s.settings.voiceTextFollowAudio ?? true)
+  const truncationReloadRetry = useSettingsStore((s) => s.settings.truncationReloadRetry ?? true)
+  const genieMultiSentenceStrict = useSettingsStore((s) => s.settings.genieMultiSentenceStrict ?? true)
+  const genieMultiSentenceTruncationRatio = useSettingsStore((s) => s.settings.genieMultiSentenceTruncationRatio ?? 0.9)
+  const genieTruncationRatio = useSettingsStore((s) => s.settings.genieTruncationRatio ?? 0.55)
   const enableSceneDigest = useSettingsStore((s) => s.settings.enableSceneDigest ?? true)
   const save = useSettingsStore((s) => s.save)
 
@@ -110,6 +114,10 @@ export function GeneralPanel() {
 
   useEffect(() => {
     void loadSceneDigest()
+    // 聊天窗切换/新建会话后刷新：编辑块跟随当前会话（未聊过的会话 = 空缓存）
+    return api.pet.onCurrentSessionChanged(() => {
+      void loadSceneDigest()
+    })
   }, [])
 
   /** 保存文字显示速度（滑块实时生效） */
@@ -249,6 +257,68 @@ export function GeneralPanel() {
             </div>
             <Switch checked={voiceTextFollowAudio} onChange={(v) => void save({ voiceTextFollowAudio: v })} />
           </div>
+        </div>
+      </Card>
+
+      {/* Genie 本地声库截断判定：多句段严格判定 + 两个比例阈值（仅影响 Genie 合成） */}
+      <Card className="p-5">
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-text">多句段严格判定</div>
+              <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                多句段（内部含句号 / 问号 / 叹号）使用单独的截断阈值，并取消 20 字豁免；
+                关闭后全部回落单句阈值。仅影响 Genie 本地声库
+              </div>
+            </div>
+            <Switch
+              checked={genieMultiSentenceStrict}
+              onChange={(v) => void save({ genieMultiSentenceStrict: v })}
+            />
+          </div>
+
+          <Slider
+            label="多句段截断阈值"
+            value={genieMultiSentenceTruncationRatio}
+            min={0.5}
+            max={1}
+            step={0.01}
+            defaultValue={0.9}
+            disabled={!genieMultiSentenceStrict}
+            onChange={(v) => void save({ genieMultiSentenceTruncationRatio: Math.round(v * 100) / 100 })}
+            format={(v) => `${Math.round(v * 100)}%`}
+          />
+
+          <Slider
+            label="单句截断阈值"
+            value={genieTruncationRatio}
+            min={0.3}
+            max={0.9}
+            step={0.01}
+            defaultValue={0.55}
+            onChange={(v) => void save({ genieTruncationRatio: Math.round(v * 100) / 100 })}
+            format={(v) => `${Math.round(v * 100)}%`}
+          />
+
+          <p className="text-xs leading-relaxed text-text-muted">
+            实际时长低于「预期时长 × 阈值」时判定截断：先免重载重试一次；是否重载角色由下方
+            「截断二次重试时重载模型」决定。下一段合成生效。
+          </p>
+        </div>
+      </Card>
+
+      {/* 截断二次重试时重载模型（仅 Genie 本地声库）：独立卡片，与文字显示无关 */}
+      <Card className="p-5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-text">截断二次重试时重载模型</div>
+            <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+              语音段合成时长过短（截断）时先免重载直接重试一次；若仍截断，开启则重载角色模型后再兜底重试
+              一次（多花 8~13 秒换取完整重试机会），关闭则直接放行较短音频（响应更快）。仅影响 Genie 本地声库，
+              下一轮语音生效
+            </div>
+          </div>
+          <Switch checked={truncationReloadRetry} onChange={(v) => void save({ truncationReloadRetry: v })} />
         </div>
       </Card>
     </div>

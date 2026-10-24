@@ -35,6 +35,9 @@ class WindowManager {
   private activeStreamUser: { sessionId: string; content: string; timestamp: number; meta: import('../../src/types').ChatMessageMeta | null } | null = null
   /** 最近一次推送给桌宠的角色卡形象配置。桌宠 renderer 就绪后补发（推送早于订阅时 IPC 消息会丢） */
   private lastPetCard: PetCardPayload | null = null
+  /** 聊天窗当前选中的会话 id（切会话/新建会话时上报）。设置窗「情景摘要缓存」编辑块
+   *  据此跟随显示当前会话的缓存（切到未聊过的会话 = 空），不再固定显示"最近活跃会话" */
+  private currentSessionId: string | null = null
   /** 待新聊天窗加载的会话 id（宠物窗"打开聊天"带过来的）。窗口首建时 did-finish-load
    *  早于 React 订阅 chat:open-session，事件会丢（偶发"新开窗没有历史"，2026-10-14 16:30 实锤）
    *  → 缓存到 renderer-ready 补发。消费一次即清 */
@@ -118,6 +121,8 @@ class WindowManager {
     }
     this.pet.show()
     this.pet.focus()
+    // 显式补一次置顶：置顶属性若曾在拖动中被清掉，仅靠 show()/focus() 只能抬到普通层顶部
+    this.pet.setAlwaysOnTop(true)
   }
 
   togglePet(): void {
@@ -130,6 +135,7 @@ class WindowManager {
     else {
       this.pet.show()
       this.pet.focus()
+      this.pet.setAlwaysOnTop(true)
     }
   }
 
@@ -176,7 +182,24 @@ class WindowManager {
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
    * displayOnly=true 表示纯旁白块（（）描写）：不合成语音，仅按序上屏文本（段落随语音顺序出现）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null }): void {
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null; ttsSpeed?: number | null }): void {
+    // ①翻译/合成并行化（2026-10-22 日志实锤：翻译串行在上一段合成之后，每段白等 2~4s）：
+    // Genie+日语模式下在 speak 事件时刻预发射翻译——翻译走辅助模型（网络 LLM），与本地 GPU
+    // 合成无资源竞争，上一段合成期间本段翻译已并行完成，tts:synthesize 到达时直接取结果。
+    // displayOnly 旁白不合成不预取；预取失败静默（合成路径取不到缓存会现场直译兜底）。
+    if ((payload?.engine ?? 'genie') === 'genie' && !payload?.displayOnly && text.trim()) {
+      void (async () => {
+        try {
+          const effLang = languageOverride ?? (await (await import('../ipc/tts.ipc')).getTTSConfig()).language
+          if (effLang === 'ja' && !/[\u3040-\u309F\u30A0-\u30FF]/.test(text)) {
+            const { prefetchTranslation } = await import('../services/genieTts')
+            prefetchTranslation(text.trim(), 'ja')
+          }
+        } catch {
+          // 预取失败静默
+        }
+      })()
+    }
     const body: {
       text: string
       voiceId: string | null
@@ -187,6 +210,7 @@ class WindowManager {
       genieOverride?: import('../../src/types').CharacterGenieOverride | null
       displayOnly?: boolean
       segIndex?: number | null
+      ttsSpeed?: number | null
     } = {
       text,
       voiceId,
@@ -197,6 +221,7 @@ class WindowManager {
       genieOverride: payload?.genieOverride ?? null,
       displayOnly: payload?.displayOnly ?? false,
       segIndex: payload?.segIndex ?? null,
+      ttsSpeed: payload?.ttsSpeed ?? null,
     }
     // 桌宠 renderer 未就绪（首个回答常发生）→ 先缓存，ready 后补发，避免丢声（旁白块同样缓存保序）
     if (!this.petSpeakReady) {
@@ -292,14 +317,24 @@ class WindowManager {
     }
   }
 
-  /** 聊天窗切会话/新建会话后，把当前会话 id 转发给宠物窗，让内容框跟随同步 */
+  /** 聊天窗切会话/新建会话后：记录当前会话 id（设置窗情景摘要编辑块跟随）+ 转发给宠物窗（内容框跟随同步） */
   notifyCurrentSession(sessionId: string | null): void {
+    this.currentSessionId = sessionId
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('session:current', sessionId)
     }
+    const settings = this.settings
+    if (settings && !settings.isDestroyed()) {
+      settings.webContents.send('session:current', sessionId)
+    }
   }
 
-  /** AI 回复完成后把归一化情绪广播给桌宠，驱动形象层切表情/切立绘（词表方案下为自由情绪词） */
+  /** 当前会话 id（聊天窗上报；null = 尚未上报）。供 IPC 层读取 */
+  getCurrentSessionId(): string | null {
+    return this.currentSessionId
+  }
+
+  /** AI 回复完成后把归一化状态广播给桌宠，驱动形象层切表情/切立绘（词表方案下为自由状态词） */
   notifyEmotion(emotion: string): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:emotion', emotion)

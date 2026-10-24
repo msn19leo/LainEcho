@@ -1,6 +1,6 @@
 /**
  * 宠物窗会话记录列表：
- * - 圆角气泡列表，左右对齐；用户/AI 气泡上方带小名牌，AI 用角色名+角色色表达情绪（不塞文字标签）。
+ * - 圆角气泡列表，左右对齐；用户/AI 气泡上方带小名牌，AI 用角色名+角色色表达状态（不塞文字标签）。
  * - 正在生成的那条做"逐字打印"（对已到达的 streamingContent 做打字机 reveal）。
  * 内容随 useSessionStore（宠物窗镜像）与聊天窗同步。
  *
@@ -227,7 +227,7 @@ export function PetContentList() {
         }
         return (
           <div key={i} className={cn('my-1 flex flex-col', isUser ? 'items-end' : 'items-start')}>
-            {/* 名牌：用户=你；AI=角色名（用角色色表达说话人/情绪） */}
+            {/* 名牌：用户=你；AI=角色名（用角色色表达说话人/状态） */}
             <span
               className={cn(
                 'mb-0.5 select-none px-1 text-[10px] font-medium',

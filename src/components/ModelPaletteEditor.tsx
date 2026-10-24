@@ -1,8 +1,8 @@
 /**
- * Live2D 模型情绪词表编辑器（模型侧演出词表，纯「词→表情」映射，与立绘集词表双轨对等）。
+ * Live2D 模型状态词表编辑器（模型侧演出词表，纯「词→表情」映射，与立绘集词表双轨对等）。
  *
- * - 词条行：情绪词 / 释义（注入 prompt 供 AI 理解）/ Live2D 表情联动（exp3.json 的 Name，可选）；
- * - 无默认情绪概念：AI 输出词未命中词条 → 不联动表情（回落全局静态表情）；
+ * - 词条行：状态词 / 释义（注入 prompt 供 AI 理解）/ Live2D 表情联动（exp3.json 的 Name，可选）；
+ * - 无默认状态概念：AI 输出词未命中词条 → 不联动表情（回落全局静态表情）；
  * - 词表为空 = 运行时按内置最小词表（仅"平静"）处理：无表情联动；
  * - 保存经 model:updatePalette(modelId, { entries }) 全量写回 data/model-palettes.json。
  *   演出形象二选一：Live2D 模式用本词表，sprite 模式用立绘集词表，两个世界的词互不干扰。
@@ -51,8 +51,8 @@ export function ModelPaletteEditor({ model, onClose, onSaved }: {
     const names = new Set<string>()
     for (const e of entries) {
       const name = e.name.trim()
-      if (!name) return '情绪词不能为空'
-      if (names.has(name)) return `情绪词重复：「${name}」`
+      if (!name) return '状态词不能为空'
+      if (names.has(name)) return `状态词重复：「${name}」`
       names.add(name)
     }
     return null
@@ -76,7 +76,7 @@ export function ModelPaletteEditor({ model, onClose, onSaved }: {
         }))
         .filter((e) => e.name)
       await api.model.updatePalette(model.id, { entries: cleaned })
-      toast('模型情绪词表已保存')
+      toast('模型状态词表已保存')
       onSaved()
       onClose()
     } catch (err) {
@@ -94,13 +94,13 @@ export function ModelPaletteEditor({ model, onClose, onSaved }: {
   return (
     <div className="space-y-2.5">
       <p className="text-xs leading-relaxed text-text-muted">
-        模型情绪词表决定 Live2D 模式下 AI 的 emotion 值域与表情联动：对话情绪命中词条时，形象平滑切换到绑定的表情；未配置的词回落全局静态表情。词表为空时按内置最小词表（仅"平静"）处理。释义会随词注入 prompt，帮 AI 判断什么场面用哪个词。
+        模型状态词表决定 Live2D 模式下 AI 的 emotion 值域与表情联动：对话状态命中词条时，形象平滑切换到绑定的表情；未配置的词回落全局静态表情。词表为空时按内置最小词表（仅"平静"）处理。释义会随词注入 prompt，帮 AI 判断什么场面用哪个词。
       </p>
 
       <div className="max-h-[320px] space-y-1.5 overflow-y-auto pr-1">
         {entries.length > 0 && (
           <div className="grid grid-cols-[92px_1fr_150px_auto] items-center gap-1.5 px-0.5">
-            <span className="text-[11px] text-text-muted">情绪词</span>
+            <span className="text-[11px] text-text-muted">状态词</span>
             <span className="text-[11px] text-text-muted">释义（注入 prompt 供 AI 理解）</span>
             <span className="text-[11px] text-text-muted">Live2D 表情</span>
             <span />
@@ -108,7 +108,7 @@ export function ModelPaletteEditor({ model, onClose, onSaved }: {
         )}
         {entries.length === 0 && (
           <div className="rounded-[var(--radius-md)] border border-dashed border-border px-3 py-6 text-center text-xs text-text-muted">
-            词表为空。「添加词条」手动配置情绪词与表情联动。
+            词表为空。「添加词条」手动配置状态词与表情联动。
           </div>
         )}
         {entries.map((e, i) => (
@@ -116,7 +116,7 @@ export function ModelPaletteEditor({ model, onClose, onSaved }: {
             <input
               value={e.name}
               onChange={(ev) => patch(i, { name: ev.target.value })}
-              placeholder="情绪词"
+              placeholder="状态词"
               className="w-full rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1 text-xs outline-none"
             />
             <input

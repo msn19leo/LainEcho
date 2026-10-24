@@ -257,6 +257,8 @@ const fullCard: CharacterCard = {
   voiceMode: 'none',
   genieOverride: null,
   ttsOverride: null,
+  // 角色 TTS 语速倍率（金样不涉及语音，null = 原速）
+  ttsSpeed: null,
   renderMode: null,
   spriteId: null,
   avatar: null,

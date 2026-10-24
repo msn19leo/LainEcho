@@ -7,9 +7,8 @@
  * - 全部失败静默（记忆本体已落盘，向量缺失只影响检索质量，不影响功能可用）。
  */
 import type { MemoryItem } from '../../../src/types'
-import { readSecret } from '../crypto'
+import { resolveProfile } from '../apiProfiles'
 import { getSettings, listMemories } from '../repository'
-import { paths } from '../storage'
 import { embedTexts, embedQuery, isEmbeddingConfigUsable, type EmbeddingConfig } from './embeddingService'
 import { listVectors, removeVectors, searchVectors, upsertVectors } from './vectorIndex'
 
@@ -17,13 +16,12 @@ import { listVectors, removeVectors, searchVectors, upsertVectors } from './vect
 const COMPENSATE_BATCH = 8
 
 /**
- * 从当前设置组装嵌入配置（独立于主 LLM：embeddingBaseURL + 独立 Key + embeddingModel）。
- * 未配置完整（地址/模型/Key 任一缺失）返回 null；不校验检索开关，手动重嵌也走这里。
+ * 从激活的嵌入档案组装嵌入配置（档案制：activeEmbeddingProfileId → 地址/模型/Key 三元组）。
+ * 未启用或配置不完整返回 null；不校验检索开关，手动重嵌也走这里。
  */
 export async function resolveEmbeddingConfig(): Promise<EmbeddingConfig | null> {
-  const settings = await getSettings()
-  const apiKey = await readSecret(paths.embeddingApiKeyFile).catch(() => null)
-  const cfg = { baseURL: settings.embeddingBaseURL, apiKey: apiKey ?? '', model: settings.embeddingModel }
+  const cfg = await resolveProfile('embedding')
+  if (!cfg) return null
   return isEmbeddingConfigUsable(cfg) ? cfg : null
 }
 

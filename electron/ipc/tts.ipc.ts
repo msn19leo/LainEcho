@@ -15,6 +15,7 @@ import { paths, readJson, writeJson, mutateJson, deleteFile } from '../services/
 import { saveSecret, readSecret, hasSecret } from '../services/crypto'
 import { genId, assertValidResourceId, listTTSModels, getTTSModel, createTTSModel, updateTTSModel, deleteTTSModel, listCharacterCards } from '../services/repository'
 import { synthesizeWithMiMo, bufferToBase64 } from '../services/ttsClient'
+import { applyAudioSpeed } from '../services/audioSpeed'
 import {
   getGenieConfig,
   saveGenieConfig,
@@ -30,6 +31,7 @@ const DEFAULT_TTS_CONFIG: TTSConfig = {
   model: '',
   engine: 'genie',
   mergeSpeech: false,
+  ttsSpeed: 1.0,
 }
 
 /** 默认参考音频列表（空数组） */
@@ -292,13 +294,13 @@ export function registerTtsIpc(): void {
    * @param params.text 要合成的文本
    * @param params.voiceId 参考音频 id（仅 mimo 引擎需要；genie 可空）
    * @param params.languageOverride 角色级语言覆盖（null/undefined = 跟随全局）
-   * @param params.emotion 保留字段（Genie 由声库自带性格，忽略逐句情绪）
+   * @param params.emotion 保留字段（Genie 由声库自带性格，忽略逐句状态）
    * @param params.engine 显式引擎覆盖（角色卡决定；缺省用全局配置）
    * @param params.genieOverride 角色级 Genie 覆盖（绑定的 TTS 模型卡 id）
    * @returns wav 格式的 ArrayBuffer，调用失败抛出错误
    */
-  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null }) => {
-    const { text, voiceId, languageOverride, engine: engineOverride, genieOverride } = params ?? {}
+  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; speed?: number }) => {
+    const { text, voiceId, languageOverride, engine: engineOverride, genieOverride, speed } = params ?? {}
     if (typeof text !== 'string' || !text.trim()) {
       throw new Error('合成文本不能为空')
     }
@@ -330,15 +332,18 @@ export function registerTtsIpc(): void {
       if (!characterName || !onnxModelDir) {
         throw new Error('未绑定 TTS 模型卡或模型卡配置不完整，请先在「设置 → 语音合成」中创建并绑定')
       }
-      return synthesizeGenie({
-        config: base,
-        characterName,
-        onnxModelDir,
-        refAudioPath: refAudioPath || undefined,
-        refAudioText: refAudioText || undefined,
-        text: text.trim(),
-        lang: effectiveConfig.language,
-      })
+      return applyAudioSpeed(
+        await synthesizeGenie({
+          config: base,
+          characterName,
+          onnxModelDir,
+          refAudioPath: refAudioPath || undefined,
+          refAudioText: refAudioText || undefined,
+          text: text.trim(),
+          lang: effectiveConfig.language,
+        }),
+        speed,
+      )
     }
 
     // MiMo 引擎：需要参考音频 + API Key
@@ -364,13 +369,16 @@ export function registerTtsIpc(): void {
     const referenceAudioExt = path.extname(voice.filePath).slice(1).toLowerCase()
 
     // 调用 MiMo API 合成
-    return synthesizeWithMiMo({
-      apiKey,
-      text: text.trim(),
-      referenceAudioBase64,
-      referenceAudioExt,
-      config: effectiveConfig,
-    })
+    return applyAudioSpeed(
+      await synthesizeWithMiMo({
+        apiKey,
+        text: text.trim(),
+        referenceAudioBase64,
+        referenceAudioExt,
+        config: effectiveConfig,
+      }),
+      speed,
+    )
   })
 }
 

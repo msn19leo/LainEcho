@@ -1,7 +1,8 @@
 /**
  * 逐字揭示游标 hook（方案A字符口径门控）：
  *
- *  - speed：每字毫秒；<=0 即时全显。
+ *  - speed：每字毫秒；<=0 即时全显。打字循环带时间余额折算（自适应追赶）——实测速率恒等于
+ *    标称 speed，不受主线程负载拖慢（否则上游债务等待时钟估错，尾字迟到，见 useEffect 内注释）。
  *  - 门控（voiceGated）：cap=已开播字符数（speakingChars）、floor=已完播字符数（spokenChars）
  *    ——语音播到哪、文本就放行到哪（文本不跑在语音前）。
  *  - **floor 快进只在换代时对齐一次**（turnKey 变化 = 新轮/重试换代/中途挂载）：
@@ -58,12 +59,34 @@ export function useGatedRevealCount(turnKey: string | null, total: number, speed
       setVisible(Number.MAX_SAFE_INTEGER)
       return
     }
+    // 自适应追赶打字循环（时间余额折算）：setInterval 实际间隔受主线程负载（Live2D 渲染/
+    // 每字一次的组件重渲染）拖慢，固定 +1 字会让实测打字速度慢于标称 speed——上游债务等待
+    // 时钟（PetApp revealDueAt = delta × 标称每字毫秒）据此估错，下一段语音开播时上一段
+    // 尾字还没打完（2026-10-19 23:00 轮实锤：旁白 43 字瞬跳后尾字迟到）。改为累计真实
+    // 流逝时间折算本 tick 应补字数，一次补齐并合并为单次 setVisible 重渲染——平均速率
+    // 恒等于标称速度，债务时钟的"标称恒速模型"与现实吻合。
+    let lastTick = Date.now()
+    /** 未消费的时间余额（ms）：不足一字的零头留到下个 tick */
+    let creditMs = 0
     const timer = setInterval(() => {
-      // 只追上限不超总长：门控下 cap 随语音进度增长，游标自然被放行
-      if (visibleRef.current < Math.min(capRef.current, totalRef.current)) {
-        visibleRef.current += 1
-        setVisible(visibleRef.current)
+      const now = Date.now()
+      creditMs += now - lastTick
+      lastTick = now
+      const chars = Math.floor(creditMs / speed)
+      if (chars > 0) {
+        creditMs -= chars * speed
+        // 只追上限不超总长：门控下 cap 随语音进度增长，游标自然被放行；
+        // 一次补多字不超 cap——打字机可以追平上限，永不越过（文本不跑在语音前）
+        const capNow = Math.min(capRef.current, totalRef.current)
+        if (visibleRef.current < capNow) {
+          visibleRef.current = Math.min(capNow, visibleRef.current + chars)
+          setVisible(visibleRef.current)
+          return
+        }
       }
+      // 无字可打（追平上限/折算不足一字）：余额封顶一字——cap 停滞（等语音）期间不攒量，
+      // 避免 cap 瞬跳（旁白零时长槽位一次解锁整段）后攒下的余额一口气全显、破坏逐字效果
+      if (creditMs > speed) creditMs = speed
     }, speed)
     return () => clearInterval(timer)
   }, [speed])

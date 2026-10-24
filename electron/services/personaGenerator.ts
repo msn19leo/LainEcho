@@ -6,7 +6,7 @@
  */
 import type { CharacterPersona, PersonaGenerateInput } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
-import { readApiKey } from './crypto'
+import { resolveProfile } from './apiProfiles'
 import { getSettings } from './repository'
 
 /** 生成时使用的 JSON 结构说明（作为 system prompt 的骨架约束） */
@@ -264,11 +264,10 @@ function normalizeGeneratedPersona(data: unknown): CharacterPersona {
  * @throws 未配置 API Key / baseURL / model 或生成失败时抛用户可读错误
  */
 export async function generatePersona(input: PersonaGenerateInput): Promise<CharacterPersona> {
+  // 主模型三元组走档案解析（档案制）
+  const mainCfg = await resolveProfile('main')
+  if (!mainCfg) throw new Error('未配置主模型（地址/模型/Key 需完整），请先在「设置 → AI API 配置」中选择并配置档案')
   const settings = await getSettings()
-  const apiKey = await readApiKey()
-  if (!apiKey) throw new Error('未配置 API Key，请先在「设置 → AI API 配置」中填写')
-  if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
-  if (!settings.model.trim()) throw new Error('未配置模型名（model）')
 
   const source = input.source.trim()
   if (!source) throw new Error('角色来源描述不能为空')
@@ -285,9 +284,9 @@ export async function generatePersona(input: PersonaGenerateInput): Promise<Char
       { role: 'user', content: userMessage },
     ],
     {
-      model: settings.model,
-      baseURL: settings.baseURL,
-      apiKey,
+      model: mainCfg.model,
+      baseURL: mainCfg.baseURL,
+      apiKey: mainCfg.apiKey,
       // 生成人设是结构化 JSON：用固定低温提高格式稳定性，并强制较大 maxTokens 防止输出被截断
       temperature: 0.7,
       maxTokens: settings.maxTokens,

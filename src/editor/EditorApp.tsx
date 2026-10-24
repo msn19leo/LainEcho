@@ -57,14 +57,14 @@ export function EditorApp() {
   const [selEvent, setSelEvent] = useState<number | null>(null)
   /** 素材清单（背景/音乐事件下拉选择用）：剧本内图片、剧本内音频、用户背景库、用户音乐库 */
   const [assets, setAssets] = useState<{ images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }>({ images: [], musics: [], userBackgrounds: [], userMusics: [] })
-  /** 情绪词表（词表方案）：绑定立绘集的词表词 + 默认词；null = 未绑定（按内置最小词表"平静"处理） */
+  /** 状态词表（词表方案）：绑定立绘集的词表词 + 默认词；null = 未绑定（按内置最小词表"平静"处理） */
   const [emotionOptions, setEmotionOptions] = useState<string[] | null>(null)
   const [paletteDefault, setPaletteDefault] = useState<string | null>(null)
   /** 立绘集清单（创作词表绑定下拉数据源；保留完整词表供切换改写向导计算映射） */
   const [spriteListFull, setSpriteListFull] = useState<CharacterSprite[]>([])
-  /** 当前生效的 dialogue 默认情绪：词表默认词优先，未绑定退内置默认"平静" */
+  /** 当前生效的 dialogue 默认状态：词表默认词优先，未绑定退内置默认"平静" */
   const defaultEmotion = paletteDefault ?? emotionOptions?.[0] ?? '平静'
-  /** 绑定切换改写向导：非空 = 待确认（改写事件情绪原文后切换绑定） */
+  /** 绑定切换改写向导：非空 = 待确认（改写事件状态原文后切换绑定） */
   const [rebindConfirm, setRebindConfirm] = useState<{ newId: string | null; affected: number; mappings: Array<{ from: string; to: string }>; toDefault: number } | null>(null)
   /** 当前剧本的词表变化状态（来自 editor-read） */
   const [paletteChanged, setPaletteChanged] = useState(false)
@@ -82,8 +82,8 @@ export function EditorApp() {
   }, [spriteListFull])
 
   /**
-   * 计算绑定切换的改写计划（P1 决策：改写式，切换即重写事件情绪原文）。
-   * 映射规则：旧词在新词表 → 保持；其余 → 新词表默认情绪。
+   * 计算绑定切换的改写计划（P1 决策：改写式，切换即重写事件状态原文）。
+   * 映射规则：旧词在新词表 → 保持；其余 → 新词表默认状态。
    */
   const planRewrite = useCallback((chapters: EditorData['chapters'], newPalette: ReturnType<typeof paletteOf>) => {
     const newWords = new Set<string>(newPalette.entries.map((e) => e.name))
@@ -118,7 +118,7 @@ export function EditorApp() {
     setRebindConfirm({ newId, ...plan })
   }
 
-  /** 应用切换：改写事件情绪原文 + 更新绑定与下拉值域（不改写时 affected=0 走同一路径） */
+  /** 应用切换：改写事件状态原文 + 更新绑定与下拉值域（不改写时 affected=0 走同一路径） */
   const applyRebindLocal = (newId: string | null, plan: { affected: number; mappings: Array<{ from: string; to: string }>; toDefault: number }) => {
     const map = new Map(plan.mappings.map((m) => [m.from, m.to]))
     mutate((d) => {
@@ -137,11 +137,11 @@ export function EditorApp() {
     setStaleWords([])
     setPaletteChanged(false)
     if (plan.affected > 0) {
-      toast.success(`已改写 ${plan.affected} 处情绪引用（自动映射 ${plan.affected - plan.toDefault}、落默认 ${plan.toDefault}）；保存后生效`)
+      toast.success(`已改写 ${plan.affected} 处状态引用（自动映射 ${plan.affected - plan.toDefault}、落默认 ${plan.toDefault}）；保存后生效`)
     }
   }
 
-  /** 一键修复未知词（词表变化/导入剧本后）：不在当前值域的情绪引用 → 默认情绪 */
+  /** 一键修复未知词（词表变化/导入剧本后）：不在当前值域的状态引用 → 默认状态 */
   const fixStaleWords = () => {
     if (!data) return
     const valid = new Set<string>(emotionOptions ?? [defaultEmotion])
@@ -159,7 +159,7 @@ export function EditorApp() {
       }
     })
     setStaleWords([])
-    toast.success(`已修复 ${n} 处未知情绪引用（→ ${def}）；保存后生效`)
+    toast.success(`已修复 ${n} 处未知状态引用（→ ${def}）；保存后生效`)
   }
 
   const fetchAssets = useCallback(async (id: string) => {
@@ -208,7 +208,7 @@ export function EditorApp() {
       setPaletteChanged(res.meta.paletteChanged)
       setStaleWords(res.meta.staleWords)
       if (res.meta.paletteChanged) {
-        toast.warning('词表已变化：绑定立绘集的词表在保存后被编辑过，存在不在当前词表中的情绪引用')
+        toast.warning('词表已变化：绑定立绘集的词表在保存后被编辑过，存在不在当前词表中的状态引用')
       }
       setSelChapter(0)
       setSelEvent(null)
@@ -467,13 +467,13 @@ export function EditorApp() {
                     />
                   </label>
                   <label className="block text-[10px] text-text-2">
-                    情绪词表来源（立绘集）
+                    状态词表来源（立绘集）
                     <SelectMenu
                       value={data.meta.spriteSetId ?? ''}
                       onChange={(v) => beginRebind(v || null)}
                       disabled={!formEditable}
                       options={[
-                        { value: '', label: '未绑定（仅默认情绪）' },
+                        { value: '', label: '未绑定（仅默认状态）' },
                         ...spriteListFull.map((s) => ({ value: s.id, label: s.name })),
                       ]}
                       className="mt-0.5 w-full"
@@ -481,11 +481,11 @@ export function EditorApp() {
                     <span className="mt-0.5 block text-[10px] text-text-muted">
                       {emotionOptions && emotionOptions.length > 0
                         ? `已启用词表（${emotionOptions.length} 词）：${emotionOptions.join(' / ')}`
-                        : '绑定已打标的立绘集后，情绪下拉按其词表生成'}
+                        : '绑定已打标的立绘集后，状态下拉按其词表生成'}
                     </span>
                     {staleWords.length > 0 && (
                       <span className="mt-1 block rounded-[var(--radius-md)] border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-500">
-                        {paletteChanged ? '词表已变化，' : ''}有 {staleWords.length} 个未知情绪词不在当前值域：{staleWords.join(' / ')}（演出时降级到默认情绪）
+                        {paletteChanged ? '词表已变化，' : ''}有 {staleWords.length} 个未知状态词不在当前值域：{staleWords.join(' / ')}（演出时降级到默认状态）
                         <button
                           onClick={fixStaleWords}
                           disabled={!formEditable}
@@ -619,11 +619,11 @@ export function EditorApp() {
           )}
         </>
       )}
-      {/* 绑定切换改写向导（P1 决策：改写式）：确认后重写事件情绪原文并切换绑定 */}
+      {/* 绑定切换改写向导（P1 决策：改写式）：确认后重写事件状态原文并切换绑定 */}
       <Modal
         open={!!rebindConfirm}
         onClose={() => setRebindConfirm(null)}
-        title="切换情绪词表来源"
+        title="切换状态词表来源"
         width={480}
         footer={
           <>
@@ -635,9 +635,9 @@ export function EditorApp() {
         {rebindConfirm && (
           <div className="space-y-3 text-xs leading-relaxed text-text-2">
             <p>
-              切换词表来源将<b className="text-text">直接改写</b>事件中的情绪引用（保存后生效）：
+              切换词表来源将<b className="text-text">直接改写</b>事件中的状态引用（保存后生效）：
               共 <b className="text-text">{rebindConfirm.affected}</b> 处需要处理，
-              其中自动映射 {rebindConfirm.affected - rebindConfirm.toDefault} 处、落默认情绪 {rebindConfirm.toDefault} 处。
+              其中自动映射 {rebindConfirm.affected - rebindConfirm.toDefault} 处、落默认状态 {rebindConfirm.toDefault} 处。
             </p>
             <div className="max-h-52 overflow-y-auto rounded-[var(--radius-md)] border border-border p-2">
               {rebindConfirm.mappings.map((m) => (
@@ -649,7 +649,7 @@ export function EditorApp() {
               ))}
             </div>
             <p className="text-[11px] text-text-muted">
-              映射规则：同名保留 → 其余改写为新词表默认情绪。未绑定时按内置最小词表（仅"平静"）处理。
+              映射规则：同名保留 → 其余改写为新词表默认状态。未绑定时按内置最小词表（仅"平静"）处理。
             </p>
           </div>
         )}
@@ -664,9 +664,9 @@ function EventForm({ event, chapterOptions, editable, assets, emotionOptions, pa
   chapterOptions: string[]
   editable: boolean
   assets: { images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }
-  /** 情绪下拉选项：剧本绑定立绘集的词表词；null = 未绑定（按内置最小词表处理） */
+  /** 状态下拉选项：剧本绑定立绘集的词表词；null = 未绑定（按内置最小词表处理） */
   emotionOptions: string[] | null
-  /** 词表默认情绪词（未绑定为 null） */
+  /** 词表默认状态词（未绑定为 null） */
   paletteDefault: string | null
   onChange: (patch: Partial<StoryEvent>) => void
   onTypeChange: (newType: string) => void
@@ -930,9 +930,9 @@ function FieldInput({ field, value, editable, assets, emotionOptions, paletteDef
   value: unknown
   editable: boolean
   assets?: { images: string[]; musics: string[]; userBackgrounds: string[]; userMusics: string[] }
-  /** 情绪下拉选项：剧本绑定立绘集的词表词；undefined/null = 未绑定（按内置最小词表处理） */
+  /** 状态下拉选项：剧本绑定立绘集的词表词；undefined/null = 未绑定（按内置最小词表处理） */
   emotionOptions?: string[] | null
-  /** 词表默认情绪词 */
+  /** 词表默认状态词 */
   paletteDefault?: string | null
   onChange: (v: unknown) => void
 }) {
@@ -973,7 +973,7 @@ function FieldInput({ field, value, editable, assets, emotionOptions, paletteDef
     )
   }
   if (field.kind === 'emotion') {
-    // 情绪值域 = 绑定词表（默认词排首）；未绑定为内置最小词表（仅"平静"）
+    // 状态值域 = 绑定词表（默认词排首）；未绑定为内置最小词表（仅"平静"）
     const emoOpts = (emotionOptions && emotionOptions.length > 0
       ? (paletteDefault
           ? [paletteDefault, ...emotionOptions.filter((w) => w !== paletteDefault)]

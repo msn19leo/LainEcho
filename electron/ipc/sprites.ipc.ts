@@ -3,7 +3,7 @@
  *
  * - 只支持文件夹导入（不做 zip 解压）：把所选文件夹整体复制到
  *   userData/sprites/{spriteId}/，并扫描图片文件记录索引。
- * - 一个立绘集 = 一个文件夹，内含多张情绪切图（png/jpg/webp/gif/bmp）。
+ * - 一个立绘集 = 一个文件夹，内含多张状态切图（png/jpg/webp/gif/bmp）。
  *   图片只收集顶层文件（不递归，避免误收录非立绘本体的资源）。
  * - 图片通过 pet-res://sprites/{spriteId}/{filePath} 供桌宠窗口加载。
  */
@@ -95,7 +95,7 @@ export function registerSpritesIpc(): void {
     windowManager.notifySpritesChanged()
   })
 
-  /** 视觉打标：逐张生成情绪词建议（产物不落库，渲染端回填词表编辑器确认后经 sprite:update 保存） */
+  /** 视觉打标：逐张生成状态词建议（产物不落库，渲染端回填词表编辑器确认后经 sprite:update 保存） */
   ipcMain.handle('sprite:annotate', async (_e, spriteId: string) => {
     return annotateSpriteSet(spriteId)
   })

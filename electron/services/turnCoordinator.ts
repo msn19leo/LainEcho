@@ -219,6 +219,66 @@ export function syncFromPartial(partial: string, palette?: import('../../src/typ
   return fresh
 }
 
+/**
+ * 结构修复补段（2026-10-22 实锤：修复增量续投只补语音槽位、不补文档段——修复段在跟读期间
+ * 无文本可门控显示，语音播完收尾切定型才整段一次性直显，即"先语音、后整段文本"症状）。
+ * 把修复产物同步进 segments，两条路径：
+ *  - 对齐（文档段数 === 续投起点，"第 N 语音项 = 第 N 文档段"不变量成立）→ 只追加超出部分
+ *    （只增不减底稿的合法延伸）；
+ *  - 错位（段数 ≠ 起点）→ 以修复产物**整体重建** segments：损坏 JSON 上两条提取链对同一
+ *    partial 恢复的闭合项数会分歧（2026-10-22 实锤 doc=5 vs 语音=3），文档前缀整体不可信，
+ *    追加错位段会让进度窗滑到别的段文本（"语音播告白、屏幕显旁白"）——修复约束"完整保留
+ *    原文"，重建后文档 = 语音槽位序列（0-2 已投 ≈ 修复前缀），字符门控恢复对齐。重建的显示
+ *    代价 = 文档跳变为修复产物，但那本来就是收尾定型要显示的内容。
+ * 两者都清掉流式残留 trailing（修复产物已取代未闭合尾部，保留会与补段/重建内容重复）。
+ * @param chunks 修复产物分段（DialogueChunk 形状，与定型解析同源）
+ * @param startIdx 续投起点（= 流式已投语音项数）
+ */
+export function appendRepairedSegments(
+  chunks: Array<{ text: string; emotion?: string; kind?: 'speak' | 'narr' }>,
+  startIdx: number,
+): void {
+  if (!doc || startIdx >= chunks.length) return
+  const toSegment = (c: { text: string; emotion?: string; kind?: 'speak' | 'narr' }, id: number): TurnSegment => ({
+    id,
+    text: c.text,
+    kind: c.kind === 'narr' ? 'narr' : 'speak',
+    emotion: c.emotion ?? '平静',
+    state: 'closed',
+  })
+  if (doc.segments.length === startIdx) {
+    // 健康路径：追加超出已投前缀的部分
+    let appended = 0
+    for (let i = startIdx; i < chunks.length; i++) {
+      const c = chunks[i]!
+      if (!c.text.trim()) continue
+      doc.segments.push(toSegment(c, doc.segments.length))
+      appended++
+    }
+    if (doc.trailing) doc.trailing = ''
+    if (appended > 0 || dirty) markDirty()
+    if (appended > 0) console.log('[turn] 结构修复补段：+%d 段（%d→%d），trailing 已清', appended, startIdx, doc.segments.length)
+    return
+  }
+  // 错位路径：以修复产物整体重建（丢弃流式残骸分段）
+  const oldCount = doc.segments.length
+  const rebuilt: TurnSegment[] = []
+  for (const c of chunks) {
+    if (!c.text.trim()) continue
+    rebuilt.push(toSegment(c, rebuilt.length))
+  }
+  doc.segments = rebuilt
+  doc.trailing = ''
+  markDirty()
+  console.log(
+    '[turn] 结构修复文档重建：段数 %d → %d（错位 %d ≠ 续投起点 %d，文档前缀不可信，以修复产物为权威序列）',
+    oldCount,
+    rebuilt.length,
+    oldCount,
+    startIdx,
+  )
+}
+
 /** 文本流结束（落盘前）：phase → reading（语音跟读阶段）并启动看门狗 */
 export function markReading(): void {
   if (!doc) return

@@ -12,7 +12,7 @@ import * as turnCoordinator from '../services/turnCoordinator'
 import { buildModelContext, forceCompact, toModelMessage } from '../services/context'
 import { estimateMessagesTokens } from '../services/token'
 import { getTTSConfig } from './tts.ipc'
-import { readApiKey } from '../services/crypto'
+import { resolveProfile } from '../services/apiProfiles'
 import {
   buildSystemPrompt,
   deleteLastTurnMessages,
@@ -27,8 +27,6 @@ import { buildSystemParts } from '../services/prompt/sections'
 import { composeSystemPrompt } from '../services/prompt/composer'
 import { retrieveMemories } from '../services/memory/retriever'
 import { buildSceneSection } from '../services/sceneContext'
-import { resolveAuxLlmConfig } from '../services/auxModel'
-import { resolveVisionConfig } from '../services/proactive/screenAnalyzer'
 import { noteUserMessage } from '../services/proactive/scheduler'
 import { windowManager } from '../windows/windowManager'
 
@@ -51,8 +49,14 @@ export function registerAiIpc(): void {
     // 通知主动搭话调度器：用户主动发消息 → 兴趣值清零、当日计数重置、更新冷却时间戳
     noteUserMessage(sessionId)
 
-    // 轮次核心执行（流式/语音/持久化/记忆沉淀均在 chatTurn 内完成；错误已广播后 rethrow）
-    return runChatTurn({ sessionId, content })
+    // 轮次核心执行（流式/语音/持久化/记忆沉淀均在 chatTurn 内完成）。
+    // 轮次执行失败不再向调用方 rethrow：失败态（stream-error 广播 + 落盘）已全权驱动渲染端，
+    // invoke 拒绝仅保留给「轮次从未开始」的前置拒绝（busy/校验），渲染端据此区分回滚与横幅。
+    try {
+      return await runChatTurn({ sessionId, content })
+    } catch {
+      return null
+    }
   })
 
   /**
@@ -77,7 +81,12 @@ export function registerAiIpc(): void {
     windowManager.broadcastAI('ai:session-rewound', { sessionId, messages: session.messages })
     noteUserMessage(sessionId)
 
-    return runChatTurn({ sessionId, content })
+    // 轮次失败返回 null（语义同 send-message），前置拒绝（busy/无轮次/内容为空）仍 reject
+    try {
+      return await runChatTurn({ sessionId, content })
+    } catch {
+      return null
+    }
   })
 
   ipcMain.on('ai:cancel', () => {
@@ -116,7 +125,7 @@ export function registerAiIpc(): void {
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
       const lastUserText = [...session.messages].reverse().find((m) => m.role === 'user')?.content ?? ''
-      const retrieval = await retrieveMemories(session.characterCardId, lastUserText, MAX_MEMORIES)
+      const retrieval = await retrieveMemories(session.characterCardId, lastUserText)
       const composed = composeSystemPrompt(
         buildSystemParts(card, retrieval.items, retrieval.profileDigest, settings.enableProactive, null, settings.stripParenNarration),
         { userName: settings.userName },
@@ -178,10 +187,9 @@ export function registerAiIpc(): void {
       const { sessionId } = params ?? {}
       if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
       const settings = await getSettings()
-      const apiKey = await readApiKey()
-      if (!apiKey) throw new Error('未配置 API Key')
-      if (!settings.baseURL.trim()) throw new Error('未配置 API 地址（baseURL）')
-      if (!settings.model.trim()) throw new Error('未配置模型名（model）')
+      // 主模型三元组走档案解析（档案制）
+      const mainCfg = await resolveProfile('main')
+      if (!mainCfg) throw new Error('未配置主模型（地址/模型/Key 需完整），请先在「设置 → AI API 配置」中选择并配置档案')
 
       const session = await getSession(sessionId)
       const card = await getCharacterCard(session.characterCardId)
@@ -193,7 +201,7 @@ export function registerAiIpc(): void {
         systemMessage,
         messages: modelMessages,
         timeAwareness: settings.timeAwarenessEnabled,
-        summarize: createSummarizer(settings, apiKey),
+        summarize: createSummarizer(mainCfg),
       })
       if (result.newSummary) {
         await updateSessionSummary(sessionId, result.newSummary)
@@ -219,41 +227,24 @@ export function registerAiIpc(): void {
 
   /**
    * 测试连接（profile 指定测试对象，按"回落后生效配置"发极简请求）：
-   *  - main：主模型（现状语义）
-   *  - aux：辅助模型；未配置时回落主模型（与运行时语义一致），文案由面板注明
-   *  - vision：视觉模型；独立必填不回落（主模型可能无图像输入能力），未配置直接报错
+   *  - main：主模型激活档案
+   *  - aux：辅助模型激活档案；未启用时回落主模型激活档案（与运行时语义一致），文案由面板注明
+   *  - vision：视觉模型激活档案；独立必填不回落（主模型可能无图像输入能力），未配置直接报错
    */
   ipcMain.handle('ai:test-connection', async (_e, profile: 'main' | 'aux' | 'vision' = 'main') => {
     try {
-      const settings = await getSettings()
-      let model: string
-      let baseURL: string
-      let apiKey: string | null
-      if (profile === 'vision') {
-        const cfg = await resolveVisionConfig()
-        if (!cfg) return { ok: false, error: '未配置视觉模型（地址/模型/Key 需全部填写，视觉模型不回落主模型）' }
-        model = cfg.model
-        baseURL = cfg.baseURL
-        apiKey = cfg.apiKey
-      } else if (profile === 'aux') {
-        const aux = await resolveAuxLlmConfig()
-        model = (aux?.model ?? settings.model).trim()
-        baseURL = (aux?.baseURL ?? settings.baseURL).trim()
-        apiKey = aux?.apiKey || (await readApiKey())
-        if (!apiKey) return { ok: false, error: '未配置 API Key' }
-        if (!baseURL) return { ok: false, error: '未配置 API 地址（baseURL）' }
-        if (!model) return { ok: false, error: '未配置模型名（model）' }
-      } else {
-        apiKey = await readApiKey()
-        if (!apiKey) return { ok: false, error: '未配置 API Key' }
-        if (!settings.baseURL.trim()) return { ok: false, error: '未配置 API 地址（baseURL）' }
-        model = settings.model.trim() || 'gpt-4o-mini'
-        baseURL = settings.baseURL
+      const resolved =
+        profile === 'vision'
+          ? await resolveProfile('vision')
+          : (await resolveProfile('aux')) ?? (await resolveProfile('main'))
+      if (!resolved) {
+        const target = profile === 'vision' ? '视觉模型' : profile === 'aux' ? '辅助（或主）模型' : '主模型'
+        return { ok: false, error: `未配置${target}档案（地址/模型/Key 需完整），请先在「设置 → AI API 配置」中选择并配置` }
       }
       const content = await sendChatCompletion([{ role: 'user', content: 'ping' }], {
-        model,
-        baseURL,
-        apiKey,
+        model: resolved.model,
+        baseURL: resolved.baseURL,
+        apiKey: resolved.apiKey,
         stream: false,
         maxTokensOverride: 5,
         signal: new AbortController().signal,

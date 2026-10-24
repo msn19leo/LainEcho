@@ -13,7 +13,7 @@
  * AI 以自己的口吻消化后自然开口，而非硬拼模板话术。
  */
 import type { AppSettings } from '../../../src/types'
-import { readApiKey } from '../crypto'
+import { resolveProfile } from '../apiProfiles'
 import { sendChatCompletion } from '../aiClient'
 import { analyzeScreen } from './screenAnalyzer'
 
@@ -83,9 +83,10 @@ async function topicNarration(settings: AppSettings, charName: string): Promise<
   const fallback = topicNarrationTemplate(charName, settings.userName || '用户')
   if (!settings.proactiveLlmNarration) return fallback
   try {
-    const apiKey = await readApiKey()
-    if (!apiKey || !settings.baseURL.trim() || !settings.model.trim()) {
-      console.log('[proactive] LLM 旁白生成跳过：主 API 配置不完整')
+    // 主模型三元组走档案解析（档案制）：未激活档案时回退固定模板
+    const mainCfg = await resolveProfile('main')
+    if (!mainCfg) {
+      console.log('[proactive] LLM 旁白生成跳过：主模型档案未配置')
       return fallback
     }
     const system =
@@ -102,9 +103,9 @@ async function topicNarration(settings: AppSettings, charName: string): Promise<
         { role: 'user', content: user },
       ],
       {
-        model: settings.model,
-        baseURL: settings.baseURL,
-        apiKey,
+        model: mainCfg.model,
+        baseURL: mainCfg.baseURL,
+        apiKey: mainCfg.apiKey,
         temperature: 0.9,
         stream: false,
         maxTokensOverride: NARRATION_MAX_TOKENS,

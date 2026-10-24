@@ -4,6 +4,13 @@ import type { AppSettings, ThemeMode } from '../types'
 import { applyTheme } from '../lib/theme'
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  // 全局服务商档案库（档案制配置）：主/辅/视觉/嵌入各自引用其中一个档案
+  profiles: [],
+  activeMainProfileId: null,
+  activeAuxProfileId: null,
+  activeVisionProfileId: null,
+  activeEmbeddingProfileId: null,
+  // ↓ 旧版单配置字段（已废弃，仅保留类型兼容；运行时以激活档案为准）
   baseURL: '',
   model: '',
   temperature: 0.8,
@@ -26,6 +33,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   timeAwarenessEnabled: true,
   // 语音文本跟随语音逐字显示：默认开启（台词文本按音频播放进度逐字放行）
   voiceTextFollowAudio: true,
+  // 语音段截断二次重试时重载模型：默认开启（首次截断免重载直接重试；仍截断才按本开关重载兜底）
+  truncationReloadRetry: true,
+  // Genie 多句段严格判定：默认开启（多句段使用单独阈值，取消 20 字豁免）
+  genieMultiSentenceStrict: true,
+  // 多句段截断阈值：默认 0.9
+  genieMultiSentenceTruncationRatio: 0.9,
+  // 单句截断阈值：默认 0.55（保持原行为）
+  genieTruncationRatio: 0.55,
   // 情景摘要缓存：默认开启（每轮异步更新"此刻场景状态"，注入【当前情景】Section）
   enableSceneDigest: true,
   memoryDedupThreshold: 0.92,
@@ -48,63 +63,34 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 interface SettingsState {
   settings: AppSettings
-  hasApiKey: boolean
   loaded: boolean
   load: () => Promise<void>
   save: (patch: Partial<AppSettings>) => Promise<void>
+  /** 重新拉取设置（档案增删改/Key 保存后刷新掩码回显） */
+  refresh: () => Promise<void>
   /** 设置主题并立即应用到当前窗口 */
   setTheme: (theme: ThemeMode) => Promise<void>
-  /** 保存 API Key 成功后刷新 hasApiKey（面板占位符/提示据此更新） */
-  markKeyConfigured: () => void
   /** 主进程广播的最新设置整体写回本地（settings:changed），并应用主题；供各窗口实时同步 */
   applyRemote: (full: AppSettings) => void
 }
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
-  hasApiKey: false,
   loaded: false,
   load: async () => {
     try {
       const data = await api.settings.get()
-      set({
-        settings: {
-          baseURL: data.baseURL,
-          model: data.model,
-          temperature: data.temperature,
-          maxTokens: data.maxTokens,
-          stream: data.stream,
-          theme: data.theme,
-          contextWindowTokens: data.contextWindowTokens,
-          enableAutoCompact: data.enableAutoCompact,
-          enableMemoryExtraction: data.enableMemoryExtraction,
-          stripParenNarration: data.stripParenNarration,
-          memoryRetrievalEnabled: data.memoryRetrievalEnabled,
-          embeddingBaseURL: data.embeddingBaseURL,
-          embeddingModel: data.embeddingModel,
-          translationBaseURL: data.translationBaseURL,
-          translationModel: data.translationModel,
-          timeAwarenessEnabled: data.timeAwarenessEnabled,
-          voiceTextFollowAudio: data.voiceTextFollowAudio,
-          enableSceneDigest: data.enableSceneDigest,
-          memoryDedupThreshold: data.memoryDedupThreshold,
-          enableProactive: data.enableProactive,
-          enableScreenSense: data.enableScreenSense,
-          maxProactivePerDay: data.maxProactivePerDay,
-          proactiveInterestIntervalSec: data.proactiveInterestIntervalSec,
-          proactiveLlmNarration: data.proactiveLlmNarration,
-          quietHours: data.quietHours,
-          visionBaseURL: data.visionBaseURL,
-          visionModel: data.visionModel,
-          userName: data.userName,
-          textSpeed: data.textSpeed,
-          storyTextSpeed: data.storyTextSpeed,
-        },
-        hasApiKey: data.hasApiKey,
-        loaded: true,
-      })
+      set({ settings: { ...DEFAULT_SETTINGS, ...data }, loaded: true })
     } catch (err) {
       console.error('加载设置失败', err)
+    }
+  },
+  refresh: async () => {
+    try {
+      const data = await api.settings.get()
+      set({ settings: { ...get().settings, ...data } })
+    } catch (err) {
+      console.error('刷新设置失败', err)
     }
   },
   save: async (patch) => {
@@ -116,11 +102,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ settings: { ...get().settings, theme } })
     await api.settings.save({ theme })
   },
-  markKeyConfigured: () => set({ hasApiKey: true }),
   applyRemote: (full) => {
     applyTheme(full.theme)
-    // 广播负载（settings:save 返回值）为 AppSettings，不含 hasApiKey；沿用本地值即可
-    set((s) => ({ settings: { ...s.settings, ...full }, loaded: true }))
+    // 广播负载为主进程落盘后的完整 AppSettings（含档案库），整体替换
+    set({ settings: { ...DEFAULT_SETTINGS, ...full }, loaded: true })
   },
 }))
 

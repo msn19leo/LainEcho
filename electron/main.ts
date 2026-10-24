@@ -5,6 +5,7 @@ import { app } from 'electron'
 import { initLogger } from './services/logger'
 import { ensureDataDirs } from './services/storage'
 import { pruneEmptySessions, migrateSpriteEmotionMaps, dedupeFailedUserResends } from './services/repository'
+import { migrateApiProfiles } from './services/apiProfiles'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
 import { migrateMemoryPerspectives } from './services/memoryExtraction'
 import { startProactiveScheduler } from './services/proactive/scheduler'
@@ -33,6 +34,8 @@ if (!gotLock) {
     await pruneEmptySessions().catch((err) => console.error('清理空会话失败', err))
     // 重发去重清理（一次性、幂等）：移除"失败 user + 同内容重发 user"相邻重复对
     await dedupeFailedUserResends().catch((err) => console.error('重发去重清理失败', err))
+    // API 档案迁移（一次性、幂等）：旧单配置字段 + 各独立 Key 文件 → 首批服务商档案（须先于各窗口使用）
+    await migrateApiProfiles()
     registerPetProtocolHandler()
     registerAllIpc()
     windowManager.init()
@@ -41,8 +44,8 @@ if (!gotLock) {
     // 迁移会删除被改写记忆的旧向量，完成后再跑补偿，按新文本重嵌
     void migrateMemoryPerspectives().then(() => compensateMissingVectors())
 
-    // 立绘情绪迁移（一次性，幂等）：旧 emotionMap（6 枚举→图）→ 情绪词表条目并剥离旧字段
-    void migrateSpriteEmotionMaps().catch((err) => console.error('[migrate] 立绘情绪迁移失败', err))
+    // 立绘状态迁移（一次性，幂等）：旧 emotionMap（6 枚举→图）→ 状态词表条目并剥离旧字段
+    void migrateSpriteEmotionMaps().catch((err) => console.error('[migrate] 立绘状态迁移失败', err))
 
     // 示例剧本：首次启动写入 data/stories/（已存在不覆盖）
     await ensureSampleStories().catch((err) => console.error('[story] 示例剧本写入失败', err))

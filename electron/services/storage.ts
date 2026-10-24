@@ -53,29 +53,42 @@ export function getRootDir(): string {
 }
 
 /**
- * 将所有数据迁移到新目录。
- * 复制 data/、models/、live2d-core/ 三个子目录到目标路径，
- * 成功后写入配置文件，调用方负责 relaunch 应用。
+ * 迁移（移动）所有数据到新目录。
+ * 复制 data/、models/、live2d-core/、sprites/、tts-models/、logs/ 到目标路径，
+ * 复制成功并写入配置文件后**删除原目录里的这些子目录**，调用方负责重启应用。
+ *
+ * 删除放在写配置之后：配置写失败时源目录仍完整，不会丢数据；
+ * 单个子目录删除失败只告警（保留副本），不影响迁移结果。
  *
  * 注：参考音频存放于 data/voices/ 下，会随 data 子目录一起迁移。
  */
 export async function migrateDataDir(newDir: string): Promise<void> {
   const srcRoot = getRootDir()
+  const src = path.resolve(srcRoot)
+  const dest = path.resolve(newDir)
+  if (src === dest) throw new Error('新目录与当前数据目录相同')
+  // 目标落在源内部会导致复制递归（把 data 复制进 data/data…），直接拒绝
+  const rel = path.relative(src, dest)
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+    throw new Error('新目录不能位于当前数据目录内部')
+  }
   // 确保目标目录存在
-  await fs.mkdir(newDir, { recursive: true })
+  await fs.mkdir(dest, { recursive: true })
 
   // 需要迁移的子目录
-  const subDirs = ['data', 'models', 'live2d-core', 'sprites', 'tts-models']
+  const subDirs = ['data', 'models', 'live2d-core', 'sprites', 'tts-models', 'logs']
+  const copied: string[] = []
   for (const sub of subDirs) {
-    const src = path.join(srcRoot, sub)
-    const dest = path.join(newDir, sub)
+    const from = path.join(src, sub)
+    const to = path.join(dest, sub)
     try {
-      await fs.access(src)
-      // 递归复制（覆盖已存在文件）
-      await fs.cp(src, dest, { recursive: true, force: true })
+      await fs.access(from)
     } catch {
       // 源目录不存在则跳过（如尚未导入 Core）
+      continue
     }
+    await fs.cp(from, to, { recursive: true, force: true })
+    copied.push(from)
   }
 
   // 写入配置文件（始终在默认 userData 下）
@@ -84,6 +97,15 @@ export async function migrateDataDir(newDir: string): Promise<void> {
   const tmpPath = `${configPath}.tmp`
   await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), 'utf-8')
   await fs.rename(tmpPath, configPath)
+
+  // 迁移 = 移动：复制与切换都完成后清理原目录，避免新旧两份长期并存占空间
+  for (const from of copied) {
+    try {
+      await fs.rm(from, { recursive: true, force: true })
+    } catch (err) {
+      console.warn('[storage] 迁移后清理原目录失败（副本已保留）：', from, err)
+    }
+  }
 }
 
 /** 重置数据目录为默认位置（清除自定义配置，不删除数据） */
@@ -182,6 +204,14 @@ export const paths = {
   },
   get apiKeyFile() {
     return path.join(this.secureDir, 'apiKey.enc')
+  },
+  /** 服务商档案 Key 密文目录（档案制：每个档案一个 <profileId>.enc） */
+  get profileKeysDir() {
+    return path.join(this.secureDir, 'keys')
+  },
+  /** 指定服务商档案的 API Key 加密存储文件（profileId 会拼入路径，调用方须先校验格式） */
+  profileKeyFile(profileId: string) {
+    return path.join(this.profileKeysDir, `${profileId}.enc`)
   },
   /** MiMo TTS API Key 加密存储文件（与 LLM API Key 隔离） */
   get voiceApiKeyFile() {

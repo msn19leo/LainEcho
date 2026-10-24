@@ -7,10 +7,11 @@ import { bindWindowStateEvents, loadWindowPage } from './base'
 
 export function createSettingsWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width: 780,
-    height: 540,
-    minWidth: 760,
-    minHeight: 520,
+    // 1080：左侧导航 + 面板内容（max-w-5xl 约定）+「状态演出」等宽弹窗（~860）可完整容纳
+    width: 1080,
+    height: 640,
+    minWidth: 1060,
+    minHeight: 560,
     frame: false,
     show: false,
     backgroundColor: '#0f1115',

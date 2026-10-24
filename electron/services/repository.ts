@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'crypto'
 import type {
+  ApiProfile,
   AppSettings,
   CharacterCard,
   CharacterCardInput,
@@ -125,6 +126,8 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     voiceMode: raw.voiceMode ?? (raw.voiceId ? 'mimo' : 'none'),
     genieOverride: raw.genieOverride ?? null,
     ttsOverride: raw.ttsOverride ?? null,
+    // 角色 TTS 语速倍率（旧卡缺省 null = 原速）；范围钳制在变速函数内
+    ttsSpeed: typeof raw.ttsSpeed === 'number' && Number.isFinite(raw.ttsSpeed) ? raw.ttsSpeed : null,
     // 形象呈现（2D 立绘）；旧卡缺省 → Live2D 模式、未绑立绘
     renderMode: raw.renderMode ?? null,
     spriteId: raw.spriteId ?? null,
@@ -157,6 +160,7 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     voiceMode: input.voiceMode ?? (input.voiceId ? 'mimo' : 'none'),
     genieOverride: input.genieOverride ?? null,
     ttsOverride: input.ttsOverride ?? null,
+    ttsSpeed: typeof input.ttsSpeed === 'number' && Number.isFinite(input.ttsSpeed) ? input.ttsSpeed : null,
     renderMode: input.renderMode ?? null,
     spriteId: input.spriteId || null,
     avatar: input.avatar ?? null,
@@ -371,7 +375,7 @@ function formatMemoryAge(createdAt: number, now = Date.now()): string {
  * @param proactiveHint 是否注入主动搭话常驻说明（enableProactive 开启时为 true）
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入）
  * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：旁白规范段替换为禁括号版本
- * @param emotionPalette 角色绑定的情绪词表（null = 未启用词表，输出格式段维持旧 6 枚举金样原文）
+ * @param emotionPalette 角色绑定的状态词表（null = 未启用词表，输出格式段维持旧 6 枚举金样原文）
  * @param timeAwareness 时间感知总开关（缺省/undefined = 开启，向后兼容）：开启 → 当前时间锚点 +
  *   记忆年龄标注；关闭 → 防时间幻觉条款。记忆检索打分的 recency 因子属于排序逻辑，不受此开关影响
  */
@@ -718,7 +722,7 @@ export async function removeSprite(spriteId: string): Promise<void> {
   await deleteFile(paths.spriteDir(spriteId))
 }
 
-/** 更新立绘集的展示资产：情绪词表 / 经典情绪映射 / 说话立绘 / 思考立绘 / 名称 */
+/** 更新立绘集的展示资产：状态词表 / 经典状态映射 / 说话立绘 / 思考立绘 / 名称 */
 export async function updateSprite(
   spriteId: string,
   patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>,
@@ -730,7 +734,7 @@ export async function updateSprite(
 }
 
 /**
- * 读取立绘集的情绪词表视图（系统内唯一取词表入口，永不返回 null）：
+ * 读取立绘集的状态词表视图（系统内唯一取词表入口，永不返回 null）：
  * 立绘集不存在 / 未打标 → 内置最小词表（仅"平静"）。
  */
 export async function getSpritePalette(spriteId: string | null | undefined): Promise<EmotionPaletteRef> {
@@ -747,14 +751,14 @@ export async function getSpritePalette(spriteId: string | null | undefined): Pro
 
 // ---------------- Live2D 模型演出词表（data/model-palettes.json，与立绘集词表双轨对等） ----------------
 
-/** 模型词表存储形态：modelId → { entries }（纯「词→表情」映射，无默认情绪） */
+/** 模型词表存储形态：modelId → { entries }（纯「词→表情」映射，无默认状态） */
 type ModelPaletteStore = Record<string, ModelPalette>
 
 /**
  * 读取 Live2D 模型演出词表视图（live2d 模式取词表入口，永不返回 null）：
  * 模型不存在 / 未配置词表 → 内置最小词表（仅"平静"，无表情联动，回落静态表情）。
- * 模型词表无默认情绪概念：归一化兜底词固定取「平静」（在表内）或第一个词条，
- * 与 prompt 契约一致；未命中词条的情绪在渲染端不联动表情（查表落空 → 回落静态表情）。
+ * 模型词表无默认状态概念：归一化兜底词固定取「平静」（在表内）或第一个词条，
+ * 与 prompt 契约一致；未命中词条的状态在渲染端不联动表情（查表落空 → 回落静态表情）。
  */
 export async function getModelPalette(modelId: string | null | undefined): Promise<EmotionPaletteRef> {
   if (modelId) {
@@ -865,7 +869,7 @@ export async function migrateSpriteEmotionMaps(): Promise<number> {
 /**
  * 计算词表内容指纹（djb2 十六进制）：词/释义与顺序任一变化都会改变指纹。
  * 用于剧本 story.yaml 的 vocabHash 比对（打开剧本时检测"词表已变"）。
- * 指纹仅覆盖 name+gloss——vocabHash 的语义是「事件引用的情绪词是否仍有效」，
+ * 指纹仅覆盖 name+gloss——vocabHash 的语义是「事件引用的状态词是否仍有效」，
  * 演出物（立绘图/表情绑定）变化不影响词的有效性，不参与指纹。
  */
 export function paletteHash(palette: EmotionPaletteRef): string | null {
@@ -884,6 +888,16 @@ export function paletteHash(palette: EmotionPaletteRef): string | null {
 // ---------------- 设置 ----------------
 
 const DEFAULT_SETTINGS: AppSettings = {
+  // 全局服务商档案库（档案制配置）：主/辅/视觉/嵌入各自引用其中一个档案（启动迁移填充）
+  profiles: [],
+  activeMainProfileId: null,
+  // 辅助模型未启用（null）时回落主模型激活的档案
+  activeAuxProfileId: null,
+  // 视觉模型不回落主模型：未启用则屏幕感知降级、立绘打标不可用
+  activeVisionProfileId: null,
+  // 嵌入模型未启用则记忆向量检索关闭
+  activeEmbeddingProfileId: null,
+  // ↓ 以下 baseURL/model 为旧版单配置字段（已废弃），仅启动迁移读取一次
   baseURL: '',
   model: '',
   temperature: 0.8,
@@ -925,6 +939,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   timeAwarenessEnabled: true,
   // 语音文本跟随语音逐字显示：默认开启（台词文本按音频播放进度逐字放行）
   voiceTextFollowAudio: true,
+  // 语音段截断二次重试时重载模型：默认开启（首次截断免重载直接重试；仍截断才按本开关重载兜底）
+  truncationReloadRetry: true,
+  // Genie 多句段严格判定：默认开启（多句段使用单独阈值，取消 20 字豁免）
+  genieMultiSentenceStrict: true,
+  // 多句段截断阈值：默认 0.9（覆盖实测 0.64~0.87 的截断比例）
+  genieMultiSentenceTruncationRatio: 0.9,
+  // 单句截断阈值：默认 0.55（保持原行为）
+  genieTruncationRatio: 0.55,
   // 情景摘要缓存：默认开启（每轮异步更新"此刻场景状态"，注入【当前情景】Section）
   enableSceneDigest: true,
   // 语义去重相似度阈值（cos ≥ 阈值视为重复）
@@ -947,6 +969,16 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     const base = current ?? {}
     const next: Partial<AppSettings> = { ...base }
     // 仅合并白名单字段，避免污染
+    // 档案库：整体写回（渲染端档案管理区全量提交）；剔除非法条目与传输态 hasKey
+    if (patch.profiles !== undefined) {
+      next.profiles = (Array.isArray(patch.profiles) ? patch.profiles : [])
+        .filter((p): p is ApiProfile => !!p && typeof p.id === 'string' && /^prof_[0-9a-f]{12}$/.test(p.id))
+        .map((p) => ({ id: p.id, name: String(p.name ?? '').slice(0, 40), baseURL: String(p.baseURL ?? '').trim(), model: String(p.model ?? '').trim() }))
+    }
+    if (patch.activeMainProfileId !== undefined) next.activeMainProfileId = patch.activeMainProfileId
+    if (patch.activeAuxProfileId !== undefined) next.activeAuxProfileId = patch.activeAuxProfileId
+    if (patch.activeVisionProfileId !== undefined) next.activeVisionProfileId = patch.activeVisionProfileId
+    if (patch.activeEmbeddingProfileId !== undefined) next.activeEmbeddingProfileId = patch.activeEmbeddingProfileId
     if (patch.baseURL !== undefined) next.baseURL = patch.baseURL
     if (patch.model !== undefined) next.model = patch.model
     if (patch.temperature !== undefined) next.temperature = patch.temperature
@@ -975,6 +1007,18 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.translationModel !== undefined) next.translationModel = patch.translationModel
     if (patch.timeAwarenessEnabled !== undefined) next.timeAwarenessEnabled = patch.timeAwarenessEnabled
     if (patch.voiceTextFollowAudio !== undefined) next.voiceTextFollowAudio = patch.voiceTextFollowAudio
+    if (patch.truncationReloadRetry !== undefined) next.truncationReloadRetry = patch.truncationReloadRetry
+    if (patch.genieMultiSentenceStrict !== undefined) next.genieMultiSentenceStrict = !!patch.genieMultiSentenceStrict
+    if (patch.genieMultiSentenceTruncationRatio !== undefined) {
+      // 夹取 0.5~1.0：过低会漏判截断，过高会频繁误判重试
+      const v = Number(patch.genieMultiSentenceTruncationRatio)
+      next.genieMultiSentenceTruncationRatio = Number.isFinite(v) ? Math.min(1, Math.max(0.5, v)) : 0.9
+    }
+    if (patch.genieTruncationRatio !== undefined) {
+      // 夹取 0.3~0.9：保持单句原有判定区间
+      const v = Number(patch.genieTruncationRatio)
+      next.genieTruncationRatio = Number.isFinite(v) ? Math.min(0.9, Math.max(0.3, v)) : 0.55
+    }
     if (patch.enableSceneDigest !== undefined) next.enableSceneDigest = patch.enableSceneDigest
     if (patch.memoryDedupThreshold !== undefined) next.memoryDedupThreshold = patch.memoryDedupThreshold
     if (patch.userName !== undefined) next.userName = patch.userName

@@ -28,7 +28,7 @@ import type {
 import { BUILTIN_DEFAULT_EMOTION, paletteFromSprite, resolvePaletteImage } from '../types'
 import { cn } from '../lib/utils'
 
-/** 情绪中文名（对话框情绪标签；旧英文枚举词作显示兜底，词表自由词直接显示原词） */
+/** 状态中文名（对话框状态标签；旧英文枚举词作显示兜底，词表自由词直接显示原词） */
 const EMOTION_LABEL: Record<string, string> = {
   neutral: '平静',
   happy: '开心',
@@ -38,7 +38,7 @@ const EMOTION_LABEL: Record<string, string> = {
   shy: '害羞',
 }
 
-/** 情绪标签显示：旧英文枚举词走中文映射，其余显示原词 */
+/** 状态标签显示：旧英文枚举词走中文映射，其余显示原词 */
 function emotionLabel(word: string): string {
   return EMOTION_LABEL[word] ?? word
 }
@@ -492,7 +492,7 @@ export function StoryApp() {
           const sprites = await api.sprite.list()
           const spr = sprites.find((sp) => sp.id === s.spriteId) ?? null
           setSprite(spr)
-          // 初始情绪 = 词表默认情绪（默认展示跟随用户配置的默认词）
+          // 初始状态 = 词表默认状态（默认展示跟随用户配置的默认词）
           if (spr) setSpriteEmotion(paletteFromSprite(spr).defaultEmotion)
           try {
             const run = await api.story.getRun(s.runId)
@@ -595,17 +595,17 @@ export function StoryApp() {
   }, [])
 
   // ---- 立绘解析（词表单链）：thinkingImage（仅队列空闲且无当前段时，避免语音已起播仍锁思考图）
-  //      > 说话图（正在播放语音且情绪未命中/等于默认图时先落说话图，兜底顺序：说话图 → 默认情绪图）
-  //      > 词表图（命中词条图 → 默认情绪图；未打标集=内置最小词表，解析落首图）----
+  //      > 说话图（正在播放语音且状态未命中/等于默认图时先落说话图，兜底顺序：说话图 → 默认状态图）
+  //      > 词表图（命中词条图 → 默认状态图；未打标集=内置最小词表，解析落首图）----
   const speakingNow = phase === 'voice' && current?.kind === 'line' && current.speaker === 'ai'
   const spriteSrc = (() => {
     if (!sprite) return null
     if (snapshot?.thinking && phase === 'idle' && !current && sprite.thinkingImage) return api.story.spriteUrl(sprite.id, sprite.thinkingImage)
-    // 情绪查表（词表单链）：命中词条图 → 默认情绪图；未打标集（内置最小词表）= 首图
+    // 状态查表（词表单链）：命中词条图 → 默认状态图；未打标集（内置最小词表）= 首图
     const emotionFile = resolvePaletteImage(sprite, spriteEmotion)
-    // 说话图使用条件：正在说话且情绪=「平静」；默认情绪可设为其它词，说话时显示其对应图
+    // 说话图使用条件：正在说话且状态=「平静」；默认状态可设为其它词，说话时显示其对应图
     const calmFile = resolvePaletteImage(sprite, BUILTIN_DEFAULT_EMOTION)
-    // 说话图让位规则：语音播放中且情绪=平静（默认状态出场才让位，不覆盖真正的情绪演出）
+    // 说话图让位规则：语音播放中且状态=平静（默认状态出场才让位，不覆盖真正的状态演出）
     const speakingFile = sprite.speakingImage && sprite.images.some((i) => i.filePath === sprite.speakingImage) ? sprite.speakingImage : null
     if (speakingNow && speakingFile && (emotionFile == null || (calmFile != null && emotionFile === calmFile))) {
       return api.story.spriteUrl(sprite.id, speakingFile)

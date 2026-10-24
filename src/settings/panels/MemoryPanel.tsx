@@ -114,9 +114,6 @@ export function MemoryPanel() {
   /** 画像编辑态：true 时生效画像卡片变为 Textarea 编辑框 */
   const [editingProfile, setEditingProfile] = useState(false)
   const [profileDraft, setProfileDraft] = useState('')
-  /** 嵌入服务独立 Key：是否已配置（仅掩码回显）+ 输入框草稿 */
-  const [hasEmbeddingKey, setHasEmbeddingKey] = useState(false)
-  const [embeddingKeyInput, setEmbeddingKeyInput] = useState('')
   const [testingEmbed, setTestingEmbed] = useState(false)
 
   useEffect(() => {
@@ -124,7 +121,6 @@ export function MemoryPanel() {
     void loadPending()
     void loadCards()
     if (!settingsLoaded) void loadSettings()
-    void api.settings.hasEmbeddingApiKey().then(setHasEmbeddingKey).catch(() => setHasEmbeddingKey(false))
   }, [load, loadPending, loadCards, settingsLoaded, loadSettings])
 
   /** 画像 tab 归属键（global → '' = 全局档案）与显示名 */
@@ -259,20 +255,7 @@ export function MemoryPanel() {
     }
   }
 
-  /** 保存嵌入服务独立 API Key（留空 = 保持不变，与主 LLM Key 同样的加密通道） */
-  const handleSaveEmbeddingKey = async () => {
-    const key = embeddingKeyInput.trim()
-    if (!key) {
-      toast('请输入 Key（留空则保持不变）')
-      return
-    }
-    await api.settings.saveEmbeddingApiKey(key)
-    setEmbeddingKeyInput('')
-    setHasEmbeddingKey(await api.settings.hasEmbeddingApiKey())
-    toast('嵌入 API Key 已保存')
-  }
-
-  /** 测试嵌入配置连通性（地址/模型/Key 任一缺失或不通都会给出可读错误） */
+  /** 测试嵌入配置连通性（激活档案的地址/模型/Key 任一缺失或不通都会给出可读错误） */
   const handleTestEmbedding = async () => {
     setTestingEmbed(true)
     try {
@@ -402,13 +385,13 @@ export function MemoryPanel() {
         />
       </div>
 
-      {/* 记忆向量检索（嵌入服务独立配置：地址/模型/Key 均不复用主 LLM） */}
+      {/* 记忆向量检索（档案制：激活的嵌入档案提供 地址/模型/Key） */}
       <div className="space-y-3 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm text-text">记忆向量检索</div>
             <div className="text-xs text-text-muted">
-              按当前对话内容检索最相关的记忆注入（不再固定取最近几条）；关闭或未配置嵌入服务时回退旧行为
+              按当前对话内容检索最相关的记忆注入（不再固定取最近几条）；关闭或未启用嵌入档案时回退旧行为
             </div>
           </div>
           <Switch
@@ -416,33 +399,21 @@ export function MemoryPanel() {
             onChange={(v) => void saveSettings({ memoryRetrievalEnabled: v })}
           />
         </div>
-        <Input
-          value={settings.embeddingBaseURL}
-          onChange={(e) => void saveSettings({ embeddingBaseURL: e.target.value })}
-          placeholder="嵌入 API 地址（OpenAI 兼容 /embeddings，如 https://api.example.com/v1，可独立于聊天服务）"
-        />
         <div className="flex items-center gap-2">
-          <Input
-            value={settings.embeddingModel}
-            onChange={(e) => void saveSettings({ embeddingModel: e.target.value })}
-            placeholder="嵌入模型名（如 text-embedding-3-small / bge-m3）"
+          <span className="shrink-0 text-xs text-text-muted">嵌入档案</span>
+          <SelectMenu
+            value={settings.activeEmbeddingProfileId ?? ''}
+            onChange={(v) => void saveSettings({ activeEmbeddingProfileId: v || null })}
+            options={[{ value: '', label: '未启用' }, ...(settings.profiles ?? []).map((p) => ({ value: p.id, label: `${p.name} · ${p.model || '未填模型'}${p.hasKey ? '' : '（未配 Key）'}` }))]}
+            placeholder="未启用（选择一个档案）"
             className="min-w-0 flex-1"
           />
           <Button variant="outline" onClick={() => void handleTestEmbedding()} disabled={testingEmbed}>
             {testingEmbed ? '测试中…' : '测试连接'}
           </Button>
         </div>
-        <div className="flex items-center gap-2">
-          <Input
-            type="password"
-            value={embeddingKeyInput}
-            onChange={(e) => setEmbeddingKeyInput(e.target.value)}
-            placeholder={hasEmbeddingKey ? 'sk-****（已配置，留空保持不变）' : '嵌入服务 API Key（独立于聊天 Key）'}
-            className="min-w-0 flex-1"
-          />
-          <Button variant="outline" onClick={() => void handleSaveEmbeddingKey()} disabled={!embeddingKeyInput.trim()}>
-            保存 Key
-          </Button>
+        <div className="text-xs text-text-muted">
+          档案的地址/模型/Key 在「AI API 配置 → 服务商档案库」中维护；嵌入需选择支持 /embeddings 端点的服务（如 text-embedding-3-small / bge-m3）
         </div>
         <div className="flex items-center gap-2 text-xs text-text-muted">
           <span className="shrink-0">语义去重阈值</span>
@@ -460,7 +431,12 @@ export function MemoryPanel() {
           />
           <span>（cos ≥ 该值的候选记忆视为重复；默认 0.92）</span>
           <span className="flex-1" />
-          <Button variant="outline" size="sm" onClick={() => void handleReembed()} disabled={reembedding || !settings.embeddingModel.trim()}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleReembed()}
+            disabled={reembedding || !(settings.activeEmbeddingProfileId && (settings.profiles ?? []).some((p) => p.id === settings.activeEmbeddingProfileId))}
+          >
             <RefreshCw size={13} strokeWidth={2} className={reembedding ? 'animate-spin' : ''} />
             重新嵌入
           </Button>

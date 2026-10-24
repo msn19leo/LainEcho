@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { api } from '../api'
 import type { ChatMessage, SessionIndexItem } from '../types'
 import { useCharacterStore } from './characterStore'
+import { toast } from '../components/toast'
 
 interface SessionState {
   sessions: SessionIndexItem[]
@@ -154,8 +155,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         set({ messages: nextMessages, streaming: true, streamingContent: '', streamError: null })
 
         // 流式上屏、完成落定统一由 bindPersistentSessionSync 的持久订阅驱动（聊天窗/宠物窗两侧同步）
+        // invoke 拒绝只剩「轮次从未开始」的前置拒绝（busy/校验/IPC 错误）——轮次执行失败时主进程
+        // 返回 null、失败态由 stream-error 广播驱动。此处回滚本地预插入的 user 气泡（按引用精确
+        // 移除，不覆盖并发更新），以 toast 提示代替失败横幅，避免与在途对账竞态产生黄→红闪变。
         api.ai.sendMessage({ sessionId: currentSessionId, messages: nextMessages }).catch((err) => {
-          set({ streaming: false, streamError: err instanceof Error ? err.message : '消息发送失败' })
+          useSessionStore.setState((s) => ({
+            streaming: false,
+            messages: s.messages.filter((m) => m !== userMsg),
+          }))
+          toast(err instanceof Error ? err.message : '消息发送失败', 'error')
         })
         resolve()
       })()
@@ -238,16 +246,32 @@ export function bindPersistentSessionSync(): () => void {
   const unsubDone = api.ai.onStreamDone((payload) => {
     const st = useSessionStore.getState()
     if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
+    // ===== 原子落定 =====：streaming 复位与 assistant 消息入列表在同一次 setState。
+    // 旧实现先复位 streaming、再等 session:get 往返回来才更新 messages——间隙里
+    // 「末条是 user && !streaming」成立，失败提示横幅每轮收尾单帧闪现（2026-10-22 实锤），
+    // 且 LastAiSlot 定型渲染会短暂取到上一轮旧回答。payload.message 是主进程已落盘的
+    // assistant 消息，直接本地追加，间隙归零。
+    useSessionStore.setState((s) => {
+      const last = s.messages[s.messages.length - 1]
+      const alreadySettled =
+        !!payload.message && last?.role === 'assistant' && last.content === payload.message.content && last.timestamp === payload.message.timestamp
+      if (alreadySettled) return { streaming: false, streamError: null }
+      return {
+        streaming: false,
+        streamError: null,
+        messages: payload.message ? [...s.messages, payload.message] : s.messages,
+      }
+    })
+    // 后台对账：拉磁盘权威状态（补 meta/error/句级字段等），失败静默不阻塞 UI。
+    // 期间若已开新轮或切换会话则放弃（新轮自己的 done 会再对账），防止旧快照覆盖新状态。
     void (async () => {
-      useSessionStore.setState({ streaming: false })
       try {
         const detail = await api.session.get(payload.sessionId!)
-        // 落定 messages；streamingContent 保留给打字机"揭示完再落定"：跟读场景由朗读结束（pet active 下降沿）清空，
-        // 非跟读场景由 Typewriter complete+onDone 清空。避免此处过早清空导致跟读时"先全文后清空"闪跳。
-        useSessionStore.setState({ messages: detail.messages, streamError: null })
-        console.log('[bind] DONE setMsg=' + detail.messages.length, 'usr=' + detail.messages.filter((m) => m.role === 'user').length)
+        const cur = useSessionStore.getState()
+        if (cur.currentSessionId !== payload.sessionId || cur.streaming) return
+        useSessionStore.setState({ messages: detail.messages })
       } catch {
-        // 拉取失败：仍清空流式状态，不阻塞
+        // 对账失败不影响界面（本地已原子落定）
       }
       void refreshSessionIndex()
     })()
@@ -255,17 +279,30 @@ export function bindPersistentSessionSync(): () => void {
   const unsubError = api.ai.onStreamError((payload) => {
     const st = useSessionStore.getState()
     if (!payload?.sessionId || isStoryRunId(payload.sessionId) || payload.sessionId !== st.currentSessionId) return
+    // ===== 原子对齐 =====：与主进程落盘的失败态在同一次 setState 内对齐——
+    // user 消息就地替换为权威版本（error 具体原因 / meta.cancelled 标记），已流出部分收成的
+    // assistant 气泡原子追加。中途不出现「末条=user 且无标记」的假失败间隙，提示条无闪变。
     useSessionStore.setState((s) => {
-      const partial = s.streamingContent
-      const appended = partial
-        ? [...s.messages, { role: 'assistant' as const, content: partial, timestamp: Date.now() }]
-        : s.messages
+      let messages = s.messages
+      const failedUser = payload.userMessage
+      if (failedUser) {
+        const last = messages[messages.length - 1]
+        if (last?.role === 'user' && last.content === failedUser.content) {
+          // 本轮 user 已在本地（send/stream-user 预插入）：就地替换为落盘权威版本
+          messages = [...messages.slice(0, -1), failedUser]
+        } else if (!messages.some((m) => m.role === 'user' && m.content === failedUser.content)) {
+          // 本地缺用户气泡（中途开窗才收到失败广播）：补上
+          messages = [...messages, failedUser]
+        }
+      }
+      if (payload.partialMessage) {
+        // 已流出的部分收成 assistant 气泡：失败后已流出的文本不消失，LastAiSlot 定型渲染有据可依
+        messages = [...messages, payload.partialMessage]
+      }
       return {
-        messages: appended,
+        messages,
         streaming: false,
-        // 保留已流出的部分用于"揭示完再落定"：错误/停止后文字仍按设置速度揭示完再切定型
-        streamingContent: partial,
-        // 主动取消（停止）不算错误，不展示红色错误条
+        // 主动取消（停止）不算错误，不展示红色错误条；meta.cancelled 标记让「未收到回复」提示同样豁免
         streamError: payload.cancelled ? null : payload.error,
       }
     })

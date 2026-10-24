@@ -9,9 +9,9 @@
  *   避免同一段经历以"原文+摘要"双份进 prompt 的冗余。
  */
 import type { MemoryProfile } from '../../../src/types'
-import { readApiKey } from '../crypto'
 import { sendChatCompletion } from '../aiClient'
-import { getCharacterCard, getSettings, listMemories } from '../repository'
+import { resolveProfile } from '../apiProfiles'
+import { getCharacterCard, listMemories } from '../repository'
 import { normalizePerspective } from '../memoryExtraction'
 import { paths, readJson, mutateJson } from '../storage'
 
@@ -253,12 +253,11 @@ export function createConsolidator(cfg: { model: string; baseURL: string; apiKey
   }
 }
 
-/** 从主进程设置组装整理回调（未配置 API 时返回 null） */
+/** 从激活的主模型档案组装整理回调（未配置档案时返回 null） */
 export async function resolveConsolidator(): Promise<ConsolidateLlm | null> {
-  const settings = await getSettings()
-  const apiKey = await readApiKey().catch(() => null)
-  if (!apiKey || !settings.baseURL.trim() || !settings.model.trim()) return null
-  return createConsolidator({ model: settings.model, baseURL: settings.baseURL, apiKey })
+  const mainCfg = await resolveProfile('main').catch(() => null)
+  if (!mainCfg) return null
+  return createConsolidator(mainCfg)
 }
 
 /** 确认/新增记忆后的自动整理触发判断（超过阈值才发起，避免频繁调用） */

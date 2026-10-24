@@ -1,19 +1,20 @@
 /**
- * AI API 配置面板：三个独立折叠配置块（主模型 / 辅助模型 / 视觉模型），各自带"测试连接"与"保存"。
- *  - 主模型（必填）：主对话链（地址/Key/模型/温度/maxTokens/流式/上下文管理）
- *  - 辅助模型（可选）：翻译/结构修复/情景摘要等机械型文本任务；留空回落主模型
- *  - 视觉模型（可选）：屏幕感知/立绘打标两类图像理解任务；需支持图像输入，留空则相关功能不启用（不回落主模型）
- * 安全要点：
- *  - 三个 API Key 均仅回显掩码（已配置时占位符为 sk-****），不回显明文
- *  - Key 各走独立加密通道落盘（DPAPI/safeStorage）；输入留空 = 保持不变
- *  - 测试连接按 profile（main/aux/vision）测试各自回落后的生效配置
+ * AI API 配置面板（档案制，2026-10-19）：全局「服务商档案库」+ 四类模型各自激活一个档案。
+ *  - 档案 = 「名称 + API 地址 + 模型名 + Key」的可复用组合，集中管理、多处引用；
+ *  - 主模型（必填）/辅助模型（可选，未启用回落主模型）/视觉模型（可选，不回落）各自下拉选择激活档案；
+ *    嵌入模型的选择在「记忆体」面板（同一档案库）；
+ *  - Key 安全：按档案独立加密落盘（safeStorage/DPAPI），仅回显掩码（hasKey），明文不出主进程；
+ *  - 测试连接按「回落后生效配置」发极简请求（辅助未启用时回落主模型激活档案）。
  */
 import { useEffect, useState } from 'react'
-import { CheckCircle2, Cpu, Eye, XCircle, Zap } from 'lucide-react'
+import { Check, CheckCircle2, ChevronDown, Cpu, Eye, Pencil, Plus, RefreshCw, Trash2, XCircle, Zap } from 'lucide-react'
 import { api } from '../../api'
+import { cn } from '../../lib/utils'
 import { useSettingsStore } from '../../store/settingsStore'
-import { AccordionItem, Button, Field, Input, Loading, Switch } from '../../components/ui'
+import { AccordionItem, Button, ConfirmModal, Field, Input, Loading, Modal, Switch } from '../../components/ui'
+import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
+import type { ApiProfile } from '../../types'
 
 /** 测试对象 profile（与主进程 ai:test-connection 的参数对应） */
 type TestProfile = 'main' | 'aux' | 'vision'
@@ -22,6 +23,9 @@ interface TestResult {
   ok: boolean
   message: string
 }
+
+/** 档案编辑器状态：create = 新建；edit = 编辑已有档案 */
+type EditorState = { mode: 'create' } | { mode: 'edit'; profile: ApiProfile } | null
 
 /** 测试结果显示条（成功绿/失败红，三块复用） */
 function TestResultView({ result }: { result: TestResult | undefined }) {
@@ -40,31 +44,128 @@ function TestResultView({ result }: { result: TestResult | undefined }) {
   )
 }
 
-export function ApiConfigPanel() {
-  const { settings, hasApiKey, loaded, load, save, markKeyConfigured } = useSettingsStore()
+/** 档案下拉选项文案：名称 · 模型名（未配 Key 追加提示） */
+function profileLabel(p: ApiProfile): string {
+  const model = p.model.trim() || '未填模型'
+  return `${p.name} · ${model}${p.hasKey ? '' : '（未配 Key）'}`
+}
 
-  // 主模型：Key 输入（回显掩码，不回显明文）与保存中状态
-  const [apiKey, setApiKey] = useState('')
-  const [savingMain, setSavingMain] = useState(false)
-  // 辅助模型：独立 Key + 保存中状态
-  const [translationKeyInput, setTranslationKeyInput] = useState('')
-  const [hasTranslationKey, setHasTranslationKey] = useState(false)
-  const [savingAux, setSavingAux] = useState(false)
-  // 视觉模型：独立 Key + 保存中状态
-  const [visionKeyInput, setVisionKeyInput] = useState('')
-  const [hasVisionKey, setHasVisionKey] = useState(false)
-  const [savingVision, setSavingVision] = useState(false)
+/** 「未启用/未配置」占位选项 */
+const OFF_OPTION = { value: '', label: '未配置' }
+/** 辅助模型的关闭选项（语义 = 回落主模型激活档案） */
+const AUX_OFF_OPTION = { value: '', label: '未启用（回落主模型）' }
+
+export function ApiConfigPanel() {
+  const { settings, loaded, load, refresh, save } = useSettingsStore()
+  const profiles = settings.profiles ?? []
+
+  // 档案编辑器（Modal）与删除确认
+  const [editor, setEditor] = useState<EditorState>(null)
+  const [formName, setFormName] = useState('')
+  const [formBaseURL, setFormBaseURL] = useState('')
+  const [formModel, setFormModel] = useState('')
+  const [formKey, setFormKey] = useState('')
+  const [savingProfile, setSavingProfile] = useState(false)
+  const [deleting, setDeleting] = useState<ApiProfile | null>(null)
+
+  // 获取可用模型（OpenAI 兼容 /models）：列表展示在模型输入框下方，点击条目回填后收起
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const [modelOptions, setModelOptions] = useState<string[] | null>(null)
+  /** 模型下拉列表展开态：▼ 按钮切换，选择条目后自动收起 */
+  const [modelListOpen, setModelListOpen] = useState(false)
+
   // 测试连接：进行中的 profile + 各块结果（互不覆盖）
   const [testing, setTesting] = useState<TestProfile | null>(null)
   const [testResults, setTestResults] = useState<Partial<Record<TestProfile, TestResult>>>({})
 
   useEffect(() => {
     if (!loaded) void load()
-    void api.settings.hasTranslationApiKey().then(setHasTranslationKey).catch(() => {})
-    void api.settings.hasVisionApiKey().then(setHasVisionKey).catch(() => {})
   }, [loaded, load])
 
-  /** 测试连接（按 profile 测各自回落后的生效配置；辅助未配置时主进程回落测主模型） */
+  /** 打开档案编辑器（新建 = 空表单；编辑 = 回填档案本体，Key 恒留空待输入） */
+  const openEditor = (state: EditorState) => {
+    setEditor(state)
+    setFormName(state?.mode === 'edit' ? state.profile.name : '')
+    setFormBaseURL(state?.mode === 'edit' ? state.profile.baseURL : '')
+    setFormModel(state?.mode === 'edit' ? state.profile.model : '')
+    setFormKey('')
+    setModelOptions(null)
+    setModelListOpen(false)
+  }
+
+  /**
+   * 获取可用模型（OpenAI 兼容 /models）：baseURL 恒用表单现值（用户可能改了未保存）；
+   * Key = 表单现值优先，编辑态留空时主进程按 profileId 读存储密钥（明文不出主进程）
+   */
+  const handleFetchModels = async () => {
+    if (!editor) return
+    if (!formBaseURL.trim()) return toast('请先填写 API 地址（baseURL）', 'error')
+    setFetchingModels(true)
+    try {
+      const list = await api.settings.listModels({
+        profileId: editor.mode === 'edit' ? editor.profile.id : undefined,
+        baseURL: formBaseURL,
+        key: formKey.trim() || undefined,
+      })
+      setModelOptions(list)
+      setModelListOpen(true)
+      toast(`已获取 ${list.length} 个可用模型`)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '获取模型列表失败', 'error')
+    } finally {
+      setFetchingModels(false)
+    }
+  }
+
+  /** 保存档案（upsert；Key 输入留空 = 编辑时保持原 Key 不变），成功后刷新掩码回显 */
+  const handleSaveProfile = async () => {
+    if (!editor) return
+    if (!formName.trim()) return toast('请填写档案名称', 'error')
+    if (!formBaseURL.trim()) return toast('请填写 API 地址（baseURL）', 'error')
+    if (!formModel.trim()) return toast('请填写模型名（model）', 'error')
+    setSavingProfile(true)
+    try {
+      await api.settings.saveProfile({
+        id: editor.mode === 'edit' ? editor.profile.id : undefined,
+        name: formName,
+        baseURL: formBaseURL,
+        model: formModel,
+        key: formKey.trim() || undefined,
+      })
+      await refresh()
+      toast(editor.mode === 'edit' ? '档案已更新' : '档案已创建')
+      setEditor(null)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '保存失败', 'error')
+    } finally {
+      setSavingProfile(false)
+    }
+  }
+
+  /** 删除档案（被主/辅/视觉/嵌入任一类引用时主进程会拒绝并给出提示） */
+  const handleDeleteProfile = async () => {
+    if (!deleting) return
+    try {
+      await api.settings.deleteProfile(deleting.id)
+      await refresh()
+      toast('档案已删除')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '删除失败', 'error')
+    }
+  }
+
+  /** 切换某类模型的激活档案（立即落盘并广播同步；空串 = 未启用） */
+  const setActive = async (
+    field: 'activeMainProfileId' | 'activeAuxProfileId' | 'activeVisionProfileId',
+    value: string,
+  ) => {
+    const id = value || null
+    if (field === 'activeMainProfileId') await save({ activeMainProfileId: id })
+    else if (field === 'activeAuxProfileId') await save({ activeAuxProfileId: id })
+    else await save({ activeVisionProfileId: id })
+  }
+
+  /** 测试连接（按 profile 测各自回落后的生效配置；辅助未启用时主进程回落测主模型） */
   const handleTest = async (profile: TestProfile) => {
     setTesting(profile)
     try {
@@ -77,119 +178,71 @@ export function ApiConfigPanel() {
     }
   }
 
-  /** 保存主模型块：主字段 + 可选新主 Key（留空保持不变，加密存储不回显明文） */
-  const handleSaveMain = async () => {
-    setSavingMain(true)
-    try {
-      if (apiKey.trim()) {
-        await api.settings.saveApiKey(apiKey.trim())
-        markKeyConfigured() // 刷新掩码占位符与提示
-      }
-      await save({
-        baseURL: settings.baseURL.trim(),
-        model: settings.model.trim(),
-        temperature: Number.isFinite(Number(settings.temperature)) ? Number(settings.temperature) : 0.8,
-        maxTokens: Math.max(1, Math.round(Number(settings.maxTokens) || 1024)),
-        stream: settings.stream,
-        contextWindowTokens: Math.max(0, Math.round(Number(settings.contextWindowTokens) || 0)),
-        enableAutoCompact: settings.enableAutoCompact,
-        userName: settings.userName.trim() || '用户',
-      })
-      setApiKey('')
-      toast('主模型设置已保存')
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '保存失败', 'error')
-    } finally {
-      setSavingMain(false)
-    }
-  }
-
-  /** 保存辅助模型块（仅辅助模型两个字段；Key 走独立通道单独保存） */
-  const handleSaveAux = async () => {
-    setSavingAux(true)
-    try {
-      await save({ translationBaseURL: settings.translationBaseURL.trim(), translationModel: settings.translationModel.trim() })
-      toast('辅助模型设置已保存')
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '保存失败', 'error')
-    } finally {
-      setSavingAux(false)
-    }
-  }
-
-  /** 保存视觉模型块（仅视觉模型两个字段；Key 走独立通道单独保存） */
-  const handleSaveVision = async () => {
-    setSavingVision(true)
-    try {
-      await save({ visionBaseURL: settings.visionBaseURL.trim(), visionModel: settings.visionModel.trim() })
-      toast('视觉模型设置已保存')
-    } catch (err) {
-      toast(err instanceof Error ? err.message : '保存失败', 'error')
-    } finally {
-      setSavingVision(false)
-    }
-  }
-
-  /** 保存辅助模型独立 API Key（留空 = 保持不变，与主 LLM Key 同样的加密通道） */
-  const handleSaveTranslationKey = async () => {
-    const key = translationKeyInput.trim()
-    if (!key) {
-      toast('请输入 Key（留空则保持不变）')
-      return
-    }
-    await api.settings.saveTranslationApiKey(key)
-    setTranslationKeyInput('')
-    setHasTranslationKey(await api.settings.hasTranslationApiKey())
-    toast('辅助模型 API Key 已保存')
-  }
-
-  /** 保存视觉模型独立 API Key（留空 = 保持不变，与主 LLM Key 同样的加密通道） */
-  const handleSaveVisionKey = async () => {
-    const key = visionKeyInput.trim()
-    if (!key) {
-      toast('请输入 Key（留空则保持不变）')
-      return
-    }
-    await api.settings.saveVisionApiKey(key)
-    setVisionKeyInput('')
-    setHasVisionKey(await api.settings.hasVisionApiKey())
-    toast('视觉模型 API Key 已保存')
-  }
-
   if (!loaded) return <Loading />
+
+  // 各类型的当前激活档案（用于按钮禁用判定）
+  const mainActive = profiles.find((p) => p.id === settings.activeMainProfileId)
+  const auxActive = profiles.find((p) => p.id === settings.activeAuxProfileId)
+  const visionActive = profiles.find((p) => p.id === settings.activeVisionProfileId)
+  /** 主模型生效配置是否完整（辅助测试回落时也看它） */
+  const mainReady = !!mainActive && mainActive.hasKey
+  const profileOptions = profiles.map((p) => ({ value: p.id, label: profileLabel(p) }))
 
   return (
     <div className="space-y-4">
+      {/* ===== 服务商档案库（全局复用：名称 + 地址 + 模型 + Key） ===== */}
+      <AccordionItem title="服务商档案库" icon={<Plus size={15} strokeWidth={1.75} />} defaultOpen>
+        <div className="space-y-3">
+          <div className="text-xs leading-relaxed text-text-muted">
+            每个档案 = 一套「API 地址 + 模型名 + API Key」组合，集中管理、可被下方各类模型同时引用。
+            换服务商/换 Key 只需切换档案，无需逐处修改。嵌入模型的档案选择在「记忆体」面板。
+          </div>
+          {profiles.length === 0 && (
+            <div className="rounded-[var(--radius-md)] border border-dashed border-border px-4 py-6 text-center text-sm text-text-muted">
+              还没有档案，点击下方「新增档案」创建第一个
+            </div>
+          )}
+          {profiles.map((p) => (
+            <div key={p.id} className="flex items-center gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-medium text-text">{p.name}</span>
+                  <span className="shrink-0 rounded-full border border-border px-2 py-0.5 text-[11px] text-text-muted">
+                    {p.hasKey ? '已配 Key' : '未配 Key'}
+                  </span>
+                </div>
+                <div className="truncate text-xs text-text-muted">
+                  {p.model || '未填模型'} · {p.baseURL || '未填地址'}
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => openEditor({ mode: 'edit', profile: p })} title="编辑档案">
+                <Pencil size={14} strokeWidth={1.75} />
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setDeleting(p)} title="删除档案">
+                <Trash2 size={14} strokeWidth={1.75} />
+              </Button>
+            </div>
+          ))}
+          <Button variant="outline" onClick={() => openEditor({ mode: 'create' })}>
+            <Plus size={14} strokeWidth={2} />
+            新增档案
+          </Button>
+        </div>
+      </AccordionItem>
+
       {/* ===== 主模型（主对话链，必填） ===== */}
       <AccordionItem title="主模型" icon={<Cpu size={15} strokeWidth={1.75} />} defaultOpen>
         <div className="space-y-4">
-          <Field label="API 地址（baseURL）" hint="填写兼容 OpenAI 格式的接口地址，如 https://api.openai.com/v1">
-            <Input
-              value={settings.baseURL}
-              onChange={(e) => save({ baseURL: e.target.value })}
-              placeholder="https://api.openai.com/v1"
-            />
-          </Field>
-
           <Field
-            label="API Key"
-            hint={
-              hasApiKey
-                ? '已配置（sk-****）。留空保持不变；填写新值将替换原 Key（加密存储，不会回显明文）。'
-                : '以 Bearer 方式发送，经系统安全存储（DPAPI）加密后落盘。'
-            }
+            label="激活档案"
+            hint="主对话链使用的服务商档案；档案的地址/模型/Key 可在「服务商档案库」中修改"
           >
-            <Input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={hasApiKey ? 'sk-****（已配置）' : 'sk-...'}
-              autoComplete="off"
+            <SelectMenu
+              value={settings.activeMainProfileId ?? ''}
+              onChange={(v) => void setActive('activeMainProfileId', v)}
+              options={[OFF_OPTION, ...profileOptions]}
+              placeholder="未配置（选择一个档案）"
             />
-          </Field>
-
-          <Field label="模型（model）" hint="如 gpt-4o-mini等，需与 API 兼容">
-            <Input value={settings.model} onChange={(e) => save({ model: e.target.value })} placeholder="gpt-4o-mini" />
           </Field>
 
           <div className="grid grid-cols-2 gap-4">
@@ -260,55 +313,31 @@ export function ApiConfigPanel() {
 
           <TestResultView result={testResults.main} />
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void handleTest('main')} disabled={testing !== null || !hasApiKey}>
+            <Button variant="outline" onClick={() => void handleTest('main')} disabled={testing !== null || !mainReady}>
               {testing === 'main' ? '测试中…' : '测试连接'}
-            </Button>
-            <Button onClick={() => void handleSaveMain()} disabled={savingMain}>
-              {savingMain ? '保存中…' : '保存'}
             </Button>
           </div>
         </div>
       </AccordionItem>
 
-      {/* ===== 辅助模型（翻译/结构修复/情景摘要，可选，留空回落主模型） ===== */}
+      {/* ===== 辅助模型（翻译/结构修复/情景摘要，可选，未启用回落主模型档案） ===== */}
       <AccordionItem title="辅助模型（翻译 / 结构修复 / 情景摘要）（可选）" icon={<Zap size={15} strokeWidth={1.75} />} defaultOpen={false}>
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
             日语翻译、JSON 修复与情景摘要更新都是机械型小任务：前两者串行在语音首响路径上，情景摘要在每轮
-            结束后后台异步更新。建议配置非思考的快速小模型（如 gemini-flash / qwen-turbo / deepseek-chat），
-            留空则使用主对话模型
+            结束后后台异步更新。建议激活非思考的快速小模型档案（如 gemini-flash / qwen-turbo / deepseek-chat），
+            未启用则使用主模型激活的档案
           </div>
-          <Input
-            value={settings.translationBaseURL}
-            onChange={(e) => save({ translationBaseURL: e.target.value })}
-            placeholder="辅助模型 API 地址（如 https://api.example.com/v1，留空使用主模型 API 地址）"
+          <SelectMenu
+            value={settings.activeAuxProfileId ?? ''}
+            onChange={(v) => void setActive('activeAuxProfileId', v)}
+            options={[AUX_OFF_OPTION, ...profileOptions]}
+            placeholder="未启用（回落主模型）"
           />
-          <Input
-            value={settings.translationModel}
-            onChange={(e) => save({ translationModel: e.target.value })}
-            placeholder="辅助模型名（如 gemini-2.0-flash，留空使用主模型）"
-          />
-          <div className="flex items-center gap-2">
-            <Input
-              type="password"
-              value={translationKeyInput}
-              onChange={(e) => setTranslationKeyInput(e.target.value)}
-              placeholder={hasTranslationKey ? 'sk-****（已配置，留空保持不变）' : '辅助模型 API Key（留空使用主 Key）'}
-              className="min-w-0 flex-1"
-            />
-            <Button variant="outline" onClick={() => void handleSaveTranslationKey()} disabled={!translationKeyInput.trim()}>
-              保存 Key
-            </Button>
-          </div>
           <TestResultView result={testResults.aux} />
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void handleTest('aux')} disabled={testing !== null}>
-              {testing === 'aux' ? '测试中…' : '测试连接'}
-            </Button>
-            <Button onClick={() => void handleSaveAux()} disabled={savingAux}>
-              {savingAux ? '保存中…' : '保存'}
-            </Button>
-          </div>
+          <Button variant="outline" onClick={() => void handleTest('aux')} disabled={testing !== null || !(auxActive?.hasKey || mainReady)}>
+            {testing === 'aux' ? '测试中…' : '测试连接'}
+          </Button>
         </div>
       </AccordionItem>
 
@@ -317,42 +346,115 @@ export function ApiConfigPanel() {
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
             用于屏幕感知（角色"偷看"桌面转述话题）与立绘集 AI 视觉打标两类图像理解任务，
-            需选择支持图像输入的多模态模型（如 gemini-flash / qwen-vl / gpt-4o-mini）。
-            留空则相关功能不启用：屏幕感知自动降级为普通话题，立绘打标不可用
+            需激活支持图像输入的多模态模型档案（如 gemini-flash / qwen-vl / gpt-4o-mini）。
+            未启用则相关功能不使用：屏幕感知自动降级为普通话题，立绘打标不可用（不回落主模型）
           </div>
-          <Input
-            value={settings.visionBaseURL}
-            onChange={(e) => save({ visionBaseURL: e.target.value })}
-            placeholder="视觉模型 API 地址（OpenAI 兼容 chat/completions，需支持图片输入）"
+          <SelectMenu
+            value={settings.activeVisionProfileId ?? ''}
+            onChange={(v) => void setActive('activeVisionProfileId', v)}
+            options={[OFF_OPTION, ...profileOptions]}
+            placeholder="未启用（选择一个档案）"
           />
-          <Input
-            value={settings.visionModel}
-            onChange={(e) => save({ visionModel: e.target.value })}
-            placeholder="视觉模型名（如 qwen-vl-plus / gpt-4o-mini）"
-          />
-          <div className="flex items-center gap-2">
-            <Input
-              type="password"
-              value={visionKeyInput}
-              onChange={(e) => setVisionKeyInput(e.target.value)}
-              placeholder={hasVisionKey ? 'sk-****（已配置，留空保持不变）' : '视觉模型 API Key（独立于主 Key）'}
-              className="min-w-0 flex-1"
-            />
-            <Button variant="outline" onClick={() => void handleSaveVisionKey()} disabled={!visionKeyInput.trim()}>
-              保存 Key
-            </Button>
-          </div>
           <TestResultView result={testResults.vision} />
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void handleTest('vision')} disabled={testing !== null}>
-              {testing === 'vision' ? '测试中…' : '测试连接'}
-            </Button>
-            <Button onClick={() => void handleSaveVision()} disabled={savingVision}>
-              {savingVision ? '保存中…' : '保存'}
-            </Button>
-          </div>
+          <Button variant="outline" onClick={() => void handleTest('vision')} disabled={testing !== null || !visionActive?.hasKey}>
+            {testing === 'vision' ? '测试中…' : '测试连接'}
+          </Button>
         </div>
       </AccordionItem>
+
+      {/* ===== 档案编辑器（Modal） ===== */}
+      <Modal
+        open={editor !== null}
+        onClose={() => setEditor(null)}
+        title={editor?.mode === 'edit' ? '编辑档案' : '新增档案'}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setEditor(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void handleSaveProfile()} disabled={savingProfile}>
+              {savingProfile ? '保存中…' : '保存'}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <Field label="档案名称">
+            <Input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="如 DeepSeek 官方 / 硅基流动" />
+          </Field>
+          <Field label="API 地址（baseURL）" hint="兼容 OpenAI 格式的接口地址，如 https://api.openai.com/v1">
+            <Input value={formBaseURL} onChange={(e) => setFormBaseURL(e.target.value)} placeholder="https://api.openai.com/v1" />
+          </Field>
+          <Field label="模型（model）" hint="如 deepseek-chat / gpt-4o-mini，需与该 API 兼容；可点「获取可用模型」从服务商拉取列表">
+            <div className="flex gap-2">
+              <Input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="deepseek-chat" className="min-w-0 flex-1" />
+              <Button
+                variant="outline"
+                onClick={() => setModelListOpen((v) => !v)}
+                disabled={fetchingModels || !modelOptions || modelOptions.length === 0}
+                title={modelOptions && modelOptions.length > 0 ? '展开/收起可用模型列表' : '先获取可用模型'}
+                className="shrink-0 px-2"
+              >
+                <ChevronDown size={14} strokeWidth={1.75} className={cn('transition-transform', modelListOpen && 'rotate-180')} />
+              </Button>
+              <Button variant="outline" onClick={() => void handleFetchModels()} disabled={fetchingModels || !formBaseURL.trim()} title={!formBaseURL.trim() ? '先填写 API 地址' : '从该服务商拉取可用模型列表'} className="shrink-0">
+                <RefreshCw size={14} strokeWidth={1.75} className={fetchingModels ? 'animate-spin' : undefined} />
+                {fetchingModels ? '获取中…' : '获取可用模型'}
+              </Button>
+            </div>
+            {modelListOpen && modelOptions !== null && modelOptions.length > 0 && (
+              <div className="mt-2 max-h-44 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface-2">
+                {modelOptions.map((id) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => {
+                      setFormModel(id)
+                      setModelListOpen(false)
+                    }}
+                    className={cn(
+                      'flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px] transition-colors',
+                      formModel === id
+                        ? 'bg-accent/15 font-medium text-accent'
+                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-surface-hover)] hover:text-[var(--text-primary)]',
+                    )}
+                  >
+                    <span className="min-w-0 truncate">{id}</span>
+                    {formModel === id && <Check size={14} strokeWidth={2} className="shrink-0" />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </Field>
+          <Field
+            label="API Key"
+            hint={
+              editor?.mode === 'edit' && editor.profile.hasKey
+                ? '已配置（sk-****）。留空保持不变；填写新值将替换原 Key（加密存储，不会回显明文）。'
+                : '以 Bearer 方式发送，经系统安全存储（DPAPI）加密后落盘。'
+            }
+          >
+            <Input
+              type="password"
+              value={formKey}
+              onChange={(e) => setFormKey(e.target.value)}
+              placeholder={editor?.mode === 'edit' && editor.profile.hasKey ? 'sk-****（已配置，留空保持不变）' : 'sk-...'}
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+      </Modal>
+
+      {/* ===== 删除确认 ===== */}
+      <ConfirmModal
+        open={deleting !== null}
+        title="删除档案"
+        message={`确定删除档案「${deleting?.name ?? ''}」吗？其 API Key 将一并清除；正在被使用的档案无法删除。`}
+        confirmText="删除"
+        danger
+        onConfirm={() => void handleDeleteProfile()}
+        onClose={() => setDeleting(null)}
+      />
     </div>
   )
 }

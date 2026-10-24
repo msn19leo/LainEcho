@@ -17,11 +17,48 @@
 import { powerMonitor } from 'electron'
 import { sendChatCompletion } from './aiClient'
 import { resolveAuxLlmConfig } from './auxModel'
+import type { ResolvedLlmConfig } from './apiProfiles'
 import { updateSessionSceneDigest } from './repository'
-import type { AppSettings } from '../../src/types'
+import type { AppSettings, CharacterPersona } from '../../src/types'
 
 /** 摘要长度上限（防御性截断）：正常输出 ≤120 字，超长说明模型跑偏 */
 const DIGEST_MAX_CHARS = 400
+
+/** 按小时返回时段描述（摘要更新 prompt 的"当前时间"锚，防模型照抄示例/旧时间） */
+function dayPart(hour: number): string {
+  if (hour >= 5 && hour < 8) return '清晨'
+  if (hour >= 8 && hour < 11) return '上午'
+  if (hour >= 11 && hour < 13) return '中午'
+  if (hour >= 13 && hour < 17) return '下午'
+  if (hour >= 17 && hour < 19) return '傍晚'
+  if (hour >= 19 && hour < 23) return '晚上'
+  return '深夜'
+}
+
+/** 当前本地时间的摘要用文本：`2026-10-19 14:30（下午）` */
+function formatNow(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}（${dayPart(d.getHours())}）`
+}
+
+/**
+ * 角色速写（摘要更新的"人设锚"）：抽取角色卡中与动作/情绪风格相关的字段
+ * （存在锚点 / 情绪处理 / 日常状态 / 特殊语言行为），供辅助模型转述"角色状态/动作"时
+ * 保持角色特有动作特征（种族特征/习惯性动作），不泛化为通用动作。空卡返回空串。
+ */
+export function buildCharacterBrief(card: { name: string; persona: CharacterPersona } | null | undefined): string {
+  if (!card) return ''
+  const p = card.persona
+  const parts = [
+    p.anchor?.trim(),
+    p.perception?.emotion?.trim() && `情绪表达：${p.perception.emotion.trim()}`,
+    p.state?.daily?.trim() && `日常状态：${p.state.daily.trim()}`,
+    p.language?.habits?.trim() && `语言/动作习惯：${p.language.habits.trim()}`,
+  ].filter((v): v is string => !!v)
+  const brief = parts.join('；')
+  return brief ? `${card.name}：${brief}`.slice(0, 240) : ''
+}
 
 /** 用户设备状态行（系统层）：空闲 <90s 视为正在使用 */
 function deviceActivityLine(): string {
@@ -68,34 +105,43 @@ export async function updateSceneDigestAfterTurn(params: {
   prevDigest: string | null | undefined
   userText: string
   assistantText: string
+  /** 角色速写（buildCharacterBrief 产物）：辅助模型转述"角色状态/动作"的人设锚，空串 = 无 */
+  characterBrief?: string | null
   settings: AppSettings
-  apiKey: string
+  /** 主模型激活档案解析出的生效三元组（辅助未启用时回落使用） */
+  mainCfg: ResolvedLlmConfig
 }): Promise<void> {
-  const { sessionId, prevDigest, userText, assistantText, settings, apiKey } = params
+  const { sessionId, prevDigest, userText, assistantText, characterBrief, settings, mainCfg } = params
   if (!settings.enableSceneDigest) return
   const prev = prevDigest?.trim() ?? ''
   try {
-    // 辅助模型（未配置回落主对话模型）：机械型小任务，快速小模型足够
+    // 辅助模型（未激活档案回落主模型档案）：机械型小任务，快速小模型足够
     const aux = await resolveAuxLlmConfig()
-    const model = (aux?.model ?? settings.model).trim()
-    const baseURL = (aux?.baseURL ?? settings.baseURL).trim()
-    const key = aux?.apiKey || apiKey
+    const model = (aux?.model ?? mainCfg.model).trim()
+    const baseURL = (aux?.baseURL ?? mainCfg.baseURL).trim()
+    const key = aux?.apiKey || mainCfg.apiKey
     if (!baseURL || !model || !key) return
     const system = [
       '你是场景状态记录员。根据"旧摘要"和"本轮对话"，输出更新后的当前情景摘要。',
       '规则：',
       '- 只保留此刻仍然有效的状态；已被新动作取代的旧状态必须更新',
       '- 只描述对话中明确支持的内容，不确定的不要编造',
-      '- 不超过 120 字，逐行输出（每行一条）：用户状态/活动：…｜角色状态/动作：…｜场景与氛围：…（场景与氛围必须包含当前时段与光线环境，如"夜晚·室内暖灯·窗外全黑"）',
+      '- 「角色状态/动作」必须符合"角色设定"与本轮对话中角色的实际表现，保留角色的特有动作特征（种族特征/习惯性动作），不得泛化为通用动作',
+      '- 不超过 120 字，逐行输出（每行一条）：用户状态/活动：…｜角色状态/动作：…｜场景与氛围：…',
+      '- 「场景与氛围」的时段与光线必须按【当前时间】推断（白天=自然光、夜晚=灯光等），禁止输出与当前时间不符的时段或光线；对话中提到的旧时间（如早些时候说过"下午"）不作为当前时段依据',
       prev ? '- "旧摘要"中仍然有效的行可以保留' : '',
       '- 若场景没有任何变化，只输出 UNCHANGED',
     ]
       .filter(Boolean)
       .join('\n')
     const user = [
+      `【当前时间】${formatNow()}`,
+      characterBrief?.trim() ? `【角色设定】\n${characterBrief.trim()}` : '',
       prev ? `【旧摘要】\n${prev}` : '【旧摘要】\n（无，这是第一条摘要）',
       `【本轮对话】\n用户：${userText}\n角色：${assistantText}`,
-    ].join('\n\n')
+    ]
+      .filter(Boolean)
+      .join('\n\n')
     const out = await sendChatCompletion(
       [
         { role: 'system', content: system },

@@ -46,6 +46,7 @@ import {
   Loading,
   Modal,
   SegmentedControl,
+  Slider,
   Textarea,
 } from '../../components/ui'
 import { SelectMenu } from '../../components/DropdownMenu'
@@ -100,6 +101,8 @@ interface EditorState {
   ttsModelId: string
   // TTS 覆盖
   ttsLanguageOverride: 'global' | TTSLanguage
+  // 角色 TTS 语速倍率（0.75–1.5；1 = 原速，两引擎通用）
+  ttsSpeed: number
   // 形象呈现（2D 立绘 / Live2D 并行切换）
   /** 'global' = 跟随全局当前形象（角色模型面板中选 live2d 还是立绘） */
   renderMode: 'global' | RenderMode
@@ -118,6 +121,7 @@ const EMPTY_EDITOR: EditorState = {
   voiceMode: 'none',
   ttsModelId: '',
   ttsLanguageOverride: 'global',
+  ttsSpeed: 1,
   renderMode: 'global',
   spriteId: '',
 }
@@ -290,6 +294,7 @@ export function CharacterCardPanel() {
       voiceMode: card.voiceMode ?? (card.voiceId ? 'mimo' : 'none'),
       ttsModelId: card.genieOverride?.ttsModelId ?? '',
       ttsLanguageOverride: ttsLanguageToEditor(card.ttsOverride),
+      ttsSpeed: card.ttsSpeed ?? 1,
       renderMode: card.renderMode ?? 'global',
       spriteId: card.spriteId ?? '',
     })
@@ -313,6 +318,7 @@ export function CharacterCardPanel() {
             ? { ttsModelId: editor.ttsModelId }
             : null,
         ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride),
+        ttsSpeed: editor.ttsSpeed,
         renderMode: editor.renderMode === 'global' ? null : editor.renderMode,
         spriteId: editor.spriteId || null,
         avatar: editor.card?.avatar ?? null,
@@ -645,7 +651,7 @@ export function CharacterCardPanel() {
                         rows={3}
                         value={editor.persona.you.stance}
                         onChange={(e) => updatePersonaGroup('you', { stance: e.target.value })}
-                        placeholder="例：对一个渴望被连接的角色来说——你是她目前为止感觉频率最接近的人，但她还没确定这是不是真实的。"
+                        placeholder="例：对一个渴望被连接的人来说——你是我目前为止感觉频率最接近的人，但我还没确定这是不是真实的。"
                       />
                     </Field>
                     <Field
@@ -827,7 +833,7 @@ export function CharacterCardPanel() {
                       />
                     </Field>
                     {editor.spriteId && (
-                      <p className="text-xs text-text-muted">情绪映射使用角色模型中 2D 立绘卡所设置的情绪映射</p>
+                      <p className="text-xs text-text-muted">状态映射使用角色模型中 2D 立绘卡所设置的状态映射</p>
                     )}
                   </>
                 ) : (
@@ -897,6 +903,18 @@ export function CharacterCardPanel() {
                         className="w-full"
                       />
                     </Field>
+                    <Field label="TTS 语速" hint="该角色说话的语速倍率（1 = 原速）。主进程合成后重采样变速，过快/过慢会有明显变调。">
+                      <div className="w-full">
+                        <Slider
+                          value={editor.ttsSpeed}
+                          min={0.75}
+                          max={1.5}
+                          step={0.05}
+                          onChange={(v) => setEditor({ ...editor, ttsSpeed: Math.round(v * 100) / 100 })}
+                          format={(v) => `${v.toFixed(2)}x`}
+                        />
+                      </div>
+                    </Field>
                   </>
                 )}
 
@@ -926,6 +944,18 @@ export function CharacterCardPanel() {
                         ]}
                         className="w-full"
                       />
+                    </Field>
+                    <Field label="TTS 语速" hint="该角色说话的语速倍率（1 = 原速）。主进程合成后重采样变速，过快/过慢会有明显变调。">
+                      <div className="w-full">
+                        <Slider
+                          value={editor.ttsSpeed}
+                          min={0.75}
+                          max={1.5}
+                          step={0.05}
+                          onChange={(v) => setEditor({ ...editor, ttsSpeed: Math.round(v * 100) / 100 })}
+                          format={(v) => `${v.toFixed(2)}x`}
+                        />
+                      </div>
                     </Field>
                     {!editor.voiceId && (
                       <p className="text-xs text-text-muted">选择参考音频后可配置语言覆盖</p>

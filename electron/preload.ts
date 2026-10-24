@@ -144,20 +144,12 @@ const api: WindowApi = {
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
-    saveApiKey: (key) => ipcRenderer.invoke('settings:save-api-key', key),
-    hasApiKey: () => ipcRenderer.invoke('settings:has-api-key'),
-    /** 保存嵌入服务独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
-    saveEmbeddingApiKey: (key) => ipcRenderer.invoke('settings:save-embedding-api-key', key),
-    /** 嵌入服务 Key 是否已配置（仅回显掩码用） */
-    hasEmbeddingApiKey: () => ipcRenderer.invoke('settings:has-embedding-api-key'),
-    /** 保存屏幕感知视觉模型独立 API Key（safeStorage 加密，与主 LLM Key 隔离） */
-    saveVisionApiKey: (key) => ipcRenderer.invoke('settings:save-vision-api-key', key),
-    /** 视觉模型 Key 是否已配置（仅回显掩码用） */
-    hasVisionApiKey: () => ipcRenderer.invoke('settings:has-vision-api-key'),
-    /** 保存翻译/修复辅助模型独立 API Key（safeStorage 加密；为空时运行时回落主 LLM Key） */
-    saveTranslationApiKey: (key) => ipcRenderer.invoke('settings:save-translation-api-key', key),
-    /** 翻译/修复辅助模型 Key 是否已配置（仅回显掩码用） */
-    hasTranslationApiKey: () => ipcRenderer.invoke('settings:has-translation-api-key'),
+    /** 新建/更新服务商档案（upsert；key 非空时保存该档案的 API Key，加密落盘） */
+    saveProfile: (profile) => ipcRenderer.invoke('settings:save-profile', profile),
+    /** 删除服务商档案（被引用时主进程抛错） */
+    deleteProfile: (id) => ipcRenderer.invoke('settings:delete-profile', id),
+    /** 拉取档案服务商的可用模型列表（OpenAI 兼容 /models；key 缺省时主进程按 profileId 读存储密钥） */
+    listModels: (input) => ipcRenderer.invoke('settings:list-models', input),
     getDataDir: () => ipcRenderer.invoke('settings:get-data-dir'),
     changeDataDir: () => ipcRenderer.invoke('settings:change-data-dir'),
     resetDataDir: () => ipcRenderer.invoke('settings:reset-data-dir'),
@@ -238,13 +230,13 @@ const api: WindowApi = {
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步）；
      *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本 */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null; displayOnly?: boolean }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null; displayOnly?: boolean; ttsSpeed?: number | null }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
     /** renderer 就绪通知（用于向主进程补发最近语音模式） */
     reportRendererReady: () => ipcRenderer.send('pet:renderer-ready'),
-    /** 订阅 AI 回复情绪事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
+    /** 订阅 AI 回复状态事件（主进程聊天完成时广播，桌宠切表情/切立绘） */
     onEmotion: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, emotion: string) => cb(emotion)
       ipcRenderer.on('pet:emotion', listener)

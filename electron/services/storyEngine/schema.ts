@@ -20,7 +20,7 @@ import type {
   StoryEvent,
 } from '../../../src/types'
 
-/** 旧 6 标准情绪（保留词集）：词表方案下仍合法的历史值，导入校验只要求非空字符串 */
+/** 旧 6 标准状态（保留词集）：词表方案下仍合法的历史值，导入校验只要求非空字符串 */
 export const STANDARD_EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy'] as const
 
 /** 校验错误（file = 剧本包内相对路径） */
@@ -53,7 +53,7 @@ function asString(v: unknown): string | null {
 /**
  * 校验 emotion 字段（词表方案）：只需是非空字符串。
  * 值域 = 剧本绑定立绘集的词表（编辑器下拉动态生成，从源头防拼错）；导入外部剧本遇到未知词时
- * 不再硬拦（运行时归一化链会降级到默认情绪，比阻断导入更稳）。缺省合法。
+ * 不再硬拦（运行时归一化链会降级到默认状态，比阻断导入更稳）。缺省合法。
  */
 function checkEmotion(raw: Unknown, file: string, index: number, errors: SchemaIssue[], field = 'emotion'): void {
   const v = raw[field]
@@ -61,7 +61,7 @@ function checkEmotion(raw: Unknown, file: string, index: number, errors: SchemaI
   if (typeof v === 'string' && v.trim()) return
   errors.push({
     file,
-    message: `事件 #${index + 1}：${field} 必须是非空字符串（情绪词，来自剧本绑定立绘集的词表），实际为「${String(v)}」`,
+    message: `事件 #${index + 1}：${field} 必须是非空字符串（状态词，来自剧本绑定立绘集的词表），实际为「${String(v)}」`,
   })
 }
 
@@ -451,7 +451,7 @@ export function validateMeta(raw: unknown, file: string): SchemaResult<ScriptMet
   }
   // AI 背景联动开关（7.3）：默认关闭——仅作者显式 aiBackground: true 时允许 AI 自行切背景
   const aiBackground = raw['aiBackground'] === true
-  // 创作词表来源（情绪词表方案）：可选，指向立绘集 id；编辑器情绪下拉按该集词表生成
+  // 创作词表来源（状态词表方案）：可选，指向立绘集 id；编辑器状态下拉按该集词表生成
   const spriteSetId = asString(raw['spriteSetId']) ?? undefined
   // 词表内容指纹（表单保存时写入）：可选，仅用于打开剧本时检测词表已变，不参与结构校验
   const vocabHash = asString(raw['vocabHash']) ?? undefined

@@ -329,8 +329,8 @@ export function DataPanel() {
             )}
           </div>
           <p className="text-xs leading-relaxed text-text-muted">
-            更改位置后，所有数据（角色卡、会话、模型、设置等）将复制到新目录，需手动重启应用生效。
-            原目录数据不会被删除，可手动清理。
+            更改位置后，所有数据（角色卡、会话、模型、设置、日志等）将移动到新目录，
+            复制成功并切换后会删除原目录里的数据，需手动重启应用生效。
           </p>
         </Card>
       )}

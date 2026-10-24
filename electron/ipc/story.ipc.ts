@@ -361,14 +361,14 @@ export function registerStoryIpc(): void {
         }
       }))
       const metaRaw = storyYaml ? (parseYaml(storyYaml) as Record<string, unknown> | null) : null
-      // 创作词表：绑定立绘集的词表词（情绪下拉动态化）；未绑定/未启用词表时为 null（编辑器退回旧 6 枚举）
+      // 创作词表：绑定立绘集的词表词（状态下拉动态化）；未绑定/未启用词表时为 null（编辑器退回旧 6 枚举）
       const boundSpriteSetId = typeof metaRaw?.['spriteSetId'] === 'string' ? metaRaw['spriteSetId'] : null
       const palette = await getSpritePalette(boundSpriteSetId)
       // 词表变化检测：story.yaml 记录的 vocabHash 与当前词表指纹不一致 = 绑定后词表被编辑过
       const storedHash = typeof metaRaw?.['vocabHash'] === 'string' ? metaRaw['vocabHash'] : null
       const currentHash = paletteHash(palette)
       const paletteChanged = !!palette && !!storedHash && !!currentHash && currentHash !== storedHash
-      // 未知情绪词盘点：事件引用但不在当前值域（绑定=词表词；未绑定=旧 6 枚举）的词，去重
+      // 未知状态词盘点：事件引用但不在当前值域（绑定=词表词；未绑定=旧 6 枚举）的词，去重
       const refWords = new Set<string>(palette ? palette.entries.map((e) => e.name) : (STANDARD_EMOTIONS as readonly string[]))
       const staleWords = new Set<string>()
       for (const ch of bundle?.chapters ?? []) {

@@ -249,7 +249,8 @@ export function PanelHeader({ title, desc }: { title: string; desc?: string }) {
 // ---------------- Slider（带数值显示 + 重置按钮） ----------------
 
 interface SliderProps {
-  label: string
+  /** 滑块标题（可省略：外层已有 Field label 时传入会重复显示） */
+  label?: string
   value: number
   min: number
   max: number
@@ -258,22 +259,24 @@ interface SliderProps {
   onChange: (value: number) => void
   /** 值的格式化显示（如保留小数位） */
   format?: (v: number) => string
+  /** 禁用交互（置灰，保留数值显示） */
+  disabled?: boolean
 }
 
 /**
  * 滑块组件：青色 handle + 浅灰轨道，右侧显示数值，带重置按钮。
  * 样式参考 airi 的 Slider 控件。
  */
-export function Slider({ label, value, min, max, step = 0.01, defaultValue, onChange, format }: SliderProps) {
+export function Slider({ label, value, min, max, step = 0.01, defaultValue, onChange, format, disabled = false }: SliderProps) {
   const displayValue = format ? format(value) : value.toFixed(2)
-  const showReset = defaultValue !== undefined && Math.abs(value - defaultValue) > 0.001
+  const showReset = !disabled && defaultValue !== undefined && Math.abs(value - defaultValue) > 0.001
   const percent = ((value - min) / (max - min)) * 100
 
   return (
-    <div className="py-1.5">
+    <div className={cn('py-1.5', disabled && 'opacity-50')}>
       <div className="mb-1.5 flex items-center justify-between">
-        <span className="text-[13px] text-text-2">{label}</span>
-        <div className="flex items-center gap-2">
+        {label !== undefined && label !== '' && <span className="text-[13px] text-text-2">{label}</span>}
+        <div className={cn('flex items-center gap-2', label === undefined || label === '' ? 'ml-auto' : '')}>
           <span className="text-xs font-medium tabular-nums text-text-muted">{displayValue}</span>
           {showReset && (
             <button
@@ -293,8 +296,9 @@ export function Slider({ label, value, min, max, step = 0.01, defaultValue, onCh
           max={max}
           step={step}
           value={value}
+          disabled={disabled}
           onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="slider-cyber w-full"
+          className={cn('slider-cyber w-full', disabled && 'cursor-not-allowed')}
           style={{
             background: `linear-gradient(to right, var(--primary-400) 0%, var(--primary-400) ${percent}%, var(--bg-surface-2) ${percent}%, var(--bg-surface-2) 100%)`,
           }}

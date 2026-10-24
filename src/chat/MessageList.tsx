@@ -193,8 +193,11 @@ export function MessageList() {
                 <span>{isUser ? '你' : currentCardName || 'AI'}</span>
                 {msg.timestamp && <span>{formatTime(msg.timestamp)}</span>}
               </div>
-              {isUser && rewind.editing && i === messages.length - 2 ? (
-                // 气泡原位编辑（最后一轮 user）：textarea 替换气泡，确认 = 编辑并重发
+              {/* 气泡原位编辑（最后一轮 user）：textarea 替换气泡，确认 = 编辑并重发。
+                  挂载位置用 rewindTargetFor 单一事实源判定——同时覆盖完整轮（user=倒数第二）
+                  与孤立 user（发送失败落盘的"未收到回复"消息=末条，2026-10-20 修复：旧条件
+                  写死 length-2 导致失败轮右键能弹菜单但编辑框永不出现） */}
+              {isUser && rewind.editing && rewindTargetFor(i, messages, streaming) === 'edit' ? (
                 <RewindEditBox initial={msg.content} onConfirm={rewind.confirmEdit} onCancel={rewind.cancelEdit} />
               ) : (
                 <div
@@ -254,6 +257,7 @@ export function MessageList() {
 
       {/* 两窗统一的失败提示（基于消息流判定，窗口重载后依然可见）：
           末条是用户消息且不在生成中 = 这轮没有 AI 回复落盘；消息上的 error 字段携带具体原因。
+          meta.cancelled（用户主动停止）豁免——主动取消不视为失败。
           发送下一条消息并成功落定后（末条变为 assistant）自动消失。
           直播期间（roundTurnActive）不提示——中途开窗时消息列表尚未补齐属正常态。 */}
       {(() => {
@@ -271,7 +275,7 @@ export function MessageList() {
                 </div>
               </div>
             )}
-            {!streaming && lastIsUser && (
+            {!streaming && lastIsUser && !lastMessage!.meta?.cancelled && (
               <div className="flex justify-center">
                 <div
                   className="flex max-w-[85%] items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-xs"

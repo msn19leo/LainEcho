@@ -1,19 +1,19 @@
 /**
- * 结构化情绪解析：把 AI 回复末尾的情绪标签归一化到 8 标准情绪。
+ * 结构化状态解析：把 AI 回复末尾的状态标签归一化到 8 标准状态。
  *
  * prompt 承诺的标签格式：{#emotion:<standard>}，占回复最后一行。
  * 这里负责：
- *  1. extractEmotion —— 从完整回复剥离标签行，返回纯净文本 + 标准情绪
- *  2. normalizeEmotion —— 把任意自由情绪词（furious/委屈…）收窄到 8 标准情绪
+ *  1. extractEmotion —— 从完整回复剥离标签行，返回纯净文本 + 标准状态
+ *  2. normalizeEmotion —— 把任意自由状态词（furious/委屈…）收窄到 8 标准状态
  */
 import { BUILTIN_DEFAULT_EMOTION, builtinPalette, type DialogueChunk, type EmotionPaletteRef, type EmotionSegment } from '../../src/types'
 
-/** 情绪标签正则：匹配回复末尾独占一行的 {#emotion:xxx}（值域含中英文字词表词） */
+/** 状态标签正则：匹配回复末尾独占一行的 {#emotion:xxx}（值域含中英文字词表词） */
 const EMOTION_TAG = /\{#emotion:([\w\u4e00-\u9fff]+)\}\s*$/i
-/** 内嵌情绪点正则：文本中任意位置的 {#emo:xxx}（表达情绪转折；值域含中英文字词表词） */
+/** 内嵌状态点正则：文本中任意位置的 {#emo:xxx}（表达状态转折；值域含中英文字词表词） */
 const EMBED_EMOTION_TAG = /\{#emo:([\w\u4e00-\u9fff]+)\}/gi
 
-/** 情绪别名表：历史 6 枚举英文词/近义自由词 → 中文标准情绪词。
+/** 状态别名表：历史 6 枚举英文词/近义自由词 → 中文标准状态词。
  *  词表方案下不再是值域，仅作归一化第二跳（识别旧词/近义词后回词表查词）。
  *  语义分组与旧版一致（担心/紧张类→难过；亲近/撒娇类→开心）。 */
 const EMOTION_ALIASES: Record<string, string> = {
@@ -41,18 +41,18 @@ const EMOTION_ALIASES: Record<string, string> = {
   脸红: '害羞', 不好意思: '害羞', 羞涩: '害羞', 难为情: '害羞',
 }
 
-/** 兜底词：词表默认情绪；无词表时内置默认"平静" */
+/** 兜底词：词表默认状态；无词表时内置默认"平静" */
 function defWord(palette?: EmotionPaletteRef | null): string {
   return palette?.defaultEmotion || BUILTIN_DEFAULT_EMOTION
 }
 
 /**
- * 把 AI 自由情绪词归一化到当前词表（唯一一条归一化链）：
+ * 把 AI 自由状态词归一化到当前词表（唯一一条归一化链）：
  *  1. 词表精确命中 → 原样返回（软链降级由渲染端查表时进行）；
  *  2. 别名表（旧 6 枚举英文词/近义中文词 → 中文标准词）命中且该词在词表内 → 返回标准词；
- *  3. 其余 → 词表默认情绪。
- * @param raw AI 输出中的情绪标签值
- * @param palette 角色绑定的情绪词表（缺省 = 内置最小词表，仅"平静"）
+ *  3. 其余 → 词表默认状态。
+ * @param raw AI 输出中的状态标签值
+ * @param palette 角色绑定的状态词表（缺省 = 内置最小词表，仅"平静"）
  */
 export function normalizeEmotion(raw: string, palette?: EmotionPaletteRef | null): string {
   const pal = palette ?? builtinPalette()
@@ -114,15 +114,15 @@ export function splitSentences(text: string): string[] {
 }
 
 /**
- * 从 AI 完整回复中解析情绪与句子：
- * - 末尾 {#emotion:xxx} 作为兜底情绪
- * - 文本内 {#emo:xxx} 作为情绪转折点，落到对应句子索引生成 emotionSegments
- * @param palette 角色绑定的情绪词表（null = 走旧 6 枚举链路）
+ * 从 AI 完整回复中解析状态与句子：
+ * - 末尾 {#emotion:xxx} 作为兜底状态
+ * - 文本内 {#emo:xxx} 作为状态转折点，落到对应句子索引生成 emotionSegments
+ * @param palette 角色绑定的状态词表（null = 走旧 6 枚举链路）
  * 返回：
  *   text            剥离所有标签后的纯净文本（用于显示/落盘）
- *   emotion         末尾兜底情绪（未命中落默认词）
+ *   emotion         末尾兜底状态（未命中落默认词）
  *   sentences       按标点切分的句子序列
- *   emotionSegments 句子级情绪切换点（startSentence 0 基）
+ *   emotionSegments 句子级状态切换点（startSentence 0 基）
  */
 export function extractEmotion(content: string, palette?: EmotionPaletteRef | null): {
   text: string
@@ -139,7 +139,7 @@ export function extractEmotion(content: string, palette?: EmotionPaletteRef | nu
     text = trimmed.slice(0, tail.index).trimEnd()
     emotion = normalizeEmotion(tail[1] ?? '', palette)
   }
-  // 2. 内嵌情绪点（位置在去掉末尾标签后的文本上计算）
+  // 2. 内嵌状态点（位置在去掉末尾标签后的文本上计算）
   const embeds: { offset: number; emotion: string }[] = []
   EMBED_EMOTION_TAG.lastIndex = 0
   let m: RegExpExecArray | null
@@ -160,7 +160,7 @@ export function extractEmotion(content: string, palette?: EmotionPaletteRef | nu
     consumed.push({ offset: cm.index - removed, emotion: normalizeEmotion(cm[1] ?? '', palette) })
   }
   clean += text.slice(cursor)
-  // 4. 切句并映射情绪点到句子索引
+  // 4. 切句并映射状态点到句子索引
   const sentences = splitSentences(clean)
   const emotionSegments: EmotionSegment[] = []
   if (sentences.length > 0) {
@@ -171,7 +171,7 @@ export function extractEmotion(content: string, palette?: EmotionPaletteRef | nu
       emotionSegments.push({ startSentence: sentenceIndex, emotion: e.emotion })
     }
     if (emotionSegments.length === 0) {
-      // 无内嵌情绪点时，末尾兜底作为唯一情绪段落起点
+      // 无内嵌状态点时，末尾兜底作为唯一状态段落起点
       emotionSegments.push({ startSentence: 0, emotion })
     }
   }
@@ -518,9 +518,9 @@ export function stripScriptTags(content: string): string {
  *   - 否则整段视为单一 neutral。
  * 返回：
  *   text            拼接后的纯净段落文本（各项以空行分隔）
- *   emotion         末尾（最后一项）情绪，缺省 neutral
+ *   emotion         末尾（最后一项）状态，缺省 neutral
  *   sentences       按标点/换行切分的句子序列（用于展示/句级元数据）
- *   emotionSegments 句子级情绪切换点（startSentence 0 基）
+ *   emotionSegments 句子级状态切换点（startSentence 0 基）
  *   chunks          合成分段（dialogue 逐项），供语音段级合成与立绘切换
  *   background      剧情联动的背景引用（顶层可选键；缺省 undefined）
  */
@@ -540,7 +540,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
   if (parsed) {
     if (Array.isArray(parsed.dialogue)) {
       // dialogue 数组元素兼容两种形态：{text, emotion, kind} 对象（标准）与纯字符串（模型偶发的简化变体，
-      // 字符串元素视作一段正文、情绪 neutral）——不支持后者时整条解析会退化为"JSON 源码当正文"
+      // 字符串元素视作一段正文、状态 neutral）——不支持后者时整条解析会退化为"JSON 源码当正文"
       dialogue = (parsed.dialogue as Array<unknown>).map((it) =>
         typeof it === 'string' ? { text: it } : (it as { text?: string; emotion?: string; kind?: string }),
       )
@@ -621,7 +621,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
     if (jsonish.startsWith('{') || jsonish.startsWith('[') || /["\u201C]dialogue["\u201D]/.test(jsonish)) {
       return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
     }
-    // 回退旧式标签解析（历史消息兼容），否则整段默认情绪。
+    // 回退旧式标签解析（历史消息兼容），否则整段默认状态。
     // 先做剧本标签清洗（stripScriptTags）：【内心独白】【台词】等漂移标签若放行会被
     // 朗读并回传历史强化漂移；清洗后无实质台词（剥括号后空）视为无效输出 → 返回空文本，
     // 交由调用方的空回复自动重试链附加纠正提示。
@@ -673,7 +673,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
   const text = chunks.map((c) => c.text).join('\n')
   const sentences = splitSentences(text)
 
-  // 逐 chunk 累计句子数，把每个 chunk 的情绪落到其首句索引（与 chunks 拆分保持同源）
+  // 逐 chunk 累计句子数，把每个 chunk 的状态落到其首句索引（与 chunks 拆分保持同源）
   const emotionSegments: EmotionSegment[] = []
   let sentCursor = 0
   for (const c of chunks) {
@@ -689,7 +689,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
 }
 
 /**
- * 流式"情绪块"已闭合项增量提取：从 fromCursor 之后提取所有**已完整闭合**的 dialogue 项
+ * 流式"状态块"已闭合项增量提取：从 fromCursor 之后提取所有**已完整闭合**的 dialogue 项
  * （`{ "text":..., "emotion":... }`，text 非空），供主进程在流式 onChunk 中逐块实时触发语音。
  *
  * - 只处理以 `"text"` 或 `"emotion"` 开头的扁平对象（对话项），自动跳过根对象 `{"dialogue":...}`
@@ -704,7 +704,7 @@ export function extractDialogueChunkDelta(partial: string, fromCursor: number, p
     const open = partial.indexOf('{', cursor)
     const quote = partial.indexOf('"', cursor)
     // 纯字符串数组变体（2026-10-02 线上案例）：引号先于花括号出现 = dialogue 数组里的裸字符串元素，
-    // 视作 {text, 默认情绪} 对话项提取，保证流式语音链对该变体照常触发（否则零提取 → 语音全押兜底）。
+    // 视作 {text, 默认状态} 对话项提取，保证流式语音链对该变体照常触发（否则零提取 → 语音全押兜底）。
     // 仅认「数组元素位置」的引号（前一个非空白字符是 [ 或 ,），避免把 "dialogue" 等键名误当台词。
     if (quote !== -1 && (open === -1 || quote < open)) {
       const end = findStringEnd(partial, quote)
@@ -807,7 +807,7 @@ function findObjectEnd(s: string, open: number): number {
  * - 逐项 yield 语义天然适配"每个 dialogue 项一个气泡/一段语音"的新渲染与门控模型。
  *
  * @param partial 累积中的原始回复文本
- * @param palette 情绪词表（缺省时用内置词表归一化）
+ * @param palette 状态词表（缺省时用内置词表归一化）
  * @returns closed: 已闭合的对话项序列（按输出顺序）；trailing: 书写中项的已写出部分（预览，不入正式序列）
  */
 export function extractDialogueObjects(
@@ -1020,7 +1020,7 @@ export function prepareScriptPartial(partial: string): string {
  *  - 台词段剥包裹引号（stripSpeakWrapQuotes，与定型 cleanQuotedScriptText 同口径）：
  *    模型给台词套引号（引号漂移），流式若原样上屏、定型清洗剥引号 → 收尾引号消失
  *    （2026-10-16 14:12 轮实锤）
- *  - emotion 恒为词表默认词（漂移形态本就无逐段情绪；依从 miss 也回落默认词，无信息损失）
+ *  - emotion 恒为词表默认词（漂移形态本就无逐段状态；依从 miss 也回落默认词，无信息损失）
  *
  * @param force 结束冲刷：把残余未封段的尾巴也产出（流结束时调用一次）
  * @returns items 产出项序列；cursor 已消费游标（下一次调用从此继续，未定稿尾巴不重复产出）
