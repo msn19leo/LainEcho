@@ -17,7 +17,7 @@
 | AI 对话 | 兼容 OpenAI 格式，SSE 流式输出；结构化 JSON 驱动台词 / 旁白 / 情绪；时间感知与情景摘要缓存 |
 | 模型配置 | 服务商档案库统一管理「地址 + 模型 + Key」，主 / 辅助 / 视觉 / 嵌入四类模型各激活一个档案 |
 | 语音合成 | 三引擎：Genie-TTS 本地离线（默认）/ 本地 SBV2（Style-Bert-VITS2，日文）/ MiMo 云端声音克隆；段级合成、口型同步、语音文本跟随、截断自愈 |
-| 主动搭话 | 空闲后按兴趣值主动开口，可设每日上限与免打扰时段；可选屏幕感知（截图仅内存流转、不落盘） |
+| 主动搭话 | 空闲后按兴趣值主动开口，可设每日上限与免打扰时段；可选屏幕感知（截图仅内存流转、不落盘）；另有独立于搭话的手动识屏（眼睛按钮，随时让它看一眼当前窗口） |
 | 角色卡 | 多维人设结构 + 示例对话 + AI 生成草稿；绑定模型 / 立绘集 / TTS 模型，支持角色级语言与语速 |
 | 记忆体 | 手动记忆 + 会话 / 剧情自动沉淀候选（确认后生效）+ 记忆档案面板 + 向量检索 + 按角色用户画像 |
 | 剧情系统 | 独立剧情窗 galgame 演出；ZIP 剧本、12 种事件、变量 / 条件 / 多分支、多周目、AI 写剧本、可视化编辑器 |
@@ -40,9 +40,13 @@ npm run dev         # 开发：Vite dev server + Electron
 npm run typecheck   # 类型检查
 npm run test:prompt # prompt 黄金用例校验
 npm run test:story  # 剧情引擎自检
+npm run sbv2:build  # 可选：编译本地 SBV2 sidecar（需 Rust/cargo，装配 exe + dll 到 dist/）
+npm run sbv2:dist   # 可选：仅重新装配 sidecar 运行目录（已有编译产物时）
 npm run build       # 构建 dist/ + dist-electron/
 npm run build:win   # 打包 Windows 安装包（NSIS x64）
 ```
+
+> 不用本地 SBV2 引擎可跳过 `sbv2:*`；打包版已内置 sidecar。
 
 ## 🧩 首次配置
 
@@ -103,6 +107,7 @@ Key 按档案独立加密，界面仅回显掩码。
 6. 角色卡声音选择「本地 SBV2（日文）」并绑定声线
 
 > 该引擎只支持日文：中文台词会先自动翻译为日语再合成，因此没有语言选项。
+> 开发环境需先 `npm run sbv2:build` 装配 `sbv2-sidecar.exe` 与 `onnxruntime.dll`（打包版已内置）。
 > 两个本地引擎都常驻内存，用完可点【结束服务】释放（结束后合成不再自动拉起）。
 
 通用能力：段级合成、口型同步、语音文本跟随、截断自愈（多句段严格判定与截断阈值可在通用设置中调整），以及每角色独立的语言 / 语速 / 引擎覆盖。
@@ -167,6 +172,7 @@ userData/
 │   ├── model-settings.json      # 模型缩放 / 位置 / 动画
 │   ├── voice-settings.json      # TTS 非敏感配置
 │   ├── tts-genie.json           # GenieTTS 地址 / Python 环境 / GenieData
+│   ├── tts-sbv2.json            # 本地 SBV2 DeBERTa 目录 / 推理设备 / sdp 随机度
 │   ├── model-palettes.json      # Live2D 状态词表
 │   ├── proactive-state.json     # 主动搭话调度状态
 │   ├── secure/
@@ -183,7 +189,7 @@ userData/
 │   └── story-music/             # 剧情音乐库
 ├── models/{modelId}/            # Live2D 模型副本（含 index.json）
 ├── sprites/{spriteId}/          # 2D 立绘集副本（含 index.json）
-├── tts-models/                  # Genie TTS 模型卡（index.json）
+├── tts-models/                  # TTS 模型卡：Genie 角色卡 + SBV2 声线卡（index.json）
 ├── live2d-core/                 # 手动导入的 Cubism Core
 ├── logs/                        # latest.log + 历史备份
 └── data-dir-config.json         # 自定义数据目录配置（仅自定义时存在）
@@ -198,7 +204,7 @@ userData/
 - **Live2D**：pixi.js 6 + pixi-live2d-display（动态 import `/cubism4`）
 - **剧情引擎**：主进程线性游标执行器（YAML + 变量 / 条件 / 分支 + AI 判定结局）
 - **记忆检索**：本地向量索引 + OpenAI 兼容嵌入服务
-- **TTS**：GenieTTS（本地 HTTP 服务）+ MiMo voiceclone API + Web Audio 口型同步
+- **TTS**：GenieTTS（本地 HTTP 服务）+ 本地 SBV2（Rust sidecar + ONNX Runtime，stdin/stdout NDJSON）+ MiMo voiceclone API；中日翻译走辅助模型；Web Audio 口型同步
 - **打包 / 更新**：electron-builder（NSIS x64）+ electron-updater + GitHub Actions
 - **自定义协议**：`pet-res://` 提供本地模型 / 立绘 / 剧本资源
 
@@ -214,6 +220,8 @@ userData/
 ## ⚠️ 已知限制
 
 - 手动维护的记忆条目过多时仍为全量拼接注入（自动检索部分已由向量 top-k 缓解）
+- 本地 SBV2 仅支持日文：中文台词需先翻译为日语，翻译链路异常时该段语音可能被跳过
+- 两个本地 TTS 引擎（Genie / SBV2）首次合成需加载声线与 warmup
 - 模型空闲动作待优化
 - 仅提供 Windows 打包目标
 - 剧情系统目前存在一些已知缺陷，后续会持续优化
