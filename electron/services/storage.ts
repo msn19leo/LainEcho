@@ -139,6 +139,10 @@ export const paths = {
   get sessionsDir() {
     return path.join(getRootDir(), 'data', 'sessions')
   },
+  /** 聊天图片附件根目录（每个会话一个子目录，路径写入消息的 images[].path） */
+  get chatImagesDir() {
+    return path.join(getRootDir(), 'data', 'chat-images')
+  },
   /** 剧本库根目录（每个剧本一个子目录：<id>/story.yaml + chapters/ + 素材） */
   get storiesDir() {
     return path.join(getRootDir(), 'data', 'stories')
@@ -169,9 +173,13 @@ export const paths = {
   get ttsModelsDir() {
     return path.join(getRootDir(), 'tts-models')
   },
-  /** GenieTTS(本地声库语音服务) 配置：地址/项目路径/GenieData 目录 */
+  /** Genie-TTS 配置：地址/项目路径/GenieData 目录 */
   get ttsGenieConfigFile() {
     return path.join(this.dataDir, 'tts-genie.json')
+  },
+  /** 本地 SBV2 配置：DeBERTa 目录/推理设备/sidecar 目录 */
+  get ttsSbv2ConfigFile() {
+    return path.join(this.dataDir, 'tts-sbv2.json')
   },
   /** 参考音频目录（用于 TTS 声音克隆） */
   get voicesDir() {
@@ -260,6 +268,10 @@ export const paths = {
   sessionFile(id: string) {
     return path.join(this.sessionsDir, `${id}.json`)
   },
+  /** 指定会话的聊天图片目录 */
+  chatImageDir(sessionId: string) {
+    return path.join(this.chatImagesDir, sessionId)
+  },
   modelDir(id: string) {
     return path.join(this.modelsDir, id)
   },
@@ -299,6 +311,7 @@ export async function ensureDataDirs() {
     ensureDir(paths.storyRunsDir),
     ensureDir(paths.storyBackgroundsDir),
     ensureDir(paths.storyMusicsDir),
+    ensureDir(paths.chatImagesDir),
     ensureDir(paths.modelsDir),
     ensureDir(paths.coreDir),
     ensureDir(paths.voicesDir),

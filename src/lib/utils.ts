@@ -1,5 +1,15 @@
 /** 通用工具函数 */
 
+/**
+ * 去掉文本末尾的句读符号与空白。
+ *
+ * 用于"把模型输出嵌进模板句子"的场景：模型输出通常自带 。！？，模板后面还会再跟一个，
+ * 直接拼会出现「……提示。。，忍不住想聊两句。」这种双标点。
+ */
+export function stripTrailingPunct(text: string): string {
+  return text.replace(/[\s。．.!！?？,，;；:：]+$/u, '')
+}
+
 export function cn(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
 }

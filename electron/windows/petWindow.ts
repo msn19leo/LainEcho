@@ -26,6 +26,12 @@ export function markPetWindowQuitting(): void {
   quitting = true
 }
 
+/** 补置顶（幂等）：窗口存在且未销毁时重新写一次 HWND_TOPMOST，不抢焦点 */
+export function reassertTopmost(win: BrowserWindow): void {
+  if (win.isDestroyed()) return
+  win.setAlwaysOnTop(true)
+}
+
 export function createPetWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: PET_WIDTH,
@@ -56,6 +62,33 @@ export function createPetWindow(): BrowserWindow {
   win.setAlwaysOnTop(true, 'floating')
   win.setMenuBarVisibility(false)
 
+  // ---- 置顶守卫 ----
+  // 实测（2026-10-27，四次全中）：桌宠被点击激活的瞬间系统会把置顶属性剥掉，且不会自愈
+  // （之后就被浏览器等窗口盖住、点不到）。两层守卫：
+  //  ① focus：激活时若已丢失立刻补回（实测 focus 事件到达时已为 false）；
+  //  ② 1s 心跳：只在"确实丢了"时补一次，正常只读不写——盲轮询会跟用户其它置顶窗口抢层级。
+  const logRestored = (source: string) => console.log('[petwin] 置顶丢失已恢复 source=%s', source)
+  const sampleTopmost = () => {
+    if (win.isDestroyed() || !win.isVisible() || win.isAlwaysOnTop()) return
+    reassertTopmost(win)
+    logRestored('watchdog')
+  }
+  const heartTimer = setInterval(sampleTopmost, 1000)
+
+  win.on('focus', () => {
+    if (!win.isDestroyed() && !win.isAlwaysOnTop()) {
+      reassertTopmost(win)
+      logRestored('focus')
+    }
+    // 兜"清除发生在 focus 事件之后"的时序（个别驱动/时序下可能如此）
+    setTimeout(() => {
+      if (!win.isDestroyed() && !win.isAlwaysOnTop()) {
+        reassertTopmost(win)
+        logRestored('focus+150ms')
+      }
+    }, 150)
+  })
+
   // 保险：Windows 上透明无边框窗口在拖动时尺寸可能被 DWM 漂移（即使 resizable:false），
   // 一旦检测到尺寸偏离当前目标（宽固定 300、高随面板联动）立即钉回，保证拖动不会让窗口漂移变大。
   win.on('resize', () => {
@@ -65,7 +98,7 @@ export function createPetWindow(): BrowserWindow {
       win.setSize(PET_WIDTH, currentPetHeight)
       // 这次尺寸回正是拖动过程中唯一由我们发起的第二次窗口写入：它会把窗口插回普通层，
       // 置顶属性随之被清掉（表现为桌宠被其它窗口盖住、且点不到、无法自愈）。写完立刻补回置顶。
-      win.setAlwaysOnTop(true)
+      reassertTopmost(win)
     }
   })
 
@@ -76,8 +109,7 @@ export function createPetWindow(): BrowserWindow {
     if (moveTimer) clearTimeout(moveTimer)
     moveTimer = setTimeout(() => {
       moveTimer = null
-      if (win.isDestroyed()) return
-      win.setAlwaysOnTop(true)
+      reassertTopmost(win)
     }, 200)
   })
 
@@ -125,6 +157,7 @@ export function createPetWindow(): BrowserWindow {
       clearTimeout(moveTimer)
       moveTimer = null
     }
+    clearInterval(heartTimer)
     if (petWin === win) petWin = null
   })
 

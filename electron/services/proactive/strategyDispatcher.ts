@@ -15,7 +15,8 @@
 import type { AppSettings } from '../../../src/types'
 import { resolveProfile } from '../apiProfiles'
 import { sendChatCompletion } from '../aiClient'
-import { analyzeScreen } from './screenAnalyzer'
+import { analyzeScreen, captureScreenImage } from './screenAnalyzer'
+import { stripTrailingPunct } from '../../../src/lib/utils'
 
 /** 意图类型：屏幕感知 / 普通话题 */
 export type ProactiveIntentKind = 'screen' | 'topic'
@@ -25,8 +26,8 @@ export function intentTtlMs(kind: ProactiveIntentKind): number {
   return kind === 'screen' ? 120_000 : 300_000
 }
 
-/** 双开关开启时 SCREEN 的轮盘权重（其余归 TOPIC） */
-const SCREEN_WEIGHT = 0.7
+/** 屏幕搭话占比的兜底值（设置项异常/缺失时使用） */
+const DEFAULT_SCREEN_WEIGHT = 70
 
 /** 旁白生成 LLM 调用的输出 token 上限：mimo 等思考型模型的 reasoning 会占用预算，
  *  预算太小会导致 content 为空字符串（同 memoryExtraction 的踩坑），因此放大到与抽取一致 */
@@ -34,11 +35,26 @@ const NARRATION_MAX_TOKENS = 2048
 
 /**
  * 轮盘决策（同步、零 I/O）：决定本轮意图类型，旁白推迟到投放时生成。
+ *
+ * 屏幕占比由设置项 `proactiveScreenWeight`（0–100）控制：只决定"开口时有多少概率
+ * 是先看屏幕说的"，不控制频率（频率仍是兴趣值累积 + 每日上限）；
+ * 用户点眼睛的主动识屏完全不走这里。
  */
 export function selectIntentKind(settings: AppSettings): ProactiveIntentKind {
-  const screenEnabled = settings.enableProactive && settings.enableScreenSense
-  if (screenEnabled && Math.random() < SCREEN_WEIGHT) return 'screen'
-  return 'topic'
+  if (!(settings.enableProactive && settings.enableScreenSense)) return 'topic'
+  const raw = Number(settings.proactiveScreenWeight)
+  const pct = Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : DEFAULT_SCREEN_WEIGHT
+  return Math.random() * 100 < pct ? 'screen' : 'topic'
+}
+
+/** 一次投放的产物：旁白文本 + 可选的当轮临时图片 */
+export interface ProactiveDelivery {
+  narration: string
+  /**
+   * 「直读」模式专用：截图作为当轮临时图片直接带给主模型。
+   * 不落盘、不写历史；旁白里也不含任何画面描述。
+   */
+  transientImage?: { base64: string; mime: string }
 }
 
 /**
@@ -46,20 +62,57 @@ export function selectIntentKind(settings: AppSettings): ProactiveIntentKind {
  * @param kind 意图类型；screen 感知失败时自动降级为 TOPIC 旁白
  * @param charName 目标会话的角色名（旁白以第三人称角色名作主语，消除"你=角色"的
  *        人称锚定——曾致模型回忆互动时把角色自己的动作错归属给用户）
- * @returns 括号包裹的舞台指示旁白（永不 throw）
+ * @param opts.requested 用户主动要求看屏幕（点眼睛）：
+ *        - 措辞改为"顺着你的示意看过去"，而不是"忍不住想聊两句"（动机从主动变被动）；
+ *        - 感知跳过缓存，必须看到"现在"；
+ *        - 按设置 vision.eyeReadMode 选择速览/详述/直读三种识图方式。
+ *        主动搭话恒为速览（不读文字、成本最低），不看这个设置。
+ * @returns 旁白 +（直读时）临时图片；永不 throw
  */
-export async function buildNarration(kind: ProactiveIntentKind, settings: AppSettings, charName: string): Promise<string> {
+export async function buildNarration(
+  kind: ProactiveIntentKind,
+  settings: AppSettings,
+  charName: string,
+  opts: { requested?: boolean } = {},
+): Promise<ProactiveDelivery> {
   const userName = settings.userName || '用户'
   const name = charName.trim() || '角色'
   if (kind === 'screen') {
-    const analysis = await analyzeScreen()
+    const mode = opts.requested ? settings.vision.eyeReadMode : 'ambient'
+
+    // ── 直读：不转述，截图随本轮直接交给主模型 ──
+    if (mode === 'native') {
+      const shot = await captureScreenImage()
+      if (!shot) {
+        return { narration: `（${name}顺着${userName}的示意看过去，却什么也没看清。）` }
+      }
+      // 旁白刻意不含任何画面描述：描述会诱导模型在回复里复述，违背"旁白描述、回复反应"的分工
+      return {
+        narration: `（${name}顺着${userName}的示意看过去。）`,
+        transientImage: { base64: shot.base64, mime: 'image/jpeg' },
+      }
+    }
+
+    // ── 速览 / 详述：视觉模型转述成文字 ──
+    const style = mode === 'detail' ? 'detail' : 'ambient'
+    const analysis = await analyzeScreen({ force: !!opts.requested, style })
     if (analysis) {
-      return `（${name}瞥了一眼${userName}的电脑桌面：${analysis}，忍不住想聊两句。）`
+      // 转述自带句号，模板后面还会补一个 → 先剥掉末尾标点，避免「。。」「。。，」
+      const body = stripTrailingPunct(analysis)
+      return {
+        narration: opts.requested
+          ? `（${name}顺着${userName}的示意看过去：${body}。）`
+          : `（${name}瞥了一眼${userName}的电脑桌面：${body}，忍不住想聊两句。）`,
+      }
+    }
+    if (opts.requested) {
+      // 用户主动要求却看不到：如实说没看清（角色化，比静默无反应好）
+      return { narration: `（${name}顺着${userName}的示意看过去，却什么也没看清。）` }
     }
     // 屏幕感知不可用 → 降级 TOPIC 旁白（保证"双开关 = 一定搭话"的体验）
     console.log('[proactive] 屏幕感知不可用，降级为 TOPIC 旁白')
   }
-  return topicNarration(settings, name)
+  return { narration: await topicNarration(settings, name) }
 }
 
 /** 当前时段的人话描述（LLM 旁白生成素材，让旁白带时间感） */

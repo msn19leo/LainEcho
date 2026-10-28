@@ -798,7 +798,7 @@ function findObjectEnd(s: string, open: number): number {
 }
 
 /**
- * 对象闭合切片器（Shinsekai 式）：从流式累积文本中逐个提取**已完整闭合的顶层 JSON 对象**，
+ * 对象闭合切片器：从流式累积文本中逐个提取**已完整闭合的顶层 JSON 对象**，
  * 每个闭合对象解析为 dialogue 项（text/kind/emotion），附加正在书写中项的尾部预览。
  *
  * 与 extractStreamingJsonText（正则抠 text 值）相比：

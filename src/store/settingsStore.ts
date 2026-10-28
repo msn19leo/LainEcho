@@ -47,10 +47,24 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // 主动搭话：默认关闭（需用户显式开启；屏幕感知级联于本开关）
   enableProactive: false,
   enableScreenSense: false,
+  // 视觉能力（设置页「视觉」模块）：默认转述模式 + 允许发图 + 仅当轮带原图 + 保留 30 天
+  vision: {
+    readMode: 'describe',
+    chatImagesEnabled: true,
+    captionRounds: 0,
+    imageRetentionDays: 30,
+    screenRange: 'window',
+    readForeground: false,
+    injectActivity: false,
+    hideFromCapture: true,
+    eyeReadMode: 'ambient',
+  },
   maxProactivePerDay: 3,
   // 兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10）
   proactiveInterestIntervalSec: 30,
   proactiveLlmNarration: true,
+  // 屏幕搭话占比：默认 70%
+  proactiveScreenWeight: 70,
   quietHours: { start: '', end: '' },
   visionBaseURL: '',
   visionModel: '',

@@ -3,6 +3,7 @@
  */
 import { registerAiIpc } from './ai.ipc'
 import { registerCharacterCardIpc } from './characterCard.ipc'
+import { registerChatImageIpc } from './chatImage.ipc'
 import { registerMemoryIpc } from './memory.ipc'
 import { registerLogsIpc } from './logs.ipc'
 import { registerModelIpc } from './model.ipc'
@@ -20,6 +21,7 @@ import { windowManager } from '../windows/windowManager'
 export function registerAllIpc(): void {
   registerAiIpc()
   registerCharacterCardIpc()
+  registerChatImageIpc()
   registerMemoryIpc()
   registerLogsIpc()
   registerModelIpc()

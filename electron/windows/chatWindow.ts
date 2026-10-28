@@ -37,6 +37,11 @@ export function createChatWindow(): BrowserWindow {
   })
   win.setMenuBarVisibility(false)
   bindWindowStateEvents(win)
+  // 防导航守卫：把文件拖进窗口时 Electron 默认会把它当作导航目标（file://），
+  // 渲染进程被整个替换 → 聊天窗白屏且只能重开。渲染端已拦 dragover/drop，
+  // 这里再兜一层（顺手也挡住误点外链把窗口带跑）。
+  win.webContents.on('will-navigate', (e) => e.preventDefault())
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   win.once('ready-to-show', () => win.show())
   void loadWindowPage(win, 'chat.html')
   return win

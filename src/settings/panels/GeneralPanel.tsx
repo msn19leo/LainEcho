@@ -260,7 +260,7 @@ export function GeneralPanel() {
         </div>
       </Card>
 
-      {/* Genie 本地声库截断判定：多句段严格判定 + 两个比例阈值（仅影响 Genie 合成） */}
+      {/* Genie Genie-TTS截断判定：多句段严格判定 + 两个比例阈值（仅影响 Genie 合成） */}
       <Card className="p-5">
         <div className="space-y-3">
           <div className="flex items-center justify-between gap-3">
@@ -268,7 +268,7 @@ export function GeneralPanel() {
               <div className="text-sm font-medium text-text">多句段严格判定</div>
               <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
                 多句段（内部含句号 / 问号 / 叹号）使用单独的截断阈值，并取消 20 字豁免；
-                关闭后全部回落单句阈值。仅影响 Genie 本地声库
+                关闭后全部回落单句阈值。仅影响 Genie-TTS
               </div>
             </div>
             <Switch
@@ -307,14 +307,14 @@ export function GeneralPanel() {
         </div>
       </Card>
 
-      {/* 截断二次重试时重载模型（仅 Genie 本地声库）：独立卡片，与文字显示无关 */}
+      {/* 截断二次重试时重载模型（仅 Genie Genie-TTS）：独立卡片，与文字显示无关 */}
       <Card className="p-5">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="text-sm font-medium text-text">截断二次重试时重载模型</div>
             <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
               语音段合成时长过短（截断）时先免重载直接重试一次；若仍截断，开启则重载角色模型后再兜底重试
-              一次（多花 8~13 秒换取完整重试机会），关闭则直接放行较短音频（响应更快）。仅影响 Genie 本地声库，
+              一次（多花 8~13 秒换取完整重试机会），关闭则直接放行较短音频（响应更快）。仅影响 Genie-TTS，
               下一轮语音生效
             </div>
           </div>

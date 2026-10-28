@@ -12,8 +12,9 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { LogOut, MessageSquare, Settings } from 'lucide-react'
+import { LogOut, Eye, MessageSquare, Settings } from 'lucide-react'
 import { api } from '../api'
+import { toast } from '../components/toast'
 import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
 import { PendingMemoryBadge } from '../components/PendingMemoryBadge'
 import { PetStage, type PetStageHandle } from './PetStage'
@@ -25,7 +26,7 @@ import { useTurnDocStore } from '../store/turnDocStore'
 import { useCharacterStore } from '../store/characterStore'
 import { initSettingsSync, useSettingsStore, typingSpeedToMs } from '../store/settingsStore'
 import { usePetReadingStore } from './petReadingStore'
-import { BUILTIN_DEFAULT_EMOTION, type ContextStats } from '../types'
+import { BUILTIN_DEFAULT_EMOTION, type ContextStats, type TTSEngine } from '../types'
 import { stripBrackets } from '../lib/utils'
 
 /** 桌宠窗口宽度固定（与主进程 PET_WIDTH 保持一致）。
@@ -50,6 +51,21 @@ export default function PetApp() {
   const [scalePct, setScalePct] = useState<number | null>(null)
   /** 迷你会话内容框：初始收起；展开高度可拖调（左上角角标）。高度持久化，重启恢复；展开态每次启动默认收起 */
   const [contentOpen, setContentOpen] = useState<boolean>(false)
+  /**
+   * 眼睛按钮点开的临时展开：**不写入持久化**。
+   * 若和 contentOpen 共用一个状态，点一次眼睛就会被 localStorage 记住，
+   * 以后每次启动桌宠都带着面板——用户没预期过这种副作用。
+   */
+  const [autoOpen, setAutoOpen] = useState<boolean>(false)
+  /** 正在识屏（按钮禁用 + 眼睛发光） */
+  const [looking, setLooking] = useState<boolean>(false)
+  /** 眼睛光效：只覆盖"正在看"的那几秒，不跟着整轮回复一直亮（最长 6s） */
+  const [glowing, setGlowing] = useState<boolean>(false)
+  const glowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 卸载时清掉光效定时器
+  useEffect(() => () => {
+    if (glowTimerRef.current) clearTimeout(glowTimerRef.current)
+  }, [])
   const [contentH, setContentH] = useState<number>(() => {
     try {
       const h = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}').height
@@ -91,6 +107,21 @@ export default function PetApp() {
       turnCoordinatorIdRef.current = doc.turnId
       useTurnDocStore.getState().adopt(doc)
     })
+    // 编辑重发截断：主进程主动清空回合文档；宠物窗必须同时停朗读、清跟读进度，
+    // 否则被删回复的声音/气泡还会继续
+    const clearRewindArtifacts = () => {
+      turnCoordinatorIdRef.current = null
+      useTurnDocStore.getState().clear()
+      usePetReadingStore.getState().reset()
+      stageRef.current?.stopSpeak()
+      resetSpeech()
+      resetProgressCursor()
+    }
+    const unsubTurnCleared = api.ai.onTurnCleared(clearRewindArtifacts)
+    const unsubRewound = api.ai.onSessionRewound((payload) => {
+      if (!payload?.sessionId || payload.sessionId !== useSessionStore.getState().currentSessionId) return
+      clearRewindArtifacts()
+    })
     void api.ai.getTurnSnapshot().then((doc) => {
       if (doc) {
         turnCoordinatorIdRef.current = doc.turnId
@@ -102,6 +133,8 @@ export default function PetApp() {
       unsubCards()
       unsubTurn()
       unsubTurnDone()
+      unsubTurnCleared()
+      unsubRewound()
       unbind()
     }
   }, [])
@@ -116,7 +149,7 @@ export default function PetApp() {
     // 会话变化：清空上一会话的上下文用量，避免串显示
     setCtxStats((prev) => (prev && prev.sessionId !== id ? null : prev))
     if (!id) {
-      useSessionStore.setState({ currentSessionId: null, messages: [], streamingContent: '', streaming: false })
+      useSessionStore.setState({ currentSessionId: null, messages: [], streamingContent: '', streaming: false, revision: 0 })
       return
     }
     // 若宠物窗本地已经是该会话（含刚发送、正在流式、或已渲染消息），跳过拉取，
@@ -132,7 +165,10 @@ export default function PetApp() {
         // 快照都不得覆盖本地——否则用户气泡会消失到 stream-done 才回来（2026-10-14 实锤）
         const cur = useSessionStore.getState()
         if (cur.currentSessionId === id && (cur.messages.length > 0 || cur.streaming)) return
-        useSessionStore.setState({ currentSessionId: id, messages: detail.messages, streaming: false, streamingContent: '' })
+        // revision 必须随会话一起切换：它只对"当前会话"有意义。不重置会把上一个会话的版本号
+        // 带进新会话，新会话首轮 stream-done（rev=1）会被误判成"旧轮"丢弃 → streaming 永不复位
+        // （2026-10-25 23:27 轮实锤：[bind] stream-done IGNORE rev=1 < 本地rev=12）。
+        useSessionStore.setState({ currentSessionId: id, messages: detail.messages, streaming: false, streamingContent: '', revision: detail.revision ?? 0 })
         // 会话绑定的角色卡 → 设为当前卡，名牌显示其名字
         if (detail.characterCardId) {
           useCharacterStore.setState({ currentCardId: detail.characterCardId })
@@ -228,7 +264,7 @@ export default function PetApp() {
 
   /** 待合成的文本队列（入队顺序 = 播放顺序；index 为合成分段索引，null 表示单段整条；
    *  cumChars = 入队时分配的"含本槽位"累计字符数，消费时按它上行进度） */
-  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: string; kind?: 'speak' | 'narr'; engine?: 'genie' | 'mimo'; genieOverride?: import('../types').CharacterGenieOverride | null; segIndex?: number | null; cumChars?: number; speed?: number | null }>>([])
+  const textQueueRef = useRef<Array<{ text: string; voiceId: string | null; languageOverride: import('../types').TTSLanguage | null; index: number | null; emotion: string; kind?: 'speak' | 'narr'; engine?: TTSEngine; localVoice?: import('../types').CharacterLocalVoice | null; segIndex?: number | null; cumChars?: number; speed?: number | null }>>([])
   /** 已合成待播放的音频队列（附带块文本与状态：跟读时用块文本逐字显示、切立绘用状态；
    *  cumChars 透传自文本队列）。buffer=null 为 displayOnly 纯旁白的零时长槽位 */
   const audioQueueRef = useRef<Array<{ buffer: ArrayBuffer | null; index: number | null; emotion: string; text: string; kind: 'speak' | 'narr'; cumChars?: number }>>([])
@@ -238,7 +274,7 @@ export default function PetApp() {
    * 口径 = 渲染端 sliceSegmentsByCount 的**无分隔符拼接空间**（segments 文本直接相加）——
    * 早先按"槽位间 +1 换行"累计会让 cap 比实际可显文本多出"已消费槽位数"个字符，
    * 表现为下一段台词提前漏出几个字（2026-10-14 16:29 轮"今天"两字实锤）。
-   * 与提取器变体/合音/兜底/分段粒度完全解耦：语音消费到哪、两窗文本就放行到哪。
+   * 与提取器变体/兜底/分段粒度完全解耦：语音消费到哪、两窗文本就放行到哪。
    */
   const enqueuedCharsRef = useRef(0)
   /** 新一轮语音开始时归零 */
@@ -296,6 +332,18 @@ export default function PetApp() {
   }
 
   /**
+   * 本轮文本流是否已结束：以回合文档阶段为准（reading / done），不依赖前端的 streaming。
+   * streaming 由 stream-done 复位——该广播一旦在链路上丢失，streaming 会永久为 true，
+   * 而 reading-done 又以此为前置条件 → 两边互相等待，只能等 90s 看门狗兜底
+   * （2026-10-25 21:10 轮实锤：语音播完 131/131 却不上报收尾）。phase=reading 本身
+   * 就代表文本流已结束、不会再有新块，是更权威的判据。
+   */
+  const turnStreamEnded = (): boolean => {
+    const phase = useTurnDocStore.getState().doc?.phase
+    return phase === 'reading' || phase === 'done'
+  }
+
+  /**
    * 朗读收尾检查：仅当「本轮生成已结束（streaming=false）且合成/播放队列全部排空」时
    * 才结束朗读流程（setActive(false)+clearText()，跟读气泡让位给定型消息）。
    * 边生成边读下，块与块之间存在排水间隙（LLM 仍在生成下一段 / 下一段合成中）：
@@ -305,7 +353,7 @@ export default function PetApp() {
   const maybeFinalizeReading = () => {
     if (textQueueRef.current.length > 0 || audioQueueRef.current.length > 0) return
     if (isSynthesizingRef.current || isPlayingRef.current) return
-    if (useSessionStore.getState().streaming) return
+    if (!turnStreamEnded()) return
     const st = usePetReadingStore.getState()
     if (!st.active && !st.playing && !st.displayedText) return
     st.setPlaying(false)
@@ -336,7 +384,7 @@ export default function PetApp() {
         audioQueueRef.current.push({ buffer: null, index: next.index, emotion: next.emotion, text: next.text, kind: 'narr', cumChars: next.cumChars })
         return
       }
-      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride, emotion: next.emotion, engine: next.engine, genieOverride: next.genieOverride, speed: next.speed ?? undefined })
+      const audio = await api.tts.synthesize({ text: speakText, voiceId: next.voiceId, languageOverride: next.languageOverride, emotion: next.emotion, engine: next.engine, localVoice: next.localVoice, speed: next.speed ?? undefined })
       // 合完时若已被新一轮/终止清场，丢弃这段，避免旧音频串到新一轮（杂音/串场）
       if (audio && speechRoundRef.current === round) {
         audioQueueRef.current.push({ buffer: audio, index: next.index, emotion: next.emotion, text: next.text, kind: 'speak', cumChars: next.cumChars })
@@ -366,7 +414,7 @@ export default function PetApp() {
         // 方案A：以旁白收尾的轮次不走 playLoop（narr 槽位在合成循环直接消费）——
         // 在此补报 reading 收尾（主进程幂等：已 done 则忽略；播放循环排空分支同样会报，双报无害）
         const tid = turnCoordinatorIdRef.current
-        if (tid && audioQueueRef.current.length === 0 && !isPlayingRef.current && !useSessionStore.getState().streaming) {
+        if (tid && audioQueueRef.current.length === 0 && !isPlayingRef.current && turnStreamEnded()) {
           api.ai.reportTurnReadingDone(tid)
         }
       }
@@ -432,7 +480,7 @@ export default function PetApp() {
     const isLastSlot = peekNextCum() === null && !isSynthesizingRef.current
     const docNow = useTurnDocStore.getState().doc
     const docTotal = docNow ? docNow.segments.reduce((n, s) => n + s.text.length, 0) + docNow.trailing.length : 0
-    const turnComplete = !useSessionStore.getState().streaming
+    const turnComplete = turnStreamEnded()
     const targetChars = isLastSlot && turnComplete ? Math.max(next.cumChars ?? 0, docTotal) : (next.cumChars ?? 0)
     const baseChars = Math.min(lastProgressCharsRef.current, targetChars)
     let progressTimer: ReturnType<typeof setInterval> | null = null
@@ -481,18 +529,16 @@ export default function PetApp() {
         // 主进程把文档推到 done（聊天窗/宠物窗据此落定型、光标消失）。
         // 条件：合成队列空（没有还在路上的语音块）且流式已结束（不会再有新块投放）。
         const tid = turnCoordinatorIdRef.current
-        if (tid && textQueueRef.current.length === 0 && !isSynthesizingRef.current && !useSessionStore.getState().streaming) {
+        if (tid && textQueueRef.current.length === 0 && !isSynthesizingRef.current && turnStreamEnded()) {
           api.ai.reportTurnReadingDone(tid)
         }
       }
     }
   }
 
-  // 生成结束（stream-done → streaming 翻假）时补一次朗读收尾检查：
-  // 最后一段语音常在流式结束后仍在合成/播放，播放循环里的收尾检查会因 streaming=true 跳过，
-  // 若没有这里补触发，跟读气泡与隐藏门会一直挂着，定型消息无法上屏。
-  // 同时补一次 reading 收尾上行：若全部语音在流式结束前就播完，各 finally 里的收尾上行都因
-  // 当时 streaming=true 被跳过，回合会挂到 90s 看门狗才落定（边界补漏）。
+  // 生成结束（stream-done → streaming 翻假）时补一次朗读收尾检查与 reading 收尾上行。
+  // 判据已改为回合文档 phase（不再依赖 streaming），两条 finally 里的收尾不再会被卡住；
+  // 这里保留为边界补漏：最后一段语音在流式结束后才播完、或收尾恰好在队列排空瞬间发生时兜底。
   useEffect(() => useSessionStore.subscribe((s, prev) => {
     if (prev.streaming && !s.streaming) {
       maybeFinalizeReading()
@@ -528,7 +574,7 @@ export default function PetApp() {
   // "（）输出时缺失、结束后才补进气泡"，2026-10-13 日志 4 例实锤）。
   useEffect(() => {
     const unsub = api.pet.onSpeak((payload) => {
-      const { text, voiceId, languageOverride, chunks, follow, engine, genieOverride, displayOnly, ttsSpeed } = payload ?? {}
+      const { text, voiceId, languageOverride, chunks, follow, engine, localVoice, displayOnly, ttsSpeed } = payload ?? {}
       if (!text?.trim()) return
       console.log(`[sync] pet onSpeak text=${text.slice(0, 16)} chunks=${chunks?.length ?? 0} engine=${engine ?? '?'} displayOnly=${!!displayOnly}`)
       const isFollow = follow === true
@@ -572,7 +618,7 @@ export default function PetApp() {
           emotion: c.emotion,
           kind: c.kind,
           engine,
-          genieOverride: genieOverride ?? null,
+          localVoice: localVoice ?? null,
           cumChars: 0,
           speed: ttsSpeed ?? null,
         }))
@@ -635,6 +681,64 @@ export default function PetApp() {
     else api.app.openChat()
   }
 
+  /** 内容框实际是否可见 = 用户手动展开 或 眼睛按钮临时展开 */
+  const showContent = contentOpen || autoOpen
+
+  /** 手动展开（持久化） */
+  const openContentManually = () => {
+    setAutoOpen(false)
+    setContentOpen(true)
+  }
+
+  /** 收起：同时清掉临时展开 */
+  const closeContent = () => {
+    setAutoOpen(false)
+    setContentOpen(false)
+  }
+
+  const toggleContent = () => {
+    if (showContent) closeContent()
+    else openContentManually()
+  }
+
+  /**
+   * 眼睛按钮：立刻看一次屏幕并让角色开口。
+   * 前置：屏幕感知已开启（视觉模型是否配置由主进程判定并回报）。
+   * 展开内容框是临时的，不写持久化。
+   */
+  const handleLookNow = async () => {
+    if (looking) return
+    if (!useSettingsStore.getState().settings.enableScreenSense) {
+      toast('屏幕感知未开启，请在「设置 → 视觉」中开启', 'info')
+      return
+    }
+    const wasOpen = showContent
+    setLooking(true)
+    setGlowing(true)
+    setAutoOpen(true)
+    if (glowTimerRef.current) clearTimeout(glowTimerRef.current)
+    // 视觉模型 + 一轮回复可能要十几秒；光效只表达"正在看"，6s 后自动熄灭
+    glowTimerRef.current = setTimeout(() => setGlowing(false), 6000)
+    try {
+      const r = await api.proactive.lookNow()
+      if (!r.ok) {
+        if (r.error) toast(r.error, 'error')
+        // 没看成：把临时展开收回，别留一个空面板挡着立绘
+        if (!wasOpen) setAutoOpen(false)
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '看失败了', 'error')
+      if (!wasOpen) setAutoOpen(false)
+    } finally {
+      setLooking(false)
+      setGlowing(false)
+      if (glowTimerRef.current) {
+        clearTimeout(glowTimerRef.current)
+        glowTimerRef.current = null
+      }
+    }
+  }
+
   return (
     <div
       style={{ width: PET_W, height: MODEL_H + INPUT_H }}
@@ -650,11 +754,11 @@ export default function PetApp() {
       </div>
 
       {/* 底部浮层：迷你会话内容框（半透明叠加在模型上，位于输入框上方） */}
-      {contentOpen && (
+      {showContent && (
         <div className="app-no-drag absolute bottom-12 left-1 z-30" style={{ height: contentH, width: 'calc(100% - 8px)' }}>
           <PetMiniChat
             contentH={contentH}
-            onToggle={() => setContentOpen((v) => !v)}
+            onToggle={toggleContent}
             onResize={setContentH}
             ctxStats={ctxStats}
             windowTokens={windowTokens}
@@ -665,23 +769,39 @@ export default function PetApp() {
         </div>
       )}
 
-      {/* 模型取右上角 no-drag 小按钮（聊天/设置） */}
-      <div className="app-no-drag absolute right-2 top-1 flex items-center gap-2" style={{ zIndex: 40 }}>
-        <PetQuickButton title="打开聊天" onClick={openChatWithCurrentSession}>
-          <MessageSquare size={14} strokeWidth={1.75} />
-        </PetQuickButton>
-        <PetQuickButton title="打开设置" onClick={() => api.app.openSettings()}>
-          <Settings size={14} strokeWidth={1.75} />
-          <PendingMemoryBadge />
-        </PetQuickButton>
-        <PetQuickButton title="退出应用" onClick={() => api.app.quit()}>
-          {/* hover 变红（退出语义）：group-hover 覆盖按钮的 hover:text-text */}
-          <LogOut size={14} strokeWidth={1.75} className="group-hover:!text-danger" />
-        </PetQuickButton>
+      {/* 快捷按钮（两行，右对齐）：第一行 眼睛 + 聊天，第二行 设置 + 退出 */}
+      <div className="app-no-drag absolute right-2 top-1 flex flex-col items-end gap-1.5" style={{ zIndex: 40 }}>
+        <div className="flex items-center gap-1.5">
+          <PetQuickButton
+            title={looking ? '正在看…' : '看一眼我的屏幕'}
+            onClick={() => void handleLookNow()}
+            disabled={looking}
+          >
+            {/* 识屏期间：图标主色 + 脉冲后转呼吸光（有屏幕识别就完整亮，不做分级） */}
+            <Eye
+              size={14}
+              strokeWidth={1.75}
+              className={glowing ? 'sense-glow text-[var(--primary-400)]' : ''}
+            />
+          </PetQuickButton>
+          <PetQuickButton title="打开聊天" onClick={openChatWithCurrentSession}>
+            <MessageSquare size={14} strokeWidth={1.75} />
+          </PetQuickButton>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <PetQuickButton title="打开设置" onClick={() => api.app.openSettings()}>
+            <Settings size={14} strokeWidth={1.75} />
+            <PendingMemoryBadge />
+          </PetQuickButton>
+          <PetQuickButton title="退出应用" onClick={() => api.app.quit()}>
+            {/* hover 变红（退出语义）：group-hover 覆盖按钮的 hover:text-text */}
+            <LogOut size={14} strokeWidth={1.75} className="group-hover:!text-danger" />
+          </PetQuickButton>
+        </div>
       </div>
 
       {/* 收起态：右下角胶囊唤起会话（左侧为上下文工具栏：token 用量 + 手动压缩） */}
-      {!contentOpen && (
+      {!showContent && (
         <div className="app-no-drag absolute bottom-10 right-2 z-50 flex items-center gap-1.5">
           <PetContextToolbar
             stats={ctxStats}
@@ -692,7 +812,7 @@ export default function PetApp() {
           />
           <button
             type="button"
-            onClick={() => setContentOpen(true)}
+            onClick={openContentManually}
             className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] font-medium text-text transition-colors hover:text-[var(--primary-400)]"
             title="展开聊天会话"
           >
@@ -727,12 +847,23 @@ export default function PetApp() {
   )
 }
 
-function PetQuickButton({ title, onClick, children }: { title: string; onClick: () => void; children: React.ReactNode }) {
+function PetQuickButton({
+  title,
+  onClick,
+  disabled,
+  children,
+}: {
+  title: string
+  onClick: () => void
+  disabled?: boolean
+  children: React.ReactNode
+}) {
   return (
     <button
       title={title}
       onClick={onClick}
-      className="glass-strong group relative flex h-8 w-8 items-center justify-center rounded-full text-text-2 transition-colors hover:text-text hover:shadow-[0_0_10px_var(--primary-glow)]"
+      disabled={disabled}
+      className="glass-strong group relative flex h-8 w-8 items-center justify-center rounded-full text-text-2 transition-colors hover:text-text hover:shadow-[0_0_10px_var(--primary-glow)] disabled:cursor-default disabled:opacity-70"
     >
       {children}
     </button>

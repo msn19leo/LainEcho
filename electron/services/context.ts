@@ -9,7 +9,7 @@
  *
  * 摘要走独立 prompt（对话总结助手），绝不混入主对话的 EMOTION_PROMPT JSON 约束。
  */
-import type { ChatMessage } from '../../src/types'
+import type { ChatImage, ChatMessage } from '../../src/types'
 import { estimateMessagesTokens } from './token'
 
 /** 触发摘要的阈值：总 token > contextWindow × COMPACT_THRESHOLD 时压缩 */
@@ -43,6 +43,11 @@ function formatSummaryLine(m: ModelMessage, timeAware: boolean): string {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
+  /**
+   * 本轮附带的图片（仅 user 消息；由 chatTurn 按「图片记忆轮数」裁剪后再转成
+   * 多模态 content parts）。摘要/导出等纯文本链路一律忽略本字段。
+   */
+  images?: ChatImage[]
   /** 消息时间戳（时间感知方案1/3 的数据通道；仅用于间隔标注与摘要时间线，不作为消息内容发送） */
   timestamp?: number
 }
@@ -73,7 +78,10 @@ export interface ContextBuildResult {
 
 /** 消息净化：剥离 UI 元数据，只保留 {role, content}（timestamp 一并透传，供时间感知链路消费） */
 export function toModelMessage(m: ChatMessage): ModelMessage {
-  return { role: m.role, content: m.content ?? '', timestamp: m.timestamp }
+  const msg: ModelMessage = { role: m.role, content: m.content ?? '', timestamp: m.timestamp }
+  // 图片随消息透传到装填层（是否真的发给模型由 chatTurn 的读图方式与轮数窗口决定）
+  if (m.images?.length) msg.images = m.images
+  return msg
 }
 
 /** 构造「历史对话总结」占位消息（带标记，供下次识别替换） */

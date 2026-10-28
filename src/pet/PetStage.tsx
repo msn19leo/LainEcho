@@ -157,7 +157,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   /** 全局当前立绘集 id（modelSettings.selectedSpriteId，角色卡未绑定立绘时回退用） */
   const selectedSpriteIdRef = useRef<string | null>(null)
   /** 桌面立绘展示状态：idle(状态词展示) / speaking(说话) / thinking(思考) */
-  const displayStateRef = useRef<'idle' | 'speaking' | 'thinking'>('idle')
+  const displayStateRef = useRef<'idle' | 'speaking' | 'thinking' | 'observing'>('idle')
   /** 上一帧说话状态（检测翻转以触发说话立绘切换） */
   const lastSpeakingRef = useRef(false)
   /** 立绘解析代数：每次 applySprite 递增，过期解析/重试结果作废 */
@@ -359,7 +359,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     gen: number,
     spriteId: string | null,
     emotion: string = BUILTIN_DEFAULT_EMOTION,
-    variant: 'idle' | 'speaking' | 'thinking' = 'idle',
+    variant: 'idle' | 'speaking' | 'thinking' | 'observing' = 'idle',
   ) {
     if (!spriteId) {
       if (gen !== spriteGenRef.current) return
@@ -398,7 +398,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       const calmFile = resolvePaletteImage(spr, BUILTIN_DEFAULT_EMOTION)
       // 变体立绘优先：思考 > 说话 > 状态查表图
       let file: string | null = null
-      if (variant === 'thinking' && has(spr.thinkingImage)) {
+      if (variant === 'observing') {
+        // 观察态（点眼睛看屏幕的那几秒）：未配置观察图时回落思考图——
+        // 两者都是"处理中"的演出，回落可避免用户点了却看不出反应
+        if (has(spr.observingImage)) file = spr.observingImage
+        else if (has(spr.thinkingImage)) file = spr.thinkingImage
+      } else if (variant === 'thinking' && has(spr.thinkingImage)) {
         file = spr.thinkingImage
       } else if (variant === 'speaking' && has(spr.speakingImage) && (emotionFile == null || (calmFile != null && emotionFile === calmFile))) {
         file = spr.speakingImage
@@ -673,6 +678,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     let unsubSettings = () => {}
     let unsubEmotion = () => {}
     let unsubThinking = () => {}
+    let unsubObserving = () => {}
     let unsubSprites = () => {}
     let unsubCursor = () => {}
     let ro: ResizeObserver | null = null
@@ -1000,6 +1006,23 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applySprite()
     })
 
+    // 订阅"观察中"状态：点眼睛后看屏幕（截图 + 视觉模型转述）的那几秒切观察立绘。
+    // 正常路径下这里**不会收到 false**——转述完成后 runChatTurn 立刻发 thinking(true)
+    // 直接覆盖，视觉上是 观察图 → 思考图 无缝衔接，中间不闪状态图。
+    // 收到 false 只可能是"观察了但没进入对话"的异常路径，做一次兜底归位。
+    unsubObserving = api.pet.onObserving((observing: boolean) => {
+      if (modeRef.current !== 'sprite') return
+      if (observing) {
+        if (displayStateRef.current === 'observing') return
+        displayStateRef.current = 'observing'
+      } else {
+        // 已被 thinking 覆盖（正常路径）或本来就空闲 → 无需重解析
+        if (displayStateRef.current !== 'observing') return
+        displayStateRef.current = 'idle'
+      }
+      applySprite()
+    })
+
     // 订阅立绘集列表变化（导入/删除/词表编辑后重解析 + 刷新词表快照）
     unsubSprites = api.sprite.onChanged(() => {
       void refreshPalette()
@@ -1028,6 +1051,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       unsubSettings()
       unsubEmotion()
       unsubThinking()
+      unsubObserving()
       unsubSprites()
       unsubCursor()
       ro?.disconnect()

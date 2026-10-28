@@ -100,6 +100,7 @@ export function PetContentList() {
   const typeSpeed = typingSpeedToMs(textSpeed)
   const messages = useSessionStore((s) => s.messages)
   const streaming = useSessionStore((s) => s.streaming)
+  const rewinding = useSessionStore((s) => s.rewinding)
   // ===== 方案A第3步：单源切换——turnDocStore 是唯一直播数据源 =====
   // 旧跟读累积链（petReadingStore.displayedText/segments）退役；朗读进度由
   // ai:turn-progress 上行进文档、随快照分发，两窗同源天然一致。
@@ -278,10 +279,10 @@ export function PetContentList() {
         const lastMessage = messages[messages.length - 1]
         // 末条是旁白/剧情消息（非真实用户输入）时不提示"未收到回复"
         const lastIsUser = !!lastMessage && lastMessage.role === 'user' && !lastMessage.meta?.proactive
-        return lastIsUser && !streaming ? (
+        return lastIsUser && !streaming && !rewinding ? (
           <div className="my-1 flex justify-center">
             <p
-              className="max-w-[92%] rounded-[5px] border border-border bg-[var(--bg-surface)]/70 px-2 py-1 text-center text-[10px]"
+              className="max-w-[92%] break-all whitespace-pre-wrap rounded-[5px] border border-border bg-[var(--bg-surface)]/70 px-2 py-1 text-center text-[10px]"
               style={{ color: 'var(--warning)' }}
             >
               上一条消息未收到回复

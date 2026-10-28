@@ -13,6 +13,7 @@
  *     从根上消除回答收尾时入场动画重播造成的气泡闪烁。
  */
 import { Fragment, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { createPortal } from 'react-dom'
 import { motion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { useSessionStore } from '../store/sessionStore'
@@ -27,7 +28,10 @@ import { liveSegmentsOf, useTurnDocStore } from '../store/turnDocStore'
 import { useAutoScrollBottom } from '../lib/useAutoScrollBottom'
 import { PositionedMenu } from '../components/DropdownMenu'
 import { RewindEditBox, rewindTargetFor, useRewind } from '../components/messageRewind'
-import type { ChatMessage } from '../types'
+import { ConfirmModal } from '../components/ui'
+import { Lightbox } from '../components/Lightbox'
+import { ChatImageThumb } from '../components/ChatImageThumb'
+import type { ChatImage, ChatMessage } from '../types'
 import { popSlideUp, springElastic } from '../lib/motion'
 
 /** 距底部小于该阈值视为"接近底部"，此时才自动跟随滚动 */
@@ -39,6 +43,7 @@ export function MessageList() {
   // 顶层订阅直播源：仅用于 roundActive 上升沿判定（本轮是否开始过）
   const streamingContent = useSessionStore((s) => s.streamingContent)
   const streaming = useSessionStore((s) => s.streaming)
+  const rewinding = useSessionStore((s) => s.rewinding)
   const streamError = useSessionStore((s) => s.streamError)
   const currentSessionId = useSessionStore((s) => s.currentSessionId)
   const currentCardName = useCurrentCardName()
@@ -77,6 +82,11 @@ export function MessageList() {
     setRoundSession(currentSessionId)
     setRoundActive(false)
   }
+  // 编辑重发截断后主进程清空回合文档：渲染期就交还末条 AI 槽位，
+  // 避免 map 与 LastAiSlot 同时渲染同一条 assistant 造成一帧重复
+  if (!roundTurnDoc && !streaming && roundActive) {
+    setRoundActive(false)
+  }
   useEffect(() => {
     // 方案A单源：快照存在（属于当前会话且未 done）即直播活跃——认领=拉快照后，
     // 快照到达本身就是接管信号（生成中/跟读中开窗的两个场景由此结构性解决）。
@@ -87,6 +97,12 @@ export function MessageList() {
       setRoundActive(true)
     }
   }, [currentSessionId, streaming, roundTurnActive, roundTurnLive, roundTurnSeq, roundTurnDoc])
+
+  // 编辑重发截断后主进程会主动清空回合文档：末条 AI 槽位必须交还给 map，
+  // 否则它会拿着截断后的"上一条 assistant"再渲染一遍（与 map 重复/错位）
+  useEffect(() => {
+    if (!roundTurnDoc && !streaming) setRoundActive(false)
+  }, [roundTurnDoc, streaming])
 
   /**
    * 本轮用户气泡（方案A权威源）：快照自含本轮 user 消息，直播期间只要 messages 里还没有
@@ -124,10 +140,10 @@ export function MessageList() {
   // 仅在用户接近底部时跟随，尊重其上翻历史
   useAutoScrollBottom(listRef, contentRef, nearBottomRef, [messages, streaming, streamError])
 
-  /** 消息重答（最后一轮）：右键气泡 → 编辑并重发 / 重新回答（与桌宠迷你会话框共用逻辑） */
+  /** 消息重答：任意 user 气泡可编辑重发；最后一轮 assistant 可重新回答 */
   const rewind = useRewind()
 
-  if (messages.length === 0 && !streaming) {
+  if (messages.length === 0 && !streaming && !rewinding) {
     return (
       <div className="flex flex-1 items-center justify-center px-6 py-8" style={{ background: 'var(--bg-base)' }}>
         <motion.div
@@ -181,11 +197,11 @@ export function MessageList() {
             transition={{ ...popSlideUp.transition, delay: Math.min(i * 0.04, 0.32) }}
             className={cn('flex', isUser ? 'justify-end' : 'justify-start')}
             onContextMenu={(e) => {
-              // 消息重答入口（仅最后一轮）：user 气泡=编辑并重发，assistant 气泡=重新回答
-              const kind = rewindTargetFor(i, messages, streaming)
-              if (!kind) return
+              // 消息重答入口：任意 user 气泡=编辑并重发；最后一轮 assistant=重新回答
+              const target = rewindTargetFor(i, messages, rewind.busy)
+              if (!target) return
               e.preventDefault()
-              rewind.openMenu(kind, e.clientX, e.clientY)
+              rewind.openMenu(target.kind, e.clientX, e.clientY, i)
             }}
           >
             <div className="max-w-[80%] text-left">
@@ -193,12 +209,19 @@ export function MessageList() {
                 <span>{isUser ? '你' : currentCardName || 'AI'}</span>
                 {msg.timestamp && <span>{formatTime(msg.timestamp)}</span>}
               </div>
-              {/* 气泡原位编辑（最后一轮 user）：textarea 替换气泡，确认 = 编辑并重发。
-                  挂载位置用 rewindTargetFor 单一事实源判定——同时覆盖完整轮（user=倒数第二）
-                  与孤立 user（发送失败落盘的"未收到回复"消息=末条，2026-10-20 修复：旧条件
-                  写死 length-2 导致失败轮右键能弹菜单但编辑框永不出现） */}
-              {isUser && rewind.editing && rewindTargetFor(i, messages, streaming) === 'edit' ? (
-                <RewindEditBox initial={msg.content} onConfirm={rewind.confirmEdit} onCancel={rewind.cancelEdit} />
+              {/* 气泡原位编辑：textarea 替换气泡，确认 = 编辑并重发。
+                  editing 绑定 sessionId + 下标 + 内容/时间戳，截断/追加/切会话后自动失效。 */}
+              {isUser && rewind.editing?.targetIndex === i && rewind.editing.sessionId === currentSessionId ? (
+                <RewindEditBox
+                  initial={msg.content}
+                  hint={
+                    i === messages.length - 1 || (i === messages.length - 2 && messages[messages.length - 1]?.role === 'assistant')
+                      ? '确认后将删除本轮回复并重新生成'
+                      : `确认后将删除该消息及其后 ${messages.length - i} 条消息`
+                  }
+                  onConfirm={rewind.confirmEdit}
+                  onCancel={rewind.cancelEdit}
+                />
               ) : (
                 <div
                   className={cn(
@@ -211,7 +234,7 @@ export function MessageList() {
                   )}
                 >
                   {isUser ? (
-                    msg.content
+                    <UserBubbleContent message={msg} />
                   ) : (
                     <AssistantBubbles message={msg} />
                   )}
@@ -237,7 +260,7 @@ export function MessageList() {
                 {docUser!.timestamp && <span>{formatTime(docUser!.timestamp)}</span>}
               </div>
               <div className="selectable whitespace-pre-wrap break-words rounded-[var(--radius-lg)] rounded-br-[var(--radius-md)] bg-primary-gradient px-4 py-2.5 text-sm leading-relaxed text-[var(--on-brand)] shadow-[var(--shadow-glow-primary)]">
-                {docUser!.content}
+                <UserBubbleContent message={docUser!} />
               </div>
             </div>
           </motion.div>
@@ -269,20 +292,20 @@ export function MessageList() {
           <>
             {streamError && !streaming && !lastIsUser && (
               <div className="flex justify-center">
-                <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-                  <AlertTriangle size={14} strokeWidth={1.75} />
-                  {streamError}
+                <div className="flex items-start gap-2 rounded-[var(--radius-md)] border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+                  <AlertTriangle size={14} strokeWidth={1.75} className="mt-0.5 shrink-0" />
+                  <span className="min-w-0 break-all whitespace-pre-wrap">{streamError}</span>
                 </div>
               </div>
             )}
-            {!streaming && lastIsUser && !lastMessage!.meta?.cancelled && (
+            {!streaming && !rewinding && lastIsUser && !lastMessage!.meta?.cancelled && (
               <div className="flex justify-center">
                 <div
-                  className="flex max-w-[85%] items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-xs"
+                  className="flex max-w-[85%] items-start gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-xs"
                   style={{ color: 'var(--warning)' }}
                 >
-                  <AlertTriangle size={14} strokeWidth={1.75} />
-                  <span>
+                  <AlertTriangle size={14} strokeWidth={1.75} className="mt-0.5 shrink-0" />
+                  <span className="min-w-0 break-all whitespace-pre-wrap">
                     上一条消息未收到回复
                     {lastMessage!.error ? `：${lastMessage.error}` : '（可能网络中断或服务暂不可用）'}
                   </span>
@@ -292,7 +315,7 @@ export function MessageList() {
           </>
         )
       })()}
-      {/* 消息重答右键菜单：编辑并重发（最后一轮 user）/ 重新回答（最后一轮 assistant） */}
+      {/* 消息重答右键菜单：任意 user 气泡=编辑并重发；最后一轮 assistant=重新回答 */}
       <PositionedMenu
         x={rewind.menu?.x ?? 0}
         y={rewind.menu?.y ?? 0}
@@ -304,6 +327,24 @@ export function MessageList() {
         }
         onClose={rewind.closeMenu}
       />
+      {/* 中间消息编辑：确认后才会截断，避免误删后续对话。Portal 到 body，
+          避免 FloatingDock/glass 的 transform 让 fixed 弹窗相对祖先定位。 */}
+      {createPortal(
+        <ConfirmModal
+          open={!!rewind.pendingConfirm}
+          title="编辑并重发"
+          message={
+            rewind.pendingConfirm
+              ? `将删除该消息及其后共 ${rewind.pendingConfirm.deletedCount} 条消息，并用编辑后的内容重新生成。情景摘要会按截断点重建；删除后无法恢复。`
+              : ''
+          }
+          confirmText="删除并重发"
+          danger
+          onConfirm={rewind.confirmPending}
+          onClose={rewind.cancelPending}
+        />,
+        document.body,
+      )}
       </div>
     </div>
   )
@@ -511,4 +552,34 @@ function useCurrentCardName(): string {
   const currentId = useCharacterStore((s) => s.currentCardId)
   const card = cards.find((c) => c.id === currentId)
   return card?.name ?? 'AI'
+}
+
+/**
+ * 用户气泡内容：图片缩略图（点击全屏）+ 文本。
+ * content 末尾带 `[图片]` / `[图片×N]` 占位（供桌宠窗/摘要/导出等纯文本下游使用），
+ * 有图时在这里剥掉——缩略图已经表达了同一件事，不剥会出现"文字 + [图片] + 图片"三重重复。
+ * 无图（文件被保留期清理 / 历史数据）时保留占位当正文。
+ */
+const IMAGE_MARKER_RE = /\s*\[图片(?:×\d+)?\]\s*$/u
+
+function UserBubbleContent({ message }: { message: { content: string; images?: ChatImage[] } }) {
+  const [preview, setPreview] = useState<string | null>(null)
+  const images = message.images ?? []
+  const raw = message.content ?? ''
+  // 只在有图时剥标记（无图消息保持原文，不额外改动既有渲染行为）
+  const text = images.length > 0 ? raw.replace(IMAGE_MARKER_RE, '').trim() : raw
+  const showText = text.trim().length > 0
+  return (
+    <>
+      {images.length > 0 && (
+        <div className={cn('flex flex-wrap gap-1.5', showText && 'mb-2')}>
+          {images.map((img) => (
+            <ChatImageThumb key={img.path} image={img} onClick={() => setPreview(api.chat.imageUrl(img.path))} />
+          ))}
+        </div>
+      )}
+      {showText && text}
+      {preview && <Lightbox src={preview} onClose={() => setPreview(null)} />}
+    </>
+  )
 }

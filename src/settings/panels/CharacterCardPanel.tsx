@@ -292,7 +292,7 @@ export function CharacterCardPanel() {
       modelId: card.modelId ?? '',
       voiceId: card.voiceId ?? '',
       voiceMode: card.voiceMode ?? (card.voiceId ? 'mimo' : 'none'),
-      ttsModelId: card.genieOverride?.ttsModelId ?? '',
+      ttsModelId: card.localVoice?.ttsModelId ?? '',
       ttsLanguageOverride: ttsLanguageToEditor(card.ttsOverride),
       ttsSpeed: card.ttsSpeed ?? 1,
       renderMode: card.renderMode ?? 'global',
@@ -313,8 +313,8 @@ export function CharacterCardPanel() {
         modelId: editor.modelId || null,
         voiceId: editor.voiceMode === 'mimo' ? editor.voiceId || null : null,
         voiceMode: editor.voiceMode,
-        genieOverride:
-          editor.voiceMode === 'genie' && editor.ttsModelId
+        localVoice:
+          (editor.voiceMode === 'genie' || editor.voiceMode === 'sbv2') && editor.ttsModelId
             ? { ttsModelId: editor.ttsModelId }
             : null,
         ttsOverride: editorToTtsOverride(editor.ttsLanguageOverride),
@@ -338,6 +338,25 @@ export function CharacterCardPanel() {
     } finally {
       setSaving(false)
     }
+  }
+
+  /**
+   * 切换声音模式时校正模型绑定：
+   * Genie 与 SBV2 的模型卡分属不同集合，若原绑定不属于目标引擎就直接清空，
+   * 避免出现「下拉显示已选、卡片却不在候选里」的悬空状态。
+   */
+  const applyVoiceMode = (mode: import('../../types').CharacterVoiceMode) => {
+    const wantEngine = mode === 'sbv2' ? 'sbv2' : mode === 'genie' ? 'genie' : null
+    const current = ttsModels.find((m) => m.id === editor!.ttsModelId)
+    const keepModel = !!(wantEngine && current && (current.engine ?? 'genie') === wantEngine)
+    setEditor({
+      ...editor!,
+      voiceMode: mode,
+      ttsModelId: wantEngine ? (keepModel ? editor!.ttsModelId : '') : editor!.ttsModelId,
+      // SBV2 只能日文：顺手把可能残留的「强制中文」拨回日文
+      ttsLanguageOverride:
+        mode === 'sbv2' && editor!.ttsLanguageOverride === 'zh' ? 'ja' : editor!.ttsLanguageOverride,
+    })
   }
 
   /** 删除角色卡 */
@@ -413,17 +432,17 @@ export function CharacterCardPanel() {
                 )}
                 {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'genie' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
-                    本地声库
+                    Genie-TTS
+                  </span>
+                )}
+                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'sbv2' && (
+                  <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
+                    本地 SBV2
                   </span>
                 )}
                 {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'mimo' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
                     声音克隆
-                  </span>
-                )}
-                {card.ttsOverride && (
-                  <span className="rounded-full bg-warning/15 px-2 py-1 text-[10px] text-warning ring-1 ring-warning/30">
-                    TTS覆盖
                   </span>
                 )}
               </div>
@@ -848,16 +867,17 @@ export function CharacterCardPanel() {
             {activeTab === 'voice' && (
               <div className="space-y-4">
                 {/* 声音模式选项卡 */}
-                <div className="flex gap-2">
+                <div className="grid grid-cols-2 gap-2">
                   {([
                     { value: 'none', label: '不启用 TTS' },
                     { value: 'genie', label: '本地 Genie-TTS' },
+                    { value: 'sbv2', label: '本地 SBV2（日文）' },
                     { value: 'mimo', label: '云端语音克隆' },
                   ] as const).map((o) => (
                     <button
                       key={o.value}
-                      onClick={() => setEditor({ ...editor, voiceMode: o.value })}
-                      className={`flex-1 rounded-[var(--radius-sm)] border px-3 py-2 text-sm transition-all ${
+                      onClick={() => applyVoiceMode(o.value)}
+                      className={`rounded-[var(--radius-sm)] border px-3 py-2 text-sm transition-all ${
                         editor.voiceMode === o.value
                           ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
                           : 'border-border text-text-2 hover:border-border-strong hover:text-text'
@@ -876,13 +896,15 @@ export function CharacterCardPanel() {
                 {/* 本地 Genie-TTS */}
                 {editor.voiceMode === 'genie' && (
                   <>
-                    <Field label="绑定 TTS 模型" hint="选择本地声库的角色 TTS 模型。需先在「语音合成」中创建模型卡。">
+                    <Field label="绑定 TTS 模型" hint="选择Genie-TTS的角色 TTS 模型。需先在「语音合成」中创建模型卡。">
                       <SelectMenu
                         value={editor.ttsModelId}
                         onChange={(v) => setEditor({ ...editor, ttsModelId: v })}
                         options={[
                           { value: '', label: '选择 TTS 模型…' },
-                          ...ttsModels.map((m) => ({ value: m.id, label: m.name })),
+                          ...ttsModels
+                            .filter((m) => (m.engine ?? 'genie') === 'genie')
+                            .map((m) => ({ value: m.id, label: m.name })),
                         ]}
                         className="w-full"
                       />
@@ -919,6 +941,46 @@ export function CharacterCardPanel() {
                 )}
 
                 {/* 云端声音克隆 */}
+                {/* 本地 SBV2（仅日文） */}
+                {editor.voiceMode === 'sbv2' && (
+                  <>
+                    <Field label="绑定声线" hint="选择 Style-Bert-VITS2 声线。需先在「语音合成 → 本地 SBV2」中添加。">
+                      <SelectMenu
+                        value={editor.ttsModelId}
+                        onChange={(v) => setEditor({ ...editor, ttsModelId: v })}
+                        options={[
+                          { value: '', label: '选择声线…' },
+                          ...ttsModels
+                            .filter((m) => m.engine === 'sbv2')
+                            .map((m) => ({ value: m.id, label: m.name })),
+                        ]}
+                        className="w-full"
+                      />
+                    </Field>
+                    {!editor.ttsModelId && (
+                      <p className="text-[11px] text-warning">
+                        请先在「设置 → 语音合成 → 本地 SBV2」中添加声线
+                      </p>
+                    )}
+                    <p className="text-[11px] leading-relaxed text-text-muted">
+                      该引擎仅支持日文：中文台词会先翻译为日语再合成，因此没有语言覆盖选项。
+                    </p>
+                    <Field label="TTS 语速" hint="该角色说话的语速倍率（1 = 原速）。主进程合成后重采样变速，过快/过慢会有明显变调。">
+                      <div className="w-full">
+                        <Slider
+                          value={editor.ttsSpeed}
+                          min={0.75}
+                          max={1.5}
+                          step={0.05}
+                          onChange={(v) => setEditor({ ...editor, ttsSpeed: Math.round(v * 100) / 100 })}
+                          format={(v) => `${v.toFixed(2)}x`}
+                        />
+                      </div>
+                    </Field>
+                  </>
+                )}
+
+
                 {editor.voiceMode === 'mimo' && (
                   <>
                     <Field label="绑定参考音频" hint="绑定后该角色回复用此声音克隆合成。需先在「语音合成」中导入参考音频。">

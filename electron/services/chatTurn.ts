@@ -10,15 +10,17 @@
  *  - user 消息可携带 meta 标记（proactive/story）落盘并随 stream-user 广播；
  *  - proactive 轮次跳过记忆抽取，且历史中的 proactive 旁白消息一律不参与抽取。
  */
-import type { ChatMessage, ChatMessageMeta } from '../../src/types'
-import { sendChatCompletion } from './aiClient'
+import type { ChatImage, ChatMessage, ChatMessageMeta, TTSEngine, VisionReadMode } from '../../src/types'
+import { sendChatCompletion, type ApiContentPart, type ApiMessage } from './aiClient'
 import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, consumeLeadingNarration, stripParenGroups, emotionAdherence, splitLeadingNarrGroups, extractScriptChunkDelta, prepareScriptPartial, stripStreamWrappers } from './emotion'
 import { buildModelContext, SUMMARY_MAX_TOKENS, toModelMessage, type ModelMessage } from './context'
+import { readImageAsBase64 } from './chatImages'
+import { describeChatImage } from './chatImageCaption'
 import { estimateMessagesTokens } from './token'
-import { getTTSConfig } from '../ipc/tts.ipc'
 import { resolveProfile, type ResolvedLlmConfig } from './apiProfiles'
 import { resolveAuxLlmConfig } from './auxModel'
 import { buildSceneSection, buildCharacterBrief, updateSceneDigestAfterTurn } from './sceneContext'
+import { getForegroundTitle, summarizeWindowTitle } from './perception/foreground'
 import { extractMemoriesFromSession } from './memoryExtraction'
 import {
   appendSessionMessages,
@@ -35,6 +37,7 @@ import type { EmotionPaletteRef } from '../../src/types'
 import { retrieveMemories } from './memory/retriever'
 import { windowManager } from '../windows/windowManager'
 import * as turnCoordinator from './turnCoordinator'
+import { isRewindBusy } from './rewindState'
 
 /**
  * ① 历史格式示范轮数：最近 N 条 assistant 消息以紧凑 dialogue JSON 回传给模型。
@@ -47,7 +50,7 @@ const HISTORY_JSON_TURNS = 6
 
 /**
  * ⑤ 尾部格式提醒（不落盘）：追加在请求 messages 末尾（最后一条 user 之后，离生成点最近）。
- * Shinsekai 式收尾契约（closing_json_reminder）放在 system 段末尾——长会话下仍会被 history
+ * 收尾契约（closing_json_reminder）放在 system 段末尾——长会话下仍会被 history
  * 稀释；放 messages 尾部权重最高。与 ① 历史格式示范（最近 N 条 JSON few-shot）构成双保险，
  * 压制长会话 JSON 漂移（2026-10-20 00:46 轮实锤：msgs 47 起连续 8 轮直通、状态词恒默认）。
  * 仅组装层动态注入：不进落盘历史、不影响记忆检索（与时间戳前缀同一策略）。
@@ -83,12 +86,12 @@ function backfillHistoryJson(history: ChatMessage[]): ChatMessage[] {
  *  绝对时刻下模型可自行推导时长，相对跳转标注冗余 */
 
 /**
- * 时间感知（Shinsekai 式逐条绝对时间，2026-10-16）：给每条 user 消息按**自身 timestamp** 注入
+ * 时间感知（逐条绝对时间，2026-10-16）：给每条 user 消息按**自身 timestamp** 注入
  * `[YYYY-MM-DD HH:mm:ss]` 独立行前缀。历史消息携带"当时的时刻"，"现在几点/我们聊了多久/
  * 开始说话时几点"均可从历史推导（2026-10-16 00:23 轮实锤：模型被问时间时只能按场景编造）。
  *
  * 关键设计：前缀在**组装层动态生成**而非持久化——落盘内容不变，记忆检索发生在组装前、
- * 用原始 content，天然无嵌入污染（Shinsekai 因持久化前缀需要额外的剥前缀防御，本方案不需要）。
+ * 用原始 content，天然无嵌入污染（因持久化前缀需要额外的剥前缀防御，本方案不需要）。
  * 仅标 user 消息（assistant 时刻可由前后 user 消息推导，省 token）；**剧情轮次不标**（故事
  * 时间轴优先，真实时间戳会干扰剧情沉浸）。user 消息不被 ①JSON 示范改写（只作用 assistant），
  * 前缀无冲突。总开关关闭时原样返回。
@@ -124,9 +127,109 @@ function toModelMessageWithNarration(m: ChatMessage): ModelMessage {
   return msg
 }
 
+/**
+ * 按「读图方式 + 图片记忆轮数」整理模型消息里的图片。
+ *
+ * - describe：把 caption 拼成文本块附在 content 后，并剥离 images —— 主模型只看到文字转述；
+ * - direct：只保留最近 `captionRounds + 1` 条 user 消息的原图，更早的剥离；
+ *   若该图已有 caption（记忆轮数 > 0 时才会生成），用文字块兜底，否则只剩 content 里的 [图片] 占位。
+ *
+ * 必须在 buildModelContext **之前**调用：token 估算与预算装填要按最终形态（图片 or 文字）计数。
+ */
+/** 历史图片的转述截断长度：本轮给全文，早轮只留摘要，避免多图长文长期占据上下文 */
+const HISTORY_CAPTION_CHARS = 120
+
+function prepareVisionMessages(messages: ModelMessage[], mode: VisionReadMode, captionRounds: number): ModelMessage[] {
+  // 模型侧不需要 `[图片×N]` 标记：直读时它拿到真图，辅助时拿到下面的文字块。
+  // 该标记只服务纯文本下游（桌宠窗/摘要/导出），留着会与图片/caption 重复。
+  const cleaned = messages.map((m) => {
+    if (!m.images?.length) return m
+    const withoutMarker = m.content.replace(/\s*\[图片(?:×\d+)?\]\s*$/u, '').trim()
+    return withoutMarker ? { ...m, content: withoutMarker } : m
+  })
+
+  /**
+   * 拼图片文字块。
+   * @param full true = 本轮（给完整转述）；false = 历史轮（截断到 HISTORY_CAPTION_CHARS，控制长期占用）
+   */
+  const toTextBlock = (imgs: ChatImage[], full: boolean): string => {
+    const blocks = imgs
+      .map((img, i) => {
+        if (!img.caption) return ''
+        const text = full || img.caption.length <= HISTORY_CAPTION_CHARS ? img.caption : `${img.caption.slice(0, HISTORY_CAPTION_CHARS)}…`
+        return `【图片 ${i + 1}】${text}`
+      })
+      .filter(Boolean)
+    if (blocks.length === 0) return ''
+    return `（用户随消息发来 ${imgs.length} 张图片，以下是你看到的内容）\n${blocks.join('\n')}`
+  }
+
+  /** 最后一条带图消息 = 本轮（只有它会拿到完整转述） */
+  const currentIdx = cleaned.reduce((acc, m, i) => (m.images?.length ? i : acc), -1)
+
+  if (mode === 'describe') {
+    return cleaned.map((m, i) => {
+      if (!m.images?.length) return m
+      // 转述失败（未配置视觉模型/接口报错）时给出明确的"没看到"，避免模型凭空编造图片内容
+      const block =
+        toTextBlock(m.images, i === currentIdx) ||
+        `（用户随消息发来 ${m.images.length} 张图片，但内容未能识别——不要猜测图片里有什么，可如实表示自己没看清）`
+      return { ...m, content: `${m.content}\n\n${block}`, images: undefined }
+    })
+  }
+
+  // direct：从尾部数 user 轮次，超出窗口的剥离原图（有 caption 则降级为截断文字）
+  const keepRounds = Math.max(1, captionRounds + 1)
+  const out = [...cleaned]
+  let seen = 0
+  for (let i = out.length - 1; i >= 0; i--) {
+    const m = out[i]!
+    if (m.role !== 'user' || !m.images?.length) continue
+    seen++
+    if (seen <= keepRounds) continue
+    const block = toTextBlock(m.images, false)
+    out[i] = { ...m, content: block ? `${m.content}\n\n${block}` : m.content, images: undefined }
+  }
+  return out
+}
+
+/**
+ * 把装填后的模型消息转成请求消息：带图的消息在此刻才把文件读成 data URL 拼成 content parts。
+ * 延迟到发送前读盘，避免 base64 常驻内存；文件已被保留期清理时自动降级为纯文本。
+ */
+async function toRequestMessages(
+  messages: ModelMessage[],
+  transient?: { base64: string; mime: string },
+): Promise<ApiMessage[]> {
+  // 临时图片只挂在本轮最后一条 user 消息上（它不会出现在 ModelMessage.images 里）
+  const lastUserIdx = transient ? messages.reduce((acc, m, i) => (m.role === 'user' ? i : acc), -1) : -1
+  const out: ApiMessage[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!
+    const withTransient = i === lastUserIdx
+    if (!m.images?.length && !withTransient) {
+      out.push({ role: m.role, content: m.content })
+      continue
+    }
+    const parts: ApiContentPart[] = []
+    if (m.content.trim()) parts.push({ type: 'text', text: m.content })
+    for (const img of m.images ?? []) {
+      const b64 = await readImageAsBase64(img.path)
+      if (b64) parts.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } })
+    }
+    if (withTransient && transient) {
+      parts.push({ type: 'image_url', image_url: { url: `data:${transient.mime};base64,${transient.base64}` } })
+    }
+    out.push(parts.length > 0 ? { role: m.role, content: parts } : { role: m.role, content: m.content || '[图片]' })
+  }
+  return out
+}
+
 /** 是否有正在进行的聊天轮次（主动搭话投放闸门用） */
 export function isChatBusy(): boolean {
-  return currentAbort !== null
+  // 编辑重发的截断/摘要重建阶段还没有 runChatTurn（currentAbort 为 null），
+  // 但同样不能投放主动搭话——否则会和随后启动的重跑撞成两轮并发
+  return currentAbort !== null || isRewindBusy()
 }
 
 /** 取消当前轮次（ai:cancel） */
@@ -185,6 +288,14 @@ export interface ChatTurnParams {
   sessionId: string
   /** 本轮 user 消息文本（普通聊天 = 用户输入；主动搭话/剧情旁白 = 系统旁白） */
   content: string
+  /** 本轮用户附带的图片（已由 chat:attach-image 压缩落盘；仅普通聊天可带图） */
+  images?: ChatImage[]
+  /**
+   * 当轮临时图片（内存 base64）：屏幕「直读」模式下把截图直接带到主模型。
+   * **不落盘、不写进消息历史**——只在本次请求的 user 消息里多一个 image part，
+   * 请求结束即丢弃，因此不会出现在会话文件、摘要、记忆抽取里。
+   */
+  transientImage?: { base64: string; mime: string }
   /** 消息来源标记（落盘 + stream-user 广播携带） */
   meta?: ChatMessageMeta
   /**
@@ -236,10 +347,17 @@ export async function runChatTurn(params: ChatTurnParams): Promise<ChatMessage> 
 }
 
 async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
-  const { sessionId, content, meta, storyDirective, store, spriteId: spriteIdOverride } = params
-  if (!content.trim()) throw new Error('消息内容为空')
+  const { sessionId, content, meta, storyDirective, store, spriteId: spriteIdOverride, images, transientImage } = params
+  // 纯图消息：content 允许为空（落盘时补 [图片] 占位，保证下游纯文本链路有内容可渲染）
+  if (!content.trim() && !images?.length) throw new Error('消息内容为空')
 
-  const userMsg: ChatMessage = { role: 'user', content, timestamp: Date.now(), meta }
+  const userMsg: ChatMessage = {
+    role: 'user',
+    content: content.trim() ? content : '[图片]',
+    timestamp: Date.now(),
+    meta,
+    ...(images?.length ? { images } : {}),
+  }
   let partial = ''
 
   // 广播本轮的 user 消息，让跟随窗口（非发起方）也能立刻补上用户气泡，
@@ -380,12 +498,23 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
   try {
     const settings = await getSettings()
     stripParen = settings.stripParenNarration && !store && !meta?.proactive
-    const ttsCfg = await getTTSConfig()
-    // 整段合音：开启时主进程关闭"边生成边读"，流式结束后整段一次合成（音调连贯）；关闭时保持逐句实时朗读
-    const mergeSpeech = ttsCfg.mergeSpeech === true
     // 主模型三元组走档案解析（档案制）：未激活档案或地址/模型/Key 不完整时报错
     const mainCfg = await resolveProfile('main')
     if (!mainCfg) throw new Error('未配置主模型（地址/模型/Key 需完整），请先在「设置 → AI API 配置」中选择并配置档案')
+
+    // ---- 图片转述（caption）：只为本轮新图生成，历史图的 caption 已随消息落盘 ----
+    // 需要 caption 的两种情形：① 读图方式=视觉模型辅助（caption 就是模型"看到"的全部内容）；
+    // ② 主模型直读但记忆轮数 > 0（图片掉出轮数窗口后靠 caption 兜底）。
+    // 直读 + 0 轮时完全跳过，不产生额外的视觉模型调用。
+    if (userMsg.images?.length && (settings.vision.readMode === 'describe' || settings.vision.captionRounds > 0)) {
+      await Promise.all(
+        userMsg.images.map(async (img) => {
+          if (img.caption) return
+          const b64 = await readImageAsBase64(img.path)
+          if (b64) img.caption = await describeChatImage(b64)
+        }),
+      )
+    }
 
     // 组装 system prompt：人设字段 + 示例对话 + 记忆注入
     // 记忆来源由检索器决定：向量模式（语义检索 top-k + 画像/约定常驻）或降级模式（最近 N 条，旧行为）
@@ -442,6 +571,16 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     }
     // 方案A：词表就绪后交给文档切片（此后新入稿分段用正式词表归一化 emotion）
     turnPalette = emotionPalette
+    // L0 前台窗口信号（仅普通聊天轮 + 用户开启「活动写入情境」时读取）。
+    // 只读窗口标题、15s 缓存，不截图不联网；拿不到就静默跳过这一行。
+    let sceneActivity: string | null = null
+    if (!store && settings.enableSceneDigest && settings.vision.injectActivity) {
+      try {
+        sceneActivity = summarizeWindowTitle((await getForegroundTitle())?.title ?? null)
+      } catch {
+        // 枚举失败不影响组装
+      }
+    }
     const systemMessage: ChatMessage = {
       role: 'system',
       content: buildSystemPrompt(
@@ -454,8 +593,11 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         stripParen,
         emotionPalette,
         settings.timeAwarenessEnabled,
-        // 情境 Section（情境服务 Phase 1）：仅普通聊天轮注入（剧情轮次不参与）
-        !store && settings.enableSceneDigest ? buildSceneSection(prevSceneDigest) : null,
+        // 情境 Section（情境服务 Phase 1 + P2 活动行）：仅普通聊天轮注入。
+        // 剧情轮的实际拒绝在 buildSceneSection 内部（isStory），这里的 !store 只是省一次组装
+        !store && settings.enableSceneDigest
+          ? buildSceneSection(prevSceneDigest, { activity: sceneActivity, isStory: !!store })
+          : null,
       ),
     }
     if (!store) {
@@ -465,10 +607,14 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     // A1+A2 上下文组装：历史（剧情 = run.messages）+ 本轮 user 消息 → 净化 → 预算装填/自动摘要
     // proactive 旁白消息在此附加系统旁白标记（历史中的旁白同样处理，见 toModelMessageWithNarration）
     // ① 历史格式示范：最近 N 条 assistant 以紧凑 dialogue JSON 回传（见 backfillHistoryJson 注释）
-    // 时间感知（Shinsekai 式逐条绝对时间）：user 消息按自身 timestamp 注入时刻前缀（剧情轮豁免，
+    // 时间感知（逐条绝对时间）：user 消息按自身 timestamp 注入时刻前缀（剧情轮豁免，
     // 见 annotateUserTimestamps 注释）；userMsg 带当前时间戳，本轮"现在几点"由此锚定
     const timeAwareMessages = annotateUserTimestamps([...backfillHistoryJson(history), userMsg], settings.timeAwarenessEnabled, !!store)
-    const modelMessages = timeAwareMessages.map(toModelMessageWithNarration)
+    const modelMessages = prepareVisionMessages(
+      timeAwareMessages.map(toModelMessageWithNarration),
+      settings.vision.readMode,
+      settings.vision.captionRounds,
+    )
     // 当前时间已由 system prompt 的【当前真实时间】Section 权威声明（见 repository.buildSystemPrompt），
     // user 消息前缀链已移除——避免双时间源竞争与 24h→12h 制换算幻觉
     const summarize = createSummarizer(mainCfg, abort.signal)
@@ -513,11 +659,18 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     // ---- 语音生成策略（始终跟读文本）----
     // 剧情轮次（store 覆盖）桌宠零参与：语音由剧情窗独立 TTS 播放，主进程不做任何桌宠语音/状态通知
     const effMode = !store ? (card?.voiceMode ?? (card?.voiceId ? 'mimo' : 'none')) : 'none'
-    const voiceEngine: 'genie' | 'mimo' | null =
-      effMode === 'genie' ? 'genie' : effMode === 'mimo' ? 'mimo' : null
+    const voiceEngine: TTSEngine | null =
+      effMode === 'genie' ? 'genie'
+      : effMode === 'sbv2' ? 'sbv2'
+      : effMode === 'mimo' ? 'mimo'
+      : null
     const voiceActive =
-      effMode === 'genie' ? true : effMode === 'mimo' ? !!card?.voiceId : false
-    const genieOverride = effMode === 'genie' ? (card?.genieOverride ?? null) : null
+      effMode === 'genie' ? true
+      : effMode === 'sbv2' ? !!card?.localVoice?.ttsModelId
+      : effMode === 'mimo' ? !!card?.voiceId
+      : false
+    // 本地引擎（Genie / SBV2）都靠「模型卡」绑定；mimo 用参考音频 id，不走这里
+    const localVoice = effMode === 'genie' || effMode === 'sbv2' ? (card?.localVoice ?? null) : null
     // 流式一开始即广播本轮语音模式，让宠物窗提前用跟读展示方式（剧情轮次跳过）
     if (!store) windowManager.notifyVoiceMode({ voiceEnabled: voiceActive })
     // 方案A：语音可用性求值完成 → 修正文档 voice 标记（渲染端据此门控文本揭示）
@@ -549,7 +702,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       // narr 块（kind 权威或（）推断）：零时长槽位按序上屏，不合成不朗读
       if (b.kind === 'narr') {
         speechEmitted = true
-        windowManager.speak(rawBlock, voiceId, langOverride, { chunks: [{ text: rawBlock, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: b.segIndex })
+        windowManager.speak(rawBlock, voiceId, langOverride, { chunks: [{ text: rawBlock, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, displayOnly: true, segIndex: b.segIndex })
         return
       }
       // speak 块：开头括号前置通道消费防重复（旧契约模型把括号带进台词项时）
@@ -561,7 +714,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       speechEmitted = true
       // 不在此处退出思考立绘：speak 仅代表"发起合成"，此刻语音尚未真正发声。
       // 思考立绘的退出改由渲染端在 lipSync 真正开始播放音频时触发（见 PetStage）。
-      windowManager.speak(text, voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, segIndex: b.segIndex })
+      windowManager.speak(text, voiceId, langOverride, { chunks: [{ text, emotion: b.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, segIndex: b.segIndex })
     }
     // 流式 onChunk 中实时结算：speak 项并入当前块（同状态且未满块），narr 项**立即独立结算**
     // （零时长 displayOnly 上屏，不参与并块——并块会让 narr 与相邻 speak 的 flush 顺序依赖
@@ -593,7 +746,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
               leadingNarr,
               voiceEngine === 'mimo' ? card.voiceId : null,
               card.ttsOverride?.language ?? null,
-              { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: itemSegIdx },
+              { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, displayOnly: true, segIndex: itemSegIdx },
             )
             pendingBlock = { texts: [rest.trim()], emotion: it.emotion, kind: 'speak', segIndex: itemSegIdx }
             continue
@@ -616,7 +769,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
             leadingNarr,
             voiceEngine === 'mimo' ? card.voiceId : null,
             card.ttsOverride?.language ?? null,
-            { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: itemSegIdx },
+            { chunks: [{ text: leadingNarr, emotion: it.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, displayOnly: true, segIndex: itemSegIdx },
           )
           if (!rest.trim()) continue
         }
@@ -646,7 +799,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     /** ① LLM 结构修复已用次数（整轮上限 2，防退化轮反复修补） */
     let repairsUsed = 0
     /**
-     * ① LLM 结构修复（Shinsekai 式，2026-10-15 03:22 轮"引号剧本"实锤后加）：
+     * ① LLM 结构修复（2026-10-15 03:22 轮"引号剧本"实锤后加）：
      * 结构化解析失败（空文本）或走了非 JSON 降级（rawEmotions 为空 = 内容来自
      * 引号剧本/纯文本等漂移形态）时，把模型**原始输出**发回 LLM，要求重新格式化为
      * 合法的 dialogue JSON（最多 2 次）——恢复分段与逐段状态，免整体重新生成。
@@ -716,7 +869,9 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       // 方案A：重试轮换代——segments 重建、turnId 更新（渲染端见新 id 整体重置清屏）
       if (!store) turnCoordinator.renewTurn()
       let reasoningText = ''
-      rawOutput = await sendChatCompletion(attemptMessages, {
+      // 带图轮次：在发送前一刻才把图片读成 data URL（重试轮也会重新转，保证图片始终有效）
+      const requestMessages = await toRequestMessages(attemptMessages, transientImage)
+      rawOutput = await sendChatCompletion(requestMessages, {
         model: mainCfg.model,
         baseURL: mainCfg.baseURL,
         apiKey: mainCfg.apiKey,
@@ -729,7 +884,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
           if (!firstChunkAt) firstChunkAt = Date.now()
           partial += chunk
           if (!chunkTimer) chunkTimer = setTimeout(flushChunks, CHUNK_FLUSH_MS)
-          if (!mergeSpeech) pumpSpeech()
+          pumpSpeech()
         },
         onReasoning: (chunk) => {
           reasoningText += chunk
@@ -750,9 +905,15 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         if (salvaged) {
           console.log('[chat] content 为空，已从思考通道提取到回复（免重试）')
           parsed = salvaged
+          // 文档补段（2026-10-28 主动识屏轮实锤）：这条路径下 content 通道全程为空，
+          // 流式期间 syncFromPartial 拿到空串 → 回合文档 segments 恒空；而语音在收尾时
+          // 按 parsed.chunks 一次性投放。桌宠直播气泡会挂载一个空文档、同时把落盘的定型
+          // 消息隐藏掉 → 表现为"语音期间气泡全空、播完才一次性出现"。此处用救回的 chunks
+          // 整体建段（startIdx=0，与语音槽位同源同序），气泡与门控即有内容可跟读。
+          turnCoordinator.appendRepairedSegments(salvaged.chunks, 0)
         }
       }
-      // ① LLM 结构修复（Shinsekai 式）：触发条件 = 解析为空、走了非 JSON 降级（rawEmotions
+      // ① LLM 结构修复：触发条件 = 解析为空、走了非 JSON 降级（rawEmotions
       // 为空 = 内容来自引号剧本/纯文本等漂移形态，此时正文虽在但分段与逐段状态丢失）、
       // 或**状态值结构污染**（2026-10-16 02:28 轮实锤：模型把 kind 字段连同转义引号写进
       // emotion 值——值形如 `开心","kind":"narr`，JSON 本身合法、rawEmotions 非空，既有
@@ -833,13 +994,12 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     flushChunks()
     // ② 直通轮收尾冲刷：把未达封段条件的尾巴（最后一句可能没有句号）入稿/投放——
     // JSON 链由下方"结算最后一个未闭合的状态块"兜底，直通链的等价物是 force 冲刷
-    // （mergeSpeech 模式保持整段一次合成语义：文档冲刷显示，语音走下方兜底整投）
     if (driftMode) {
       if (!store) {
         const tailFresh = turnCoordinator.syncFromPartialScript(scriptSource(), turnPalette, true)
         void tailFresh
       }
-      if (!mergeSpeech) pumpSpeech(true)
+      pumpSpeech(true)
     }
     // 结算最后一个未闭合的状态块
     flushPendingBlock()
@@ -862,7 +1022,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       const voiceId = voiceEngine === 'mimo' ? card.voiceId : null
       // 增量对齐（仅逐段链）：speechSegIdx = 流式闭合项数，与修复产物前缀项同基
       // （修复约束"完整保留原文"，前缀项不重排）；起点越过尾部 = 无新增段（C/D 形态只修状态值）
-      const startIdx = speechEmitted && !mergeSpeech ? Math.min(speechSegIdx, parsed.chunks.length) : 0
+      const startIdx = speechEmitted ? Math.min(speechSegIdx, parsed.chunks.length) : 0
       if (speechEmitted) {
         console.log(
           '[chat] 结构修复增量投递：流式已投 %d 段，修复产物 %d 段，续投 %s',
@@ -874,53 +1034,30 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       // 结构修复补段（2026-10-22 实锤）：续投段同步入回合文档——此前修复段只进语音管线，
       // 文档缺失导致跟读期间无文本可门控显示，语音播完收尾切定型才整段一次性直显。
       // 补段后语音门控照常工作（进度播到哪、文本逐字放行到哪），与正常轮行为一致。
-      if (repairAppended && !mergeSpeech) {
+      if (repairAppended) {
         turnCoordinator.appendRepairedSegments(parsed.chunks, startIdx)
       }
-      if (mergeSpeech) {
-        // 合音模式：只合并 speak 段（narr 段零时长槽位按序上屏，保持与逐段链一致的可见性）
-        const speakChunks = parsed.chunks.filter((c) => (c.kind ?? 'speak') === 'speak')
-        const mergedText = speakChunks.map((c) => c.text).join('\n')
-        if (mergedText.trim()) {
-          // 合音块跨多个文档段：首段索引回报（进度按块推进，合音无中间边界）
-          const firstSpeakIdx = parsed.chunks.findIndex((c) => (c.kind ?? 'speak') === 'speak')
-          windowManager.speak(mergedText, voiceId, langOverride, {
-            chunks: [{ text: mergedText, emotion: parsed.emotion }],
-            follow: true,
-            engine: voiceEngine ?? undefined,
-            genieOverride,
-            ttsSpeed: speakSpeed,
-            segIndex: firstSpeakIdx,
-          })
+      for (let ci = startIdx; ci < parsed.chunks.length; ci++) {
+        const c = parsed.chunks[ci]!
+        const kind = c.kind ?? 'speak'
+        // narr 段：displayOnly 按序上屏不朗读（与流式 flushPendingBlock 行为对齐）
+        if (kind === 'narr') {
+          windowManager.speak(c.text, voiceId, langOverride, { chunks: [{ text: c.text, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, displayOnly: true, segIndex: ci })
+          continue
         }
-        for (const c of parsed.chunks) {
-          if ((c.kind ?? 'speak') === 'narr' && c.text.trim()) {
-            windowManager.speak(c.text, voiceId, langOverride, { chunks: [{ text: c.text, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: parsed.chunks.indexOf(c) })
-          }
+        // speak 段：剥掉已前置上屏的开头括号（旧契约模型把括号带进台词项时），剥空跳过
+        const chunkText = consumeLeadingNarration(c.text, narrationGroups, narrationCursor)
+        if (!chunkText.trim()) continue
+        // 开头连续（）组拆为独立 displayOnly 旁白槽位（与 pumpSpeech 同口径：模型误标
+        // kind:speak 的开头旁白立即上屏，不随语音门控；len(narr)+len(rest)=len(chunkText)）
+        const { narr: leadingNarr, rest } = splitLeadingNarrGroups(chunkText)
+        if (leadingNarr) {
+          windowManager.speak(leadingNarr, voiceId, langOverride, { chunks: [{ text: leadingNarr, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, displayOnly: true, segIndex: ci })
+          if (!rest.trim()) continue
+          windowManager.speak(rest, voiceId, langOverride, { chunks: [{ text: rest, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, segIndex: ci })
+          continue
         }
-      } else {
-        for (let ci = startIdx; ci < parsed.chunks.length; ci++) {
-          const c = parsed.chunks[ci]!
-          const kind = c.kind ?? 'speak'
-          // narr 段：displayOnly 按序上屏不朗读（与流式 flushPendingBlock 行为对齐）
-          if (kind === 'narr') {
-            windowManager.speak(c.text, voiceId, langOverride, { chunks: [{ text: c.text, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: ci })
-            continue
-          }
-          // speak 段：剥掉已前置上屏的开头括号（旧契约模型把括号带进台词项时），剥空跳过
-          const chunkText = consumeLeadingNarration(c.text, narrationGroups, narrationCursor)
-          if (!chunkText.trim()) continue
-          // 开头连续（）组拆为独立 displayOnly 旁白槽位（与 pumpSpeech 同口径：模型误标
-          // kind:speak 的开头旁白立即上屏，不随语音门控；len(narr)+len(rest)=len(chunkText)）
-          const { narr: leadingNarr, rest } = splitLeadingNarrGroups(chunkText)
-          if (leadingNarr) {
-            windowManager.speak(leadingNarr, voiceId, langOverride, { chunks: [{ text: leadingNarr, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, displayOnly: true, segIndex: ci })
-            if (!rest.trim()) continue
-            windowManager.speak(rest, voiceId, langOverride, { chunks: [{ text: rest, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, segIndex: ci })
-            continue
-          }
-          windowManager.speak(chunkText, voiceId, langOverride, { chunks: [{ text: chunkText, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, genieOverride, ttsSpeed: speakSpeed, segIndex: ci })
-        }
+        windowManager.speak(chunkText, voiceId, langOverride, { chunks: [{ text: chunkText, emotion: c.emotion }], follow: true, engine: voiceEngine ?? undefined, localVoice, ttsSpeed: speakSpeed, segIndex: ci })
       }
     }
 
@@ -958,8 +1095,25 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       timestamp: now,
       meta: store ? { story: true, storyBackground: background } : undefined,
     }
+    // 回答全文 + 每段状态词（诊断留痕）：语音/文本不同步、状态异常时按时间点对照即可定位。
+    // 分段串一行打印（段序号:类型/状态/前 40 字），全文单独一行，便于和 TTS 侧日志对齐。
+    if (!store) {
+      console.log(
+        '[chat] 回答定型：整体状态=%s 字数=%d 分段=%s',
+        emotion,
+        text.length,
+        (chunks ?? [])
+          .map((c, i) => `${i}:${c.kind === 'narr' ? '旁白' : c.kind === 'speak' ? '台词' : '未标注'}/${c.emotion}/${c.text.slice(0, 40)}`)
+          .join(' | '),
+      )
+      console.log('[chat] 回答全文：%j', text.slice(0, 400))
+    }
+    let appendedMeta: { revision?: number; sceneEpoch?: number; messageCount: number } | null = null
     if (store) await store.append([userMsg, asstMsg])
-    else await appendSessionMessages(sessionId, [userMsg, asstMsg])
+    else {
+      const appended = await appendSessionMessages(sessionId, [userMsg, asstMsg])
+      appendedMeta = { revision: appended.revision, sceneEpoch: appended.sceneEpoch, messageCount: appended.messages.length }
+    }
 
     // 情境摘要异步更新（情境服务 Phase 1）：fire-and-forget 不阻塞、失败保留旧值；剧情轮次不参与
     if (!store) {
@@ -971,6 +1125,9 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         characterBrief: buildCharacterBrief(card),
         settings,
         mainCfg,
+        // 落盘后的代际/消息数：rewind 截断后旧轮更新不得覆盖新状态
+        expectedSceneEpoch: appendedMeta?.sceneEpoch,
+        atMessageCount: appendedMeta?.messageCount,
       })
     }
 
@@ -992,12 +1149,18 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       })
     }
 
-    if (!store) windowManager.broadcastAI('ai:stream-done', { sessionId, message: asstMsg })
+    if (!store) windowManager.broadcastAI('ai:stream-done', { sessionId, message: asstMsg, revision: appendedMeta?.revision })
     // 立绘/表情驱动策略：有语音由语音块驱动；无语音由文本输出驱动（剧情轮次桌宠零参与）
     if (!store && !voiceActive) windowManager.notifyEmotion(emotion)
     return asstMsg
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
+    const rawMessage = err instanceof Error ? err.message : String(err)
+    // 带图轮次的失败：服务商原文（如 content[1].type 不支持）对用户没有意义，
+    // 统一提示为模型不支持图片输入——用户可在「设置 → 视觉 → 读图方式」自行切换。
+    const message =
+      userMsg.images?.length && /image|vision|multimodal|media|unsupported|not support/i.test(rawMessage)
+        ? '当前选择模型不支持图片输入'
+        : rawMessage
 
     // 出错/取消时也持久化 user 消息与已流出的部分回复，避免 UI 与磁盘状态分叉：
     //  - 主动取消：user 消息打 meta.cancelled 标记（不写 error 文案），渲染端「未收到回复」提示据此豁免；
@@ -1009,10 +1172,14 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     const partialAsst: ChatMessage | undefined = partial
       ? { role: 'assistant', content: maybeStrip(extractStreamingJsonText(partial)), timestamp: Date.now() }
       : undefined
+    let failedRevision: number | undefined
     try {
       const extra: ChatMessage[] = partialAsst ? [failedUser, partialAsst] : [failedUser]
       if (store) await store.append(extra)
-      else await appendSessionMessages(sessionId, extra)
+      else {
+        const appended = await appendSessionMessages(sessionId, extra)
+        failedRevision = appended.revision
+      }
     } catch {
       // 持久化失败不影响错误上报
     }
@@ -1033,6 +1200,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         cancelled,
         userMessage: failedUser,
         partialMessage: partialAsst,
+        revision: failedRevision,
       })
     }
     // 方案A：错误路径文档终态（已流出部分作为 final；无文档时内部直接返回）

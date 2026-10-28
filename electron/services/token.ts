@@ -10,6 +10,11 @@ import { encode } from 'gpt-tokenizer'
 
 /** 一条消息除 content 外的固定开销（role 等元数据，近似值） */
 const MESSAGE_OVERHEAD_TOKENS = 4
+/**
+ * 单张图片的近似 token 成本（长边 1568 的截图在主流多模态模型上的经验中位数）。
+ * 估算偏保守即可：A1 预算装填只要求不漏算，精确值由服务商计费决定。
+ */
+const IMAGE_TOKENS = 1300
 
 /** 估算任意文本的 token 数；空文本返回 0 */
 export function estimateTextTokens(text: string): number {
@@ -23,13 +28,14 @@ export function estimateTextTokens(text: string): number {
   }
 }
 
-/** 估算单条消息的 token 数（content + 固定开销） */
-export function estimateMessageTokens(message: { role?: string; content?: unknown }): number {
-  return MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(String(message?.content ?? ''))
+/** 估算单条消息的 token 数（content + 固定开销 + 图片） */
+export function estimateMessageTokens(message: { role?: string; content?: unknown; images?: unknown }): number {
+  const images = Array.isArray(message?.images) ? message.images.length : 0
+  return MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(String(message?.content ?? '')) + images * IMAGE_TOKENS
 }
 
 /** 估算整组消息的总 token 数 */
-export function estimateMessagesTokens(messages: Array<{ role?: string; content?: unknown }>): number {
+export function estimateMessagesTokens(messages: Array<{ role?: string; content?: unknown; images?: unknown }>): number {
   let total = 0
   for (const m of messages) total += estimateMessageTokens(m)
   return total

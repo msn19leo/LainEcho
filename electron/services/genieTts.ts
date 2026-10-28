@@ -1,5 +1,5 @@
 /**
- * Genie-TTS(https://github.com/High-Logic/Genie-TTS) 本地声库语音服务客户端。
+ * Genie-TTS(https://github.com/High-Logic/Genie-TTS) Genie-TTS客户端。
  *
  * GENIE 是 GPT-SoVITS 的轻量 CPU 推理引擎（~200MB 运行时 / 模型），声库自带性格。
  * 官方提供 Python 库 `genie_tts` 与 FastAPI 服务，本模块据此对接官方 HTTP API。
@@ -21,9 +21,7 @@ import { existsSync, mkdirSync, promises as fs } from 'fs'
 import { paths, readJson, writeJson } from './storage'
 import { getSettings } from './repository'
 import type { TTSGenieConfig } from '../../src/types'
-import { sendChatCompletion } from './aiClient'
-import { resolveProfile } from './apiProfiles'
-import { resolveAuxLlmConfig } from './auxModel'
+import { translateWithCache } from './ttsTranslate'
 
 /** 默认配置 */
 const DEFAULT_CONFIG: TTSGenieConfig = {
@@ -117,9 +115,15 @@ export async function checkGenie(baseUrl: string): Promise<{ ok: boolean; error?
 let serverProcess: ChildProcess | null = null
 /** 自动拉起互斥：多段合成并发触发时只启动一次（避免双实例 bind 10048 端口冲突） */
 let startPromise: Promise<void> | null = null
+/**
+ * 用户手动点了【结束服务】：抑制合成路径的自动拉起，直到再次点【启动服务】
+ * 或重启应用。不持久化 —— 否则下次启动会莫名其妙没声音。
+ */
+let manualStopped = false
 
-/** 清理已拉起进程 */
+/** 清理已拉起进程（用户主动停止，后续合成不再自动拉起） */
 export function stopGenieServer(): void {
+  manualStopped = true
   if (serverProcess) {
     try {
       serverProcess.kill()
@@ -128,6 +132,11 @@ export function stopGenieServer(): void {
     }
     serverProcess = null
   }
+}
+
+/** 是否处于「用户手动停止」状态（设置页据此显示已停止） */
+export function isGenieManuallyStopped(): boolean {
+  return manualStopped
 }
 
 /** Python 可执行名：优先项目目录下的 python，否则系统 python */
@@ -162,6 +171,8 @@ function spawnEnv(dataDir: string): NodeJS.ProcessEnv {
  * @param dataDir GenieData 资源目录（不存在则报错，不启动）
  */
 export async function startGenieServer(workPath: string, baseUrl = DEFAULT_CONFIG.baseUrl, dataDir = ''): Promise<{ ok: boolean; error?: string }> {
+  // 用户显式启动：解除手动停止抑制
+  manualStopped = false
   // 幂等前置：服务已在线直接返回
   if (await probe(baseUrl).catch(() => false)) return { ok: true }
   // 互斥：已有启动进行中（含合成路径的自动拉起）→ 等它完成后确认在线状态
@@ -837,131 +848,9 @@ async function ensureMonoWav(p: string): Promise<string | null> {
   }
 }
 
-/**
- * 使用 LLM API 将文本翻译为目标语言。
- * 用于日语 TTS 模型：AI 生成中文文本，翻译为日语后交给 GenieTTS 合成。
- *
- * 校验防线（2026-10-05，"最后一段语音没输出完就结束/语音异常"根因修复）：
- *  - 目标 ja 但结果不含日文假名（思考型模型的 reasoning 会计入 max_tokens 预算，预算过小 →
- *    content 为空；或模型偷懒回显中文原文）→ 强化提示词重试一次；
- *  - 仍失败则抛错（不再静默回退原文合成）——宁可跳过该块语音（文本照常上屏跟读），
- *    也不能让日文声库读中文出怪音；上层 PetApp catch 后按既有静默降级处理。
- * 纯度防线（2026-10-14，"翻译夹杂中文残留/韩文"实锤后补）：
- *  - 含韩文（Hangul 区，实测 "먼저"）→ 判不纯；
- *  - 逐句检查：含汉字但整句无假名且长度 ≥4（日文句子必含假名助词/送假名）→ 未翻译的
- *    中文残句（实测 "那、那算什么呀"）→ 判不纯；
- *  - 不纯 → 强化提示词重试一次；重试后仍不纯 → **照旧放行合成**（用户选择的降级策略：
- *    不跳过语音、不回退中文原文，与既有行为一致，仅多一次纠偏机会）。
- */
-async function translateText(text: string, targetLang: 'ja' | 'zh'): Promise<string> {
-  // P0-2B：翻译走辅助模型（机械任务，主对话模型可能是思考型，延迟 1.3~28.8s 波动）；
-  // 未激活辅助档案时回落主模型激活档案的三元组（档案制）
-  const aux = await resolveAuxLlmConfig()
-  const mainCfg = aux ?? (await resolveProfile('main'))
-  const useModel = mainCfg?.model ?? ''
-  const useBaseURL = mainCfg?.baseURL ?? ''
-  const useApiKey = mainCfg?.apiKey ?? ''
-  if (!useApiKey || !useBaseURL.trim() || !useModel.trim()) {
-    console.warn('[genie] 翻译跳过：未配置 LLM API（主或翻译辅助模型档案）')
-    return text
-  }
-  const langName = targetLang === 'ja' ? '日语' : '中文'
-  // 结果校验：ja 至少要含日文假名（平/片假名），zh 至少要含汉字——否则视为翻译失败
-  const looksValid = (out: string) =>
-    targetLang === 'ja' ? /[\u3040-\u309F\u30A0-\u30FF]/.test(out) : /[\u4e00-\u9fff]/.test(out)
-  // ja 纯度校验：韩文混入 / 漏翻的中文残句（含汉字但整句无假名，句长 ≥4 过滤「私。」类短句误报）
-  const HANGUL_RE = /[\uAC00-\uD7AF\u1100-\u11FF]/
-  const looksPureJa = (out: string): boolean => {
-    if (HANGUL_RE.test(out)) return false
-    for (const sentence of out.split(/[。！？!?\n…]+/)) {
-      const s = sentence.trim()
-      if (/[\u4e00-\u9fff]/.test(s) && !/[\u3040-\u309F\u30A0-\u30FF]/.test(s) && s.length >= 4) return false
-    }
-    return true
-  }
-  // 思考型模型的 reasoning 计入 max_tokens 预算：1024 被思考耗尽 → content 为空 →
-  // 此前静默回退原文（中文喂日文声库 = "语音异常"根因），抬到 2048 与主对话链路对齐
-  const systemPrompt = (strong: boolean) =>
-    `你是一个翻译助手。将用户输入的文本翻译为${langName}，只输出翻译结果，不要任何解释、注释或额外内容。保持原文的情感和语气。` +
-    (strong
-      ? `\n【强制】结果必须是${langName}文本：禁止输出原文语言、禁止夹杂中文/韩文等其他语言的字词、禁止输出空内容、禁止输出任何思考过程。`
-      : '')
-
-  let lastOutput = ''
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      lastOutput = await sendChatCompletion(
-        [
-          { role: 'system', content: systemPrompt(attempt > 1) },
-          { role: 'user', content: text },
-        ],
-        {
-          model: useModel,
-          baseURL: useBaseURL,
-          apiKey: useApiKey,
-          temperature: 0.3,
-          stream: false,
-          maxTokensOverride: 2048,
-        },
-      )
-    } catch (err) {
-      console.error('[genie] 翻译请求异常（第 %d 次）', attempt, err)
-      continue // 请求异常 → 直接重试一次
-    }
-    const result = lastOutput.trim()
-    if (!result || !looksValid(result)) {
-      console.warn(
-        '[genie] 翻译结果校验失败（第 %d 次）：输出字数=%d 含假名=%s 输出=%j',
-        attempt,
-        result.length,
-        looksValid(result),
-        result.slice(0, 60) || '(空)',
-      )
-      continue
-    }
-    // 纯度校验（仅 ja）：不纯 → 重试一次；重试后仍不纯 → 照旧放行（用户选择的降级策略）
-    if (targetLang === 'ja' && !looksPureJa(result)) {
-      if (attempt < 2) {
-        console.warn('[genie] 翻译结果纯度校验失败（第 %d 次，夹杂中文/韩文）→ 强化提示词重试：输出=%j', attempt, result.slice(0, 60))
-        continue
-      }
-      console.warn('[genie] 翻译结果纯度校验仍失败（已重试）→ 照旧放行合成：输出=%j', result.slice(0, 60))
-    }
-    return result
-  }
-  throw new Error('日语翻译校验失败（两次尝试均未得到有效日文）——跳过该块语音，文本照常上屏')
-}
-
-// ===== ①翻译/合成并行化（2026-10-22 日志实锤：翻译串行在上一段合成之后，每段白等 2~4s）=====
-// speak 事件时刻（windowManager.speak）预发射翻译：翻译走辅助模型（网络 LLM），与本地 GPU 合成
-// 无资源竞争——上一段合成期间本段翻译已并行完成，tts:synthesize 到达时直接取结果。
-// LRU 32 条；同文本 in-flight 去重（同一 Promise）；失败即弃（合成路径现场直译兜底）。
-const translationCache = new Map<string, Promise<string>>()
-
-/** 预发射一段翻译（speak 事件时刻调用；重复调用同文本幂等） */
-export function prefetchTranslation(text: string, lang: 'ja' | 'zh'): void {
-  const key = `${lang}|${text}`
-  if (translationCache.has(key)) return
-  const p = translateText(text, lang)
-  translationCache.set(key, p)
-  if (translationCache.size > 32) {
-    const oldest = translationCache.keys().next().value
-    if (oldest !== undefined) translationCache.delete(oldest)
-  }
-  // 预发射期间无人 await：先挂空 catch 防 unhandledRejection（await 原 promise 仍可正常抛出）
-  void p.catch(() => {})
-  // 失败即弃缓存：后续合成路径取不到会现场直译（与旧行为等价）
-  void p.catch(() => {
-    translationCache.delete(key)
-  })
-}
-
-/** 合成路径取译文：预取命中（含 in-flight）直接等它，未命中现场翻译 */
-async function translateWithCache(text: string, lang: 'ja' | 'zh'): Promise<string> {
-  const cached = translationCache.get(`${lang}|${text}`)
-  if (cached) return cached
-  return translateText(text, lang)
-}
+// 翻译（中文 ↔ 日文）已抽到 ttsTranslate.ts：Genie-TTS 与 SBV2 共用。
+// 这里保留 re-export，兼容 windowManager 既有的动态导入写法。
+export { prefetchTranslation } from './ttsTranslate'
 
 /**
  * 用 GenieTTS 合成语音（声库自带性格）。
@@ -1009,7 +898,7 @@ async function synthesizeGenieInner(params: {
   if (!(await probe(base))) {
     // 服务未就绪且配置了环境路径 → 自动拉起（startGenieServer 自带幂等前置 + 互斥 + 等就绪，
     // 合成路径与【启动服务】按钮共用同一套防重，杜绝双实例 bind 10048）
-    if (config.workPath && !serverProcess) {
+    if (config.workPath && !serverProcess && !manualStopped) {
       const started = await startGenieServer(config.workPath, config.baseUrl, config.dataDir)
       if (!started.ok) throw new Error(started.error ?? 'GenieTTS 服务启动失败。')
     }

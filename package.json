@@ -13,6 +13,8 @@
     "test:prompt": "node scripts/run-prompt-golden.mjs",
     "test:story": "node scripts/run-story-verify.mjs",
     "icon": "node scripts/png-to-ico.mjs",
+    "sbv2:build": "cargo build --release --manifest-path electron/services/sbv2-server/Cargo.toml && node scripts/prepare-sbv2-runtime.mjs",
+    "sbv2:dist": "node scripts/prepare-sbv2-runtime.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "postinstall": "electron-builder install-app-deps"

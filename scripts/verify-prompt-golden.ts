@@ -255,7 +255,7 @@ const fullCard: CharacterCard = {
   modelId: null,
   voiceId: null,
   voiceMode: 'none',
-  genieOverride: null,
+  localVoice: null,
   ttsOverride: null,
   // 角色 TTS 语速倍率（金样不涉及语音，null = 原速）
   ttsSpeed: null,

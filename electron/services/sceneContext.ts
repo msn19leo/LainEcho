@@ -6,7 +6,7 @@
  *
  * 数据源分层：
  * - 系统层（本模块实时计算）：powerMonitor.getSystemIdleTime()（Electron 内置零依赖）→
- *   用户活跃/空闲——前台应用名无内置 API，留待屏幕识别（Phase 3）
+ *   用户活跃/空闲；前台应用名由 perception/foreground 提供（L0，仅窗口标题，不截图）
  * - 对话层（sceneDigest）：每会话缓存的场景状态摘要，turn done 后由辅助模型异步增量更新
  *   （UNCHANGED 短路；失败保留旧值；未配置辅助模型回落主对话模型）
  *
@@ -19,10 +19,16 @@ import { sendChatCompletion } from './aiClient'
 import { resolveAuxLlmConfig } from './auxModel'
 import type { ResolvedLlmConfig } from './apiProfiles'
 import { updateSessionSceneDigest } from './repository'
-import type { AppSettings, CharacterPersona } from '../../src/types'
+import type { AppSettings, CharacterPersona, ChatMessage } from '../../src/types'
 
 /** 摘要长度上限（防御性截断）：正常输出 ≤120 字，超长说明模型跑偏 */
 const DIGEST_MAX_CHARS = 400
+/** 编辑重发重建时纳入的最近消息条数（约 6 轮）；更早的状态由旧摘要携带 */
+const REWIND_RECENT_MESSAGES = 12
+/** 重建输入字符上限（防御超长消息把辅助模型上下文打满） */
+const REWIND_MAX_INPUT_CHARS = 6000
+/** 重建硬超时：主进程最多等这么久，超时清空摘要继续重跑 */
+const REWIND_TIMEOUT_MS = 2500
 
 /** 按小时返回时段描述（摘要更新 prompt 的"当前时间"锚，防模型照抄示例/旧时间） */
 function dayPart(hour: number): string {
@@ -78,12 +84,24 @@ function deviceActivityLine(): string {
 /**
  * 组装【当前情景】Section。
  * @param digest 会话的场景摘要缓存（对话层；空 = 尚未建立，跳过该层）
+ * @param opts.activity 用户当前正在使用的应用（L0 前台窗口标题；null/空 = 不注入）
+ * @param opts.isStory 剧情轮次：**函数内直接拒绝**
  * @returns Section 文本；无任何可注入内容时返回空串（调用方不注入）
  */
-export function buildSceneSection(digest: string | null | undefined): string {
+export function buildSceneSection(
+  digest: string | null | undefined,
+  opts: { activity?: string | null; isStory?: boolean } = {},
+): string {
+  // 剧情演出有自己的导演指令与场景管理。屏幕活动是"现实此刻"的信息，
+  // 漏进剧情会出现"中世纪酒馆里角色点评你的 VS Code"这类破戏。
+  // 这里做函数内拒绝而不是依赖调用方判断：调用侧的 !store 是隐式契约，重构时最容易丢。
+  if (opts.isStory) return ''
+
   const lines: string[] = []
   const device = deviceActivityLine()
   if (device) lines.push(`- ${device}。`)
+  const activity = opts.activity?.trim()
+  if (activity) lines.push(`- 用户当前正在使用的应用窗口：${activity}。`)
   const d = digest?.trim()
   if (d) for (const line of d.split('\n')) if (line.trim()) lines.push(`- ${line.trim().replace(/^-\s*/, '')}。`)
   if (lines.length === 0) return ''
@@ -110,8 +128,11 @@ export async function updateSceneDigestAfterTurn(params: {
   settings: AppSettings
   /** 主模型激活档案解析出的生效三元组（辅助未启用时回落使用） */
   mainCfg: ResolvedLlmConfig
+  /** 本轮落盘后的情景代际与消息数：写入前校验，防止 rewind 后旧轮覆盖 */
+  expectedSceneEpoch?: number
+  atMessageCount?: number
 }): Promise<void> {
-  const { sessionId, prevDigest, userText, assistantText, characterBrief, settings, mainCfg } = params
+  const { sessionId, prevDigest, userText, assistantText, characterBrief, settings, mainCfg, expectedSceneEpoch, atMessageCount } = params
   if (!settings.enableSceneDigest) return
   const prev = prevDigest?.trim() ?? ''
   try {
@@ -160,9 +181,135 @@ export async function updateSceneDigestAfterTurn(params: {
     const text = (out ?? '').trim()
     if (!text || text === prev) return
     if (/^UNCHANGED$/i.test(text)) return
-    await updateSessionSceneDigest(sessionId, text.slice(0, DIGEST_MAX_CHARS))
+    await updateSessionSceneDigest(sessionId, text.slice(0, DIGEST_MAX_CHARS), {
+      expectedSceneEpoch,
+      atMessageCount,
+    })
   } catch (err) {
     // 摘要更新失败保留旧值（缓存语义），不影响对话链路
     console.warn('[scene] 情景摘要更新失败（保留旧值）：', err instanceof Error ? err.message : String(err))
+  }
+}
+
+/** 重建输入用的消息时刻（M-D HH:mm，与 A2 摘要时间线同口径） */
+function formatMessageTs(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}-${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 截断后最近 N 条消息拼成重建输入（从尾部取，超字符上限即停） */
+function buildRewindDialogue(messages: ChatMessage[]): string {
+  const lines: string[] = []
+  let chars = 0
+  const MAX_LINE_CHARS = 2000
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue
+    const label = m.role === 'user' ? (m.meta?.proactive ? '旁白' : '用户') : '角色'
+    const ts = typeof m.timestamp === 'number' && m.timestamp > 0 ? `[${formatMessageTs(m.timestamp)}] ` : ''
+    const raw = m.content ?? ''
+    // 单条超长消息取尾部（最近的内容更重要），避免把辅助模型上下文打满
+    const body = raw.length > MAX_LINE_CHARS ? `…${raw.slice(-MAX_LINE_CHARS)}` : raw
+    const line = `${ts}${label}：${body}`
+    if (chars + line.length > REWIND_MAX_INPUT_CHARS) {
+      if (lines.length === 0) lines.unshift(line.slice(-REWIND_MAX_INPUT_CHARS))
+      break
+    }
+    lines.unshift(line)
+    chars += line.length
+    if (lines.length >= REWIND_RECENT_MESSAGES) break
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 编辑重发后的情景摘要重建：以"截断后仍存活的历史"为准，旧摘要只作长期场景的参考。
+ *
+ * 为什么不是回滚摘要快照：旧会话没有逐轮摘要历史，且恢复出来的旧摘要会带着旧时段/光线，
+ * 与【当前真实时间】冲突。重建能用当前时间刷新场景，并兼容所有存量会话。
+ *
+ * 输入只取截断点之前的最近 12 条（不含被编辑的新文本——它还没有发送）；旧摘要负责携带
+ * 更早的地点/关系状态，尾段负责纠正被删后续造成的变化。
+ * 任何失败/超时返回 null，由调用方清空摘要后继续重跑（缓存语义，不阻塞对话）。
+ */
+export async function rebuildSceneDigestAfterRewind(params: {
+  sessionId: string
+  survivingMessages: ChatMessage[]
+  previousDigest?: string | null
+  characterBrief?: string | null
+  settings: AppSettings
+  mainCfg: ResolvedLlmConfig
+  signal?: AbortSignal
+}): Promise<string | null> {
+  const { sessionId, survivingMessages, previousDigest, characterBrief, settings, mainCfg, signal } = params
+  if (!settings.enableSceneDigest) return null
+  const dialogue = buildRewindDialogue(survivingMessages)
+  if (!dialogue.trim()) return null
+
+  const prev = previousDigest?.trim() ?? ''
+  const aux = await resolveAuxLlmConfig()
+  const model = (aux?.model ?? mainCfg.model).trim()
+  const baseURL = (aux?.baseURL ?? mainCfg.baseURL).trim()
+  const key = aux?.apiKey || mainCfg.apiKey
+  if (!baseURL || !model || !key) return null
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REWIND_TIMEOUT_MS)
+  const onAbort = () => controller.abort()
+  if (signal?.aborted) controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
+
+  try {
+    const system = [
+      '你是场景状态记录员。用户编辑了较早的一条消息并重发，后续对话已被删除；请根据"截断后仍存在的最近对话"重建"此刻"的情景摘要。',
+      '规则：',
+      '- 以【截断后的最近对话】为准；【旧摘要】可能包含已被删除的后续对话，仅作参考，冲突时必须丢弃。',
+      '- 只保留截断后对话明确支持的状态；只由已删除后续产生的动作、事件、约定不得保留。',
+      '- 不要预测、引用或提及尚未发送的新消息。',
+      '- 「场景与氛围」的时段与光线必须按【当前时间】推断（白天=自然光、夜晚=灯光等），禁止输出与当前时间不符的时段或光线；若截断后对话与当前时间间隔较大，不要强行延续旧地点/旧活动，按当前时间与常理重置。',
+      '- 不超过 120 字，逐行输出（每行一条）：用户状态/活动：…｜角色状态/动作：…｜场景与氛围：…。',
+      '- 信息不足时输出空字符串；不要输出 UNCHANGED。',
+    ].join('\n')
+    const user = [
+      `【当前时间】${formatNow()}`,
+      characterBrief?.trim() ? `【角色设定】\n${characterBrief.trim()}` : '',
+      prev ? `【旧摘要】（可能包含已删除的后续，仅作参考）\n${prev}` : '【旧摘要】\n（无）',
+      `【截断后的最近对话】\n${dialogue}`,
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+
+    const out = await sendChatCompletion(
+      [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      {
+        model,
+        baseURL,
+        apiKey: key,
+        temperature: 0.2,
+        stream: false,
+        maxTokensOverride: 300,
+        signal: controller.signal,
+      },
+    )
+    const text = (out ?? '').trim()
+    if (!text || /^UNCHANGED$/i.test(text)) {
+      console.log('[scene] rewind 重建无有效输出，将清空摘要')
+      return null
+    }
+    return text.slice(0, DIGEST_MAX_CHARS)
+  } catch (err) {
+    console.warn(
+      '[scene] rewind 重建失败/超时（将清空摘要）：',
+      err instanceof Error ? err.message : String(err),
+      `session=${sessionId}`,
+    )
+    return null
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
   }
 }

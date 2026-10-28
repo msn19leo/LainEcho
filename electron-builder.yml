@@ -12,6 +12,15 @@ files:
   - "!node_modules/**"
 asar: true
 npmRebuild: false
+# SBV2 sidecar：exe 与 ONNX Runtime 不能进 asar（需要真实文件路径），
+# 运行时由 sbv2Tts.resolveSidecarDir() 指向 process.resourcesPath/sbv2
+extraResources:
+  - from: electron/services/sbv2-server/dist/sbv2-sidecar.exe
+    to: sbv2/sbv2-sidecar.exe
+  - from: electron/services/sbv2-server/dist/onnxruntime.dll
+    to: sbv2/onnxruntime.dll
+  - from: electron/services/sbv2-server/dist/DirectML.dll
+    to: sbv2/DirectML.dll
 electronLanguages:
   - zh-CN
   - en-US

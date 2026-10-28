@@ -35,6 +35,9 @@ export function createEditorWindow(scriptId: string): BrowserWindow {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // 关掉拼写检查：剧本字段是中文台词 / 日文假名 / YAML 文件名，拼写检查没有意义，
+      // 还会在 ch01 这类文件名下画一堆红色波浪线。
+      spellcheck: false,
     },
   })
   win.setMenuBarVisibility(false)

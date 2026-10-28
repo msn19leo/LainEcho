@@ -10,7 +10,7 @@
 import { ipcMain, dialog } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
-import type { TTSConfig, TTSLanguage, VoiceReference, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../src/types'
+import type { TTSConfig, TTSEngine, TTSLanguage, VoiceReference, TTSGenieConfig, TTSModelCard, TTSModelCardInput, TTSsbv2Config, Sbv2Device, Sbv2ServerStatus } from '../../src/types'
 import { paths, readJson, writeJson, mutateJson, deleteFile } from '../services/storage'
 import { saveSecret, readSecret, hasSecret } from '../services/crypto'
 import { genId, assertValidResourceId, listTTSModels, getTTSModel, createTTSModel, updateTTSModel, deleteTTSModel, listCharacterCards } from '../services/repository'
@@ -21,16 +21,25 @@ import {
   saveGenieConfig,
   checkGenie,
   startGenieServer,
+  stopGenieServer,
   downloadGenieData,
   synthesizeGenie,
 } from '../services/genieTts'
+import {
+  getSbv2Config,
+  saveSbv2Config,
+  startSbv2Server,
+  stopSbv2Server,
+  getSbv2Status,
+  listSbv2Devices,
+  synthesizeSbv2FromCard,
+} from '../services/sbv2Tts'
 
-/** 默认 TTS 配置（默认走本地声库语音服务 GenieTTS） */
+/** 默认 TTS 配置（默认走Genie-TTS GenieTTS） */
 const DEFAULT_TTS_CONFIG: TTSConfig = {
   language: 'zh',
   model: '',
   engine: 'genie',
-  mergeSpeech: false,
   ttsSpeed: 1.0,
 }
 
@@ -130,7 +139,7 @@ export function registerTtsIpc(): void {
     return next
   })
 
-  // ==================== 本地声库语音服务(GenieTTS) ====================
+  // ==================== Genie-TTS(GenieTTS) ====================
 
   /** 读取 GenieTTS 配置 */
   ipcMain.handle('tts:genie-config', () => getGenieConfig())
@@ -151,10 +160,42 @@ export function registerTtsIpc(): void {
     return startGenieServer(workPath ?? cfg.workPath, cfg.baseUrl, dataDir ?? cfg.dataDir)
   })
 
+  /** 结束 GenieTTS 服务（之后合成不再自动拉起，直到再次启动） */
+  ipcMain.handle('tts:genie-stop', () => {
+    stopGenieServer()
+  })
+
   /** 用系统 python 下载 GenieData 资源 */
   ipcMain.handle('tts:genie-download-data', async (_e, dataDir: string) => {
     return downloadGenieData(dataDir)
   })
+
+  // ==================== 本地 SBV2（Style-Bert-VITS2，仅日文） ====================
+
+  ipcMain.handle('tts:sbv2-config', () => getSbv2Config())
+
+  ipcMain.handle('tts:sbv2-save-config', async (_e, patch: Partial<TTSsbv2Config>) => {
+    return saveSbv2Config(patch ?? {})
+  })
+
+  /** 枚举本机显卡（DXGI；id 即 DirectML device_id） */
+  ipcMain.handle('tts:sbv2-devices', () => listSbv2Devices())
+
+  ipcMain.handle('tts:sbv2-start', async () => {
+    try {
+      await startSbv2Server()
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false, error: message }
+    }
+  })
+
+  ipcMain.handle('tts:sbv2-stop', () => {
+    stopSbv2Server()
+  })
+
+  ipcMain.handle('tts:sbv2-status', () => getSbv2Status())
 
   /** 弹目录选择框 */
   ipcMain.handle('tts:choose-folder', async () => {
@@ -290,17 +331,17 @@ export function registerTtsIpc(): void {
   // ==================== 合成 ====================
 
   /**
-   * 合成语音：按 engine 路由到本地声库服务(GenieTTS) 或 MiMo 声音克隆。
+   * 合成语音：按 engine 路由到Genie-TTS 服务(GenieTTS) 或 MiMo 声音克隆。
    * @param params.text 要合成的文本
    * @param params.voiceId 参考音频 id（仅 mimo 引擎需要；genie 可空）
    * @param params.languageOverride 角色级语言覆盖（null/undefined = 跟随全局）
    * @param params.emotion 保留字段（Genie 由声库自带性格，忽略逐句状态）
    * @param params.engine 显式引擎覆盖（角色卡决定；缺省用全局配置）
-   * @param params.genieOverride 角色级 Genie 覆盖（绑定的 TTS 模型卡 id）
+   * @param params.localVoice 角色级 Genie 覆盖（绑定的 TTS 模型卡 id）
    * @returns wav 格式的 ArrayBuffer，调用失败抛出错误
    */
-  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; speed?: number }) => {
-    const { text, voiceId, languageOverride, engine: engineOverride, genieOverride, speed } = params ?? {}
+  ipcMain.handle('tts:synthesize', async (_e, params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: TTSEngine; localVoice?: import('../../src/types').CharacterLocalVoice | null; speed?: number }) => {
+    const { text, voiceId, languageOverride, engine: engineOverride, localVoice, speed } = params ?? {}
     if (typeof text !== 'string' || !text.trim()) {
       throw new Error('合成文本不能为空')
     }
@@ -312,7 +353,7 @@ export function registerTtsIpc(): void {
       : config
     const engine = engineOverride ?? config.engine ?? 'genie'
 
-    // 本地声库引擎：无需参考音频，直接合成（声库自带性格）
+    // Genie-TTS引擎：无需参考音频，直接合成（声库自带性格）
     if (engine === 'genie') {
       const base = await getGenieConfig()
       // 从 TTS 模型卡获取角色参数
@@ -320,8 +361,8 @@ export function registerTtsIpc(): void {
       let onnxModelDir = ''
       let refAudioPath = ''
       let refAudioText = ''
-      if (genieOverride?.ttsModelId) {
-        const modelCard = await getTTSModel(genieOverride.ttsModelId)
+      if (localVoice?.ttsModelId) {
+        const modelCard = await getTTSModel(localVoice.ttsModelId)
         if (modelCard) {
           characterName = modelCard.characterName
           onnxModelDir = modelCard.onnxModelDir
@@ -344,6 +385,16 @@ export function registerTtsIpc(): void {
         }),
         speed,
       )
+    }
+
+    // 本地 SBV2：只能读日文，忽略全局语言与角色覆盖，恒定按 ja 处理。
+    // 取卡 / 翻译 / 随机度 / 文本规范化 / 日志都在 synthesizeSbv2FromCard 里，与剧情通道共用。
+    if (engine === 'sbv2') {
+      const ident = localVoice?.ttsModelId ?? ''
+      if (!ident) {
+        throw new Error('未绑定声线，请先在角色卡中选择「本地 SBV2」并绑定声线卡')
+      }
+      return applyAudioSpeed(await synthesizeSbv2FromCard({ ttsModelId: ident, text }), speed)
     }
 
     // MiMo 引擎：需要参考音频 + API Key

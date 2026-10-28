@@ -6,6 +6,7 @@ import { ipcMain, dialog } from 'electron'
 import type { AppSettings } from '../../src/types'
 import { deleteProfile, hasProfileKey, listProfileModels, upsertProfile } from '../services/apiProfiles'
 import { getSettings, saveSettings } from '../services/repository'
+import { syncNativeTheme } from '../services/nativeTheme'
 import { getDataDirInfo, migrateDataDir, resetDataDir } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
@@ -23,6 +24,12 @@ export function registerSettingsIpc(): void {
 
   ipcMain.handle('settings:save', async (_e, patch: Partial<AppSettings>) => {
     await saveSettings(patch)
+    // 主题变更立即同步给原生层（影响输入光标 / 滚动条 / 原生菜单配色）
+    if (patch.theme) syncNativeTheme(patch.theme)
+    // 「截图时隐藏本应用窗口」是窗口级属性：改动后立即对所有已开窗口生效
+    if (patch.vision?.hideFromCapture !== undefined) {
+      windowManager.applyContentProtection((await getSettings()).vision.hideFromCapture)
+    }
     // 广播携带档案 Key 状态（hasKey），设置窗切换激活档案后掩码回显不丢；
     // 设置变更同步给桌宠窗：「模型上下文窗口」等展示字段（如 token 用量显示里的窗口值）
     const result = await getSettingsWithProfileKeyState()

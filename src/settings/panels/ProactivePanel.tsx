@@ -1,12 +1,12 @@
 /**
- * 主动搭话面板：开关（主动搭话 / 屏幕感知级联）+ 频率与免打扰（每日上限 / 免打扰时段）+
+ * 主动搭话面板：开关（主动搭话）+ 开口时机（兴趣值）+ 频率与免打扰 +
  * 调度状态实时展示（兴趣值/今日次数/最近搭话时间）。
  *
- * - 屏幕感知开关级联于主动搭话：总开关关闭时禁用（并自动保存关闭态，避免残留开启）
- * - 视觉模型（屏幕感知/立绘打标用）在「AI API 配置」面板独立配置；未配置时屏幕感知自动降级为普通话题
+ * - 屏幕感知开关与视觉模型配置已移至「视觉」面板，且不再级联于本开关
+ *   （眼睛按钮让用户随时能要求角色看一眼，与"角色自己开口"无关）
  */
 import { useEffect, useState } from 'react'
-import { Eye, Radio, Sparkles } from 'lucide-react'
+import { Radio, Sparkles } from 'lucide-react'
 import { api } from '../../api'
 import { Switch } from '../../components/ui'
 import { useSettingsStore } from '../../store/settingsStore'
@@ -29,12 +29,13 @@ export function ProactivePanel() {
     return unsub
   }, [settingsLoaded, loadSettings])
 
-  /** 切换主动搭话总开关：关闭时级联关闭屏幕感知（避免残留开启） */
+  /**
+   * 切换主动搭话总开关。
+   * 不再级联关闭屏幕感知：眼睛按钮（用户主动识屏）独立于主动搭话，
+   * 关掉搭话不该连带关掉"我想让它看一眼"的能力。
+   */
   const handleToggleProactive = async (v: boolean) => {
-    const patch = v
-      ? { enableProactive: true }
-      : { enableProactive: false, enableScreenSense: false }
-    await saveSettings(patch)
+    await saveSettings({ enableProactive: v })
   }
 
   return (
@@ -50,25 +51,7 @@ export function ProactivePanel() {
         <Switch checked={settings.enableProactive} onChange={(v) => void handleToggleProactive(v)} />
       </div>
 
-      {/* 屏幕感知（级联于主动搭话） */}
-      <div className="flex items-center justify-between rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
-        <div>
-          <div className="flex items-center gap-1.5 text-sm text-text">
-            <Eye size={14} strokeWidth={1.75} color="var(--accent-500)" />
-            屏幕感知
-          </div>
-          <div className="text-xs text-text-muted">
-            与主动搭话同时开启时：角色先"偷看"你的桌面（截图仅内存流转、不落盘），再以看到的内容搭话；
-            视觉模型在「AI API 配置」中配置，感知失败或未配置时自动降级为普通话题
-          </div>
-        </div>
-        <Switch
-          checked={settings.enableScreenSense}
-          onChange={(v) => void saveSettings({ enableScreenSense: v })}
-          // 级联禁用：总开关关闭时不可单独开启屏幕感知
-          disabled={!settings.enableProactive}
-        />
-      </div>
+      {/* 屏幕感知开关已移至「视觉」面板（与读图方式、视觉模型放在一起） */}
 
       {/* 话题旁白风格：LLM 随机生成 vs 固定模板 */}
       {settings.enableProactive && (
@@ -89,6 +72,35 @@ export function ProactivePanel() {
       )}
 
       {/* 视觉模型配置已移至「AI API 配置」面板（屏幕感知/立绘打标共用） */}
+
+      {/* 屏幕搭话占比：只影响"开口时看不看屏幕"，不影响频率 */}
+      {settings.enableProactive && (
+        <div className="flex items-center justify-between rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
+          <div>
+            <div className="text-sm text-text">屏幕搭话占比</div>
+            <div className="text-xs text-text-muted">
+              主动搭话时"先看一眼屏幕再开口"的概率。
+              {!settings.enableScreenSense && '（需先在「视觉」中开启屏幕感知）'}
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={5}
+              disabled={!settings.enableScreenSense}
+              value={settings.proactiveScreenWeight}
+              onChange={(e) => {
+                const v = Number(e.target.value)
+                if (!Number.isNaN(v)) void saveSettings({ proactiveScreenWeight: Math.min(100, Math.max(0, Math.round(v))) })
+              }}
+              className="w-16 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-xs text-text disabled:opacity-40"
+            />
+            <span className="text-xs text-text-muted">%</span>
+          </div>
+        </div>
+      )}
 
       {/* 频率与免打扰 */}
       <div className="space-y-3 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">

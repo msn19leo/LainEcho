@@ -55,6 +55,7 @@ export function ChatWindow() {
   const loadSession = useSessionStore((s) => s.loadSession)
   const resetCurrentSession = useSessionStore((s) => s.resetCurrentSession)
   const streaming = useSessionStore((s) => s.streaming)
+  const rewinding = useSessionStore((s) => s.rewinding)
   // ===== 方案A第3步：单源切换 =====
   // 快照订阅 + 就绪拉取（幂等）：三时序开窗（生成中/跟读中/收尾后）的全部信息都在快照中。
   // 旧直播链（stream-chunk 消费在 bind 内、reading 镜像四通道、认领补发）全部退役。
@@ -67,6 +68,9 @@ export function ChatWindow() {
     const unsubTurnDone = api.ai.onTurnDone((doc) => {
       useTurnDocStore.getState().adopt(doc)
     })
+    const unsubTurnCleared = api.ai.onTurnCleared(() => {
+      useTurnDocStore.getState().clear()
+    })
     void api.ai.getTurnSnapshot().then((doc) => {
       if (doc) useTurnDocStore.getState().adopt(doc)
     }).catch(() => {})
@@ -74,6 +78,7 @@ export function ChatWindow() {
     return () => {
       unsubTurn()
       unsubTurnDone()
+      unsubTurnCleared()
       unsubSync()
     }
   }, [])
@@ -131,6 +136,7 @@ export function ChatWindow() {
 
   // 切换角色卡：同步桌宠模型 + 表情/待机动作覆盖 + 清空当前会话（首条消息时才新建持久化会话）
   const handleCardChange = async (cardId: string) => {
+    if (streaming || rewinding) return
     setCurrentCard(cardId)
     syncPetCard(cardId)
     resetCurrentSession()
@@ -138,6 +144,7 @@ export function ChatWindow() {
 
   // 新建会话：清空当前会话（首条消息时才新建持久化会话，避免空会话堆积）
   const handleNewSession = () => {
+    if (streaming || rewinding) return
     if (!currentCardId) {
       toast('请先选择角色卡', 'info')
       return
@@ -182,13 +189,13 @@ export function ChatWindow() {
           <div className="flex items-center gap-2">
             <DropdownMenu
               align="end"
-              disabled={streaming}
+              disabled={streaming || rewinding}
               buttonClassName="inline-flex h-8 max-w-[120px] items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2/70 px-2 text-xs text-text transition-colors hover:border-border-strong"
               panelClassName="w-56"
               trigger={
                 <>
                   <IconTile icon={Bot} size="xs" />
-                  <span className="truncate font-medium">{currentCard?.name ?? '选角色'}</span>
+                  <span className="min-w-0 truncate font-medium">{currentCard?.name ?? '选角色'}</span>
                   <ChevronDown size={13} className="shrink-0 text-text-muted" />
                 </>
               }
@@ -196,7 +203,7 @@ export function ChatWindow() {
             />
             <button
               onClick={() => void handleNewSession()}
-              disabled={streaming}
+              disabled={streaming || rewinding}
               title="新建会话"
               className="bg-brand-gradient glow-primary inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] px-3 text-xs font-medium text-[var(--on-brand)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >

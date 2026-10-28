@@ -92,6 +92,9 @@ export function registerPetProtocolHandler(): void {
       } else if (host === 'story-music') {
         // 剧情音乐库（用户上传）：pet-res://story-music/{文件名}
         root = paths.storyMusicsDir
+      } else if (host === 'chat-images') {
+        // 聊天图片附件：pet-res://chat-images/{sessionId}/{fileName}
+        root = paths.chatImagesDir
       } else {
         return new Response('Unknown host', { status: 404 })
       }

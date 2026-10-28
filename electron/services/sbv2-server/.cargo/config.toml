@@ -1,0 +1,8 @@
+# 局部覆盖：仓库根数据目录的 ~/.cargo/config.toml 里 rsproxy 的 sparse 地址
+# 写成了 crates.io-index/（正确应为 index/），会导致 404 → CONNECT 502。
+# 这里只对本子项目生效，不改用户全局配置。
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"

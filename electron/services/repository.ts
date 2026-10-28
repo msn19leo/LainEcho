@@ -21,9 +21,11 @@ import type {
   SessionIndexItem,
   TTSModelCard,
   TTSModelCardInput,
+  VisionSettings,
 } from '../../src/types'
 import { CHARACTER_CARD_VERSION, BUILTIN_DEFAULT_EMOTION, BUILTIN_DEFAULT_GLOSS, builtinPalette, paletteFromSprite } from '../../src/types'
 import type { CharacterSprite, SpritePaletteEntry } from '../../src/types'
+import { removeSessionImages } from './chatImages'
 import { paths, readJson, writeJson, mutateJson, deleteFile, fileExists } from './storage'
 import { buildSystemParts } from './prompt/sections'
 import { composeSystemPrompt } from './prompt/composer'
@@ -124,7 +126,7 @@ function normalizeCard(raw: Partial<CharacterCard>): CharacterCard {
     voiceId: raw.voiceId ?? null,
     // 声音模式：旧卡按是否绑定参考音频迁移（绑定=mimo，否则 none）
     voiceMode: raw.voiceMode ?? (raw.voiceId ? 'mimo' : 'none'),
-    genieOverride: raw.genieOverride ?? null,
+    localVoice: raw.localVoice ?? null,
     ttsOverride: raw.ttsOverride ?? null,
     // 角色 TTS 语速倍率（旧卡缺省 null = 原速）；范围钳制在变速函数内
     ttsSpeed: typeof raw.ttsSpeed === 'number' && Number.isFinite(raw.ttsSpeed) ? raw.ttsSpeed : null,
@@ -158,7 +160,7 @@ export async function createCharacterCard(input: CharacterCardInput): Promise<Ch
     modelId: input.modelId || null,
     voiceId: input.voiceId || null,
     voiceMode: input.voiceMode ?? (input.voiceId ? 'mimo' : 'none'),
-    genieOverride: input.genieOverride ?? null,
+    localVoice: input.localVoice ?? null,
     ttsOverride: input.ttsOverride ?? null,
     ttsSpeed: typeof input.ttsSpeed === 'number' && Number.isFinite(input.ttsSpeed) ? input.ttsSpeed : null,
     renderMode: input.renderMode ?? null,
@@ -437,6 +439,8 @@ export async function pruneEmptySessions(): Promise<void> {
     list.filter((s) => s.messageCount !== 0),
   )
   await Promise.all(empties.map((s) => deleteFile(paths.sessionFile(s.id))))
+  // 空会话不会有已发送的图片，但可能有粘贴后未发送的残留，一并清掉
+  await Promise.all(empties.map((s) => removeSessionImages(s.id)))
 }
 
 export async function createSession(characterCardId: string): Promise<SessionIndexItem> {
@@ -474,7 +478,12 @@ export async function appendSessionMessages(id: string, extra: ChatMessage[]): P
   assertValidResourceId(id, 'session')
   const session = await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
     const base = cur ?? { id, characterCardId: '', messages: [] }
-    return { ...base, messages: [...base.messages, ...extra] }
+    return {
+      ...base,
+      messages: [...base.messages, ...extra],
+      revision: (base.revision ?? 0) + 1,
+      sceneEpoch: (base.sceneEpoch ?? 0) + 1,
+    }
   })
 
   // 更新索引（title / messageCount / updatedAt）
@@ -498,9 +507,10 @@ export async function appendSessionMessages(id: string, extra: ChatMessage[]): P
 }
 
 /**
- * 删除会话最后一轮（末尾 assistant + 其前最近的 user），返回被删除的 user 内容供重答复用。
- * 末尾不是 assistant、或其前没有 user 时不动并返回 null（防御：轮次未完成/空会话/消息不足）。
- * "截断最后一轮 → 重走正常链路"模式（消息重答功能的主进程侧落盘操作）。
+ * 删除会话最后一轮（末尾 assistant + 其前最近的 user），返回被删除的 user 内容。
+ *
+ * @deprecated 编辑重发/重新回答已统一走 truncateSessionFromMessage（支持任意目标 + revision 校验 +
+ * 摘要游标/标题处理）。此函数仅为旧调用方保留；新代码不要使用。
  */
 export async function deleteLastTurnMessages(id: string): Promise<ChatMessage | null> {
   assertValidResourceId(id, 'session')
@@ -516,13 +526,23 @@ export async function deleteLastTurnMessages(id: string): Promise<ChatMessage | 
       const prev = msgs[msgs.length - 2]
       if (prev?.role !== 'user') return cur
       removedUser = prev
-      return { ...cur, messages: msgs.slice(0, -2) }
+      return {
+        ...cur,
+        messages: msgs.slice(0, -2),
+        revision: (cur.revision ?? 0) + 1,
+        sceneEpoch: (cur.sceneEpoch ?? 0) + 1,
+      }
     }
     // 形态2：孤立 user（上一轮发送失败/取消落盘的"未收到回复"消息，2026-10-17 实锤）
     // → 只删它并以原内容重跑（重答=重发）；主动搭话旁白不是用户输入，不参与重答
     if (last?.role === 'user' && !last.meta?.proactive) {
       removedUser = last
-      return { ...cur, messages: msgs.slice(0, -1) }
+      return {
+        ...cur,
+        messages: msgs.slice(0, -1),
+        revision: (cur.revision ?? 0) + 1,
+        sceneEpoch: (cur.sceneEpoch ?? 0) + 1,
+      }
     }
     return cur
   })
@@ -540,6 +560,68 @@ export async function deleteLastTurnMessages(id: string): Promise<ChatMessage | 
 }
 
 /**
+ * 从指定消息起截断会话（编辑并重发 / 重新回答的核心落盘操作）：
+ * 删除 targetIndex 及其后的全部消息，返回新会话与被删消息。
+ *
+ * 与 deleteLastTurnMessages 的区别：支持任意 user 消息（中间轮次），并用
+ * expectedRevision 做乐观并发校验，防止另一窗口在读取后追加消息导致按旧下标误删。
+ * allowProactive：重新回答主动搭话轮时目标 user 是旁白，需要放行；编辑并重发恒为 false。
+ */
+export async function truncateSessionFromMessage(
+  id: string,
+  targetIndex: number,
+  opts: { expectedRevision?: number; allowProactive?: boolean } = {},
+): Promise<{
+  session: SessionDetail
+  removed: ChatMessage[]
+} | null> {
+  assertValidResourceId(id, 'session')
+  let removed: ChatMessage[] = []
+  let oldMessages: ChatMessage[] = []
+  const session = await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
+    if (!cur) throw new Error('会话不存在')
+    if (opts.expectedRevision != null && (cur.revision ?? 0) !== opts.expectedRevision) {
+      throw new Error('会话已更新，请刷新后重试')
+    }
+    const msgs = cur.messages ?? []
+    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= msgs.length) {
+      throw new Error('目标消息不存在')
+    }
+    const target = msgs[targetIndex]
+    if (target?.role !== 'user') throw new Error('只能编辑用户消息')
+    if (!opts.allowProactive && target.meta?.proactive) throw new Error('主动搭话旁白不支持编辑')
+    oldMessages = msgs
+    removed = msgs.slice(targetIndex)
+    return {
+      ...cur,
+      messages: msgs.slice(0, targetIndex),
+      revision: (cur.revision ?? 0) + 1,
+      sceneEpoch: (cur.sceneEpoch ?? 0) + 1,
+    }
+  })
+  if (!session || removed.length === 0) return null
+
+  // 索引更新：messageCount / updatedAt；首条消息被编辑且标题仍是自动派生值时，重置标题，
+  // 让下一次 appendSessionMessages 按新的首条 user 重新生成（用户手动改过的标题不覆盖）。
+  const index = await listSessions()
+  const item = index.find((s) => s.id === id)
+  const resetTitle = targetIndex === 0 && !!item && item.title === deriveTitle(oldMessages)
+  await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (list) => {
+    const idx = list.findIndex((s) => s.id === id)
+    if (idx === -1) return list
+    const existing = list[idx] as SessionIndexItem
+    list[idx] = {
+      ...existing,
+      title: resetTitle ? '新会话' : existing.title,
+      messageCount: session.messages.length,
+      updatedAt: Date.now(),
+    }
+    return list
+  })
+  return { session, removed }
+}
+
+/**
  * 重发去重：发送前若磁盘末条是**带 error 标记的失败 user** 且内容与本次发送完全相同，
  * 则移除它（本次发送替代失败尝试）。失败轮落盘 user 携带 error 供"未收到回复"提示展示，
  * 但用户重发同一条消息时若不替换，历史里会出现两条相邻重复 user（2026-10-17 实锤，
@@ -554,7 +636,12 @@ export async function removeFailedDuplicateUser(id: string, content: string): Pr
     const msgs = cur.messages ?? []
     const last = msgs[msgs.length - 1]
     if (last?.role !== 'user' || !last.error || last.content.trim() !== text) return cur
-    return { ...cur, messages: msgs.slice(0, -1) }
+    return {
+      ...cur,
+      messages: msgs.slice(0, -1),
+      revision: (cur.revision ?? 0) + 1,
+      sceneEpoch: (cur.sceneEpoch ?? 0) + 1,
+    }
   })
 }
 
@@ -615,39 +702,73 @@ export async function updateSessionSummary(id: string, summary: string): Promise
 /**
  * 写入会话的情景摘要缓存（情境服务 Phase 1：每轮由辅助模型异步更新"此刻场景状态"）。
  * 会话文件不存在时静默忽略；空摘要不写（保留旧值）。
+ *
+ * 并发保护：expectedSceneEpoch 与当前会话代际不一致时放弃写入——rewind 截断、手动编辑
+ * 或新一轮落盘都会推进 sceneEpoch，旧轮的异步更新不得覆盖更新的状态。
+ * atMessageCount：摘要对应的 messages.length（sceneDigestAt），用于判断摘要是否覆盖某条消息。
+ * @returns 是否真正写入
  */
-export async function updateSessionSceneDigest(id: string, digest: string): Promise<void> {
+export async function updateSessionSceneDigest(
+  id: string,
+  digest: string,
+  opts: { expectedSceneEpoch?: number; atMessageCount?: number } = {},
+): Promise<boolean> {
   assertValidResourceId(id, 'session')
   const text = digest?.trim()
-  if (!text) return
+  if (!text) return false
+  let written = false
   await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
     if (!cur) return cur
-    return { ...cur, sceneDigest: text }
+    if (opts.expectedSceneEpoch != null && (cur.sceneEpoch ?? 0) !== opts.expectedSceneEpoch) return cur
+    written = true
+    const next: SessionDetail = {
+      ...cur,
+      sceneDigest: text,
+      sceneEpoch: (cur.sceneEpoch ?? 0) + 1,
+    }
+    if (opts.atMessageCount !== undefined) next.sceneDigestAt = opts.atMessageCount
+    return next
   })
+  return written
 }
 
 /**
  * 手动写入/清空会话的情景摘要缓存（设置窗文本块编辑通道）。
  * 与 updateSessionSceneDigest 的区别：允许空串清除字段（用户显式清空 = 删除缓存，
  * 下一轮注入只剩系统层活跃状态行，之后由辅助模型重新生成）。
+ *
+ * 手动编辑同样推进 sceneEpoch：在途的自动更新携带旧代际会被丢弃，不能覆盖用户手写内容。
+ * atMessageCount 缺省取当前消息数（手动摘要描述"此刻"，视为覆盖到当前全部消息）。
+ * @returns 是否真正写入
  */
-export async function setSessionSceneDigest(id: string, text: string): Promise<void> {
+export async function setSessionSceneDigest(
+  id: string,
+  text: string,
+  opts: { expectedSceneEpoch?: number; atMessageCount?: number } = {},
+): Promise<boolean> {
   assertValidResourceId(id, 'session')
   const trimmed = text?.trim() ?? ''
+  let written = false
   await mutateJson<SessionDetail | null>(paths.sessionFile(id), null, (cur) => {
     if (!cur) return cur
+    if (opts.expectedSceneEpoch != null && (cur.sceneEpoch ?? 0) !== opts.expectedSceneEpoch) return cur
+    written = true
+    const at = opts.atMessageCount ?? (cur.messages?.length ?? 0)
     if (!trimmed) {
       const { sceneDigest: _removed, ...rest } = cur
-      return rest
+      return { ...rest, sceneDigestAt: at, sceneEpoch: (cur.sceneEpoch ?? 0) + 1 }
     }
-    return { ...cur, sceneDigest: trimmed }
+    return { ...cur, sceneDigest: trimmed, sceneDigestAt: at, sceneEpoch: (cur.sceneEpoch ?? 0) + 1 }
   })
+  return written
 }
 
 export async function removeSession(id: string): Promise<void> {
   assertValidResourceId(id, 'session')
   await mutateJson(paths.sessionsIndexFile, DEFAULT_SESSION_INDEX, (index) => index.filter((s) => s.id !== id))
   await deleteFile(paths.sessionFile(id))
+  // 级联删除该会话的聊天图片附件（失败静默，由保留期清理兜底）
+  await removeSessionImages(id)
 }
 
 /** 修改会话标题（不更新 updatedAt，避免重命名打乱列表排序） */
@@ -725,7 +846,7 @@ export async function removeSprite(spriteId: string): Promise<void> {
 /** 更新立绘集的展示资产：状态词表 / 经典状态映射 / 说话立绘 / 思考立绘 / 名称 */
 export async function updateSprite(
   spriteId: string,
-  patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>,
+  patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>,
 ): Promise<void> {
   assertValidResourceId(spriteId, 'sprite')
   await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) =>
@@ -915,12 +1036,32 @@ const DEFAULT_SETTINGS: AppSettings = {
   stripParenNarration: false,
   // 屏幕感知：默认关闭（与主动搭话级联；开启后搭话前先感知屏幕内容）
   enableScreenSense: false,
+  // 视觉能力（设置页「视觉」模块）：默认转述模式（不依赖主模型是否支持图片输入）
+  vision: {
+    readMode: 'describe',
+    chatImagesEnabled: true,
+    // 图片记忆轮数：默认 0 = 仅发送当轮带原图，之后只用 caption 文本
+    captionRounds: 0,
+    // 原图保留天数：默认 30 天（0 = 永久）
+    imageRetentionDays: 30,
+    // 感知范围默认只截活动窗口（字更清楚，且天然排除自家窗口）
+    screenRange: 'window',
+    // 前台窗口信号（L0）与情境注入默认关闭：需用户显式开启
+    readForeground: false,
+    injectActivity: false,
+    // 截图时隐藏本应用窗口：默认开（否则屏幕感知会把自己的桌宠拍进去）
+    hideFromCapture: true,
+    // 点眼睛时的识图方式：默认速览（保持旧行为）
+    eyeReadMode: 'ambient',
+  },
   // 每日主动搭话上限（用户回复后重置计数）
   maxProactivePerDay: 3,
   // 主动搭话兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10）
   proactiveInterestIntervalSec: 30,
   // 话题搭话旁白由 LLM 随机生成（每次搭话多一次小调用；失败回退固定模板）
   proactiveLlmNarration: true,
+  // 屏幕搭话占比：默认 70%（十次主动搭话里约七次先看一眼屏幕）
+  proactiveScreenWeight: 70,
   // 免打扰时段（空串 = 不启用；支持跨零点）
   quietHours: { start: '', end: '' },
   // 屏幕感知视觉模型（OpenAI 兼容 chat/completions + 图片输入；Key 独立加密存储）
@@ -961,7 +1102,10 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 export async function getSettings(): Promise<AppSettings> {
   const saved = await readJson<Partial<AppSettings> | null>(paths.settingsFile, null)
-  return { ...DEFAULT_SETTINGS, ...(saved ?? {}) }
+  const merged = { ...DEFAULT_SETTINGS, ...(saved ?? {}) }
+  // vision 为嵌套对象：浅合并会让缺失的子字段变 undefined，此处逐字段兜底
+  merged.vision = { ...DEFAULT_SETTINGS.vision, ...(saved?.vision ?? {}) }
+  return merged
 }
 
 export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
@@ -991,12 +1135,35 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.stripParenNarration !== undefined) next.stripParenNarration = patch.stripParenNarration
     if (patch.enableProactive !== undefined) next.enableProactive = patch.enableProactive
     if (patch.enableScreenSense !== undefined) next.enableScreenSense = patch.enableScreenSense
+    if (patch.vision !== undefined) {
+      // 嵌套对象：逐字段校验并夹取，避免渲染端传入非法值污染磁盘
+      const v = (patch.vision ?? {}) as Partial<VisionSettings>
+      const rounds = Number(v.captionRounds)
+      const days = Number(v.imageRetentionDays)
+      next.vision = {
+        readMode: v.readMode === 'direct' ? 'direct' : 'describe',
+        chatImagesEnabled: v.chatImagesEnabled !== false,
+        // 夹取 0~6 轮：4 张图 × N 轮是乘法关系，上限过大会把上下文窗口吃满
+        captionRounds: Number.isFinite(rounds) ? Math.min(6, Math.max(0, Math.floor(rounds))) : 0,
+        imageRetentionDays: Number.isFinite(days) ? Math.min(365, Math.max(0, Math.floor(days))) : 30,
+        screenRange: v.screenRange === 'screen' ? 'screen' : 'window',
+        readForeground: v.readForeground === true,
+        injectActivity: v.injectActivity === true,
+        hideFromCapture: v.hideFromCapture !== false,
+        eyeReadMode: v.eyeReadMode === 'detail' ? 'detail' : v.eyeReadMode === 'native' ? 'native' : 'ambient',
+      }
+    }
     if (patch.maxProactivePerDay !== undefined) next.maxProactivePerDay = Math.max(0, Math.floor(patch.maxProactivePerDay))
     if (patch.proactiveInterestIntervalSec !== undefined) {
       // 夹取 10~600 秒：下限防定时器疯转，上限兜底极端输入
       next.proactiveInterestIntervalSec = Math.min(600, Math.max(10, Math.floor(patch.proactiveInterestIntervalSec)))
     }
     if (patch.proactiveLlmNarration !== undefined) next.proactiveLlmNarration = patch.proactiveLlmNarration
+    if (patch.proactiveScreenWeight !== undefined) {
+      // 夹取 0~100：这是概率百分比，超出范围没有意义
+      const w = Number(patch.proactiveScreenWeight)
+      next.proactiveScreenWeight = Number.isFinite(w) ? Math.min(100, Math.max(0, Math.floor(w))) : 70
+    }
     if (patch.quietHours !== undefined) next.quietHours = patch.quietHours
     if (patch.visionBaseURL !== undefined) next.visionBaseURL = patch.visionBaseURL
     if (patch.visionModel !== undefined) next.visionModel = patch.visionModel
@@ -1026,7 +1193,10 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.storyTextSpeed !== undefined) next.storyTextSpeed = patch.storyTextSpeed
     return next
   })
-  return { ...DEFAULT_SETTINGS, ...result }
+  const merged = { ...DEFAULT_SETTINGS, ...result }
+  // vision 同 getSettings：返回值也必须是完整嵌套对象，否则渲染端读子字段会拿到 undefined
+  merged.vision = { ...DEFAULT_SETTINGS.vision, ...(result?.vision ?? {}) }
+  return merged
 }
 
 /** Cubism Core 是否已就绪 */
@@ -1123,6 +1293,7 @@ export async function getTTSModel(id: string): Promise<TTSModelCard | null> {
 export async function createTTSModel(input: TTSModelCardInput): Promise<TTSModelCard> {
   const card: TTSModelCard = {
     id: genId('tts-model'),
+    engine: input.engine ?? 'genie',
     name: input.name.trim(),
     characterName: input.characterName.trim(),
     onnxModelDir: input.onnxModelDir.trim(),
@@ -1142,6 +1313,7 @@ export async function updateTTSModel(id: string, input: TTSModelCardInput): Prom
     const existing = list[idx]!
     const next: TTSModelCard = {
       ...existing,
+      engine: input.engine ?? existing.engine ?? 'genie',
       name: input.name.trim(),
       characterName: input.characterName.trim(),
       onnxModelDir: input.onnxModelDir.trim(),

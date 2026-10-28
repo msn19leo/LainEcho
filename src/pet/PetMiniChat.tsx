@@ -64,9 +64,11 @@ export function PetMiniChat({ contentH, onToggle, onResize, ctxStats, windowToke
     <div className="app-no-drag relative flex h-full flex-col overflow-hidden rounded-[8px] border border-[var(--border-strong)] bg-[var(--bg-panel)]/70 shadow-[var(--shadow-card)] backdrop-blur-[12px]">
       {/* 头部：左上角角标（拖高）+ 提示文字 + 右侧收放按钮 */}
       <div className="flex shrink-0 items-center justify-between pr-1 pt-0.5">
-        <div className="flex items-center">
+        {/* min-w-0 + flex-1：让标题组成为可压缩区，角色名过长时由 truncate 省略，
+            否则 flex 子项按内容撑开，会把右侧的用量/收起按钮挤出容器 */}
+        <div className="flex min-w-0 flex-1 items-center">
           <div
-            className="-ml-0.5 h-4 w-4 cursor-row-resize select-none"
+            className="-ml-0.5 h-4 w-4 shrink-0 cursor-row-resize select-none"
             style={{ touchAction: 'none' }}
             onPointerDown={onPointerDown}
             title="按住左上角上下拖动调整高度"
@@ -76,7 +78,7 @@ export function PetMiniChat({ contentH, onToggle, onResize, ctxStats, windowToke
               style={{ backgroundImage: 'linear-gradient(225deg, transparent 50%, var(--text-muted) 50%)' }}
             />
           </div>
-          <span className="select-none truncate px-1 text-[11px] font-medium leading-[18px] text-text-muted">
+          <span className="min-w-0 select-none truncate px-1 text-[11px] font-medium leading-[18px] text-text-muted">
             {`聊天会话（${charName}）`}
           </span>
         </div>

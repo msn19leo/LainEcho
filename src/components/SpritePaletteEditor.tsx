@@ -1,7 +1,7 @@
 /**
  * 状态词表编辑器（立绘集用，词表方案唯一状态配置入口）。
  *
- * - 以图为中心的所见即所得编辑（参考 Shinsekai 立绘管理）：左侧立绘缩略图网格（完整显示+滚动），
+ * - 以图为中心的所见即所得编辑：左侧立绘缩略图网格（完整显示+滚动），
  *   点选缩略图 → 右侧大图预览 + 编辑挂在该图上的状态词列表（一图可挂多词，如"中性 平静"）；
  * - 词表数据模型不变（词 → 图：SpritePaletteEntry{name, gloss, image}，多词可指向同一图），
  *   "图为中心"只是编辑视角反转——prompt 注入 / AI 解析 / 渲染链零改动；
@@ -33,6 +33,7 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
   const [defaultEmotion, setDefaultEmotion] = useState('')
   const [speakingImage, setSpeakingImage] = useState('')
   const [thinkingImage, setThinkingImage] = useState('')
+  const [observingImage, setObservingImage] = useState('')
   const [annotating, setAnnotating] = useState(false)
   const [saving, setSaving] = useState(false)
   /** 当前选中的缩略图（右区大图预览与挂词编辑的作用对象；默认第一张） */
@@ -44,8 +45,9 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
     setDefaultEmotion(sprite.defaultEmotion || sprite.emotions[0]?.name || '')
     setSpeakingImage(sprite.speakingImage ?? '')
     setThinkingImage(sprite.thinkingImage ?? '')
+    setObservingImage(sprite.observingImage ?? '')
     setSelectedImage(sprite.images[0]?.filePath ?? '')
-  }, [sprite.id, sprite.emotions, sprite.defaultEmotion, sprite.speakingImage, sprite.thinkingImage])
+  }, [sprite.id, sprite.emotions, sprite.defaultEmotion, sprite.speakingImage, sprite.thinkingImage, sprite.observingImage])
 
   // 词条数量变化 → 回调父级（弹窗标题实时同步）
   useEffect(() => {
@@ -143,6 +145,7 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
         defaultEmotion: cleaned.length > 0 ? defaultEmotion : '',
         speakingImage: speakingImage || null,
         thinkingImage: thinkingImage || null,
+        observingImage: observingImage || null,
       })
       toast.success('状态词表已保存')
       onSaved()
@@ -221,6 +224,7 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
               const bound = entries.filter((e) => e.image === img.filePath).map((e) => e.name.trim() || '（未命名）')
               const isSpeaking = speakingImage === img.filePath
               const isThinking = thinkingImage === img.filePath
+              const isObserving = observingImage === img.filePath
               return (
                 <button
                   key={img.filePath}
@@ -239,12 +243,13 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
                   <span
                     className={cn(
                       'block truncate px-0.5 text-center text-[10px] leading-5',
-                      bound.length > 0 || isSpeaking || isThinking ? 'text-[var(--primary-400)]' : 'text-text-muted',
+                      bound.length > 0 || isSpeaking || isThinking || isObserving ? 'text-[var(--primary-400)]' : 'text-text-muted',
                     )}
                   >
                     {bound.length > 0 ? bound.join('·') : '未标注'}
                     {isSpeaking && <span className="text-amber-400"> · 说话图</span>}
                     {isThinking && <span className="text-violet-400"> · 思考图</span>}
+                    {isObserving && <span className="text-sky-400"> · 观察图</span>}
                   </span>
                 </button>
               )
@@ -321,7 +326,7 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
             </div>
           )}
 
-          {/* 说话/思考图：一键作用于当前选中的图 + 缩略预览与清除 */}
+          {/* 说话/思考/观察图：一键作用于当前选中的图 + 缩略预览与清除 */}
           <div className="flex items-center gap-1.5">
             <Button
               variant="outline"
@@ -342,6 +347,16 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
               title="把选中的立绘图设为思考立绘（AI 准备回答期间使用）"
             >
               设为思考图
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="min-w-0 flex-1 px-1.5 text-[11px]"
+              disabled={!selectedImage}
+              onClick={() => setObservingImage(selectedImage)}
+              title="把选中的立绘图设为观察立绘（点桌宠眼睛看屏幕的那几秒使用）"
+            >
+              设为观察图
             </Button>
           </div>
           <div className="flex items-center gap-3">
@@ -379,13 +394,31 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
                 <span className="text-[11px] text-text-muted">未配置</span>
               )}
             </div>
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="shrink-0 text-[11px] text-text-muted">观察图</span>
+              {observingImage ? (
+                <span className="relative inline-block h-8 w-8 shrink-0 overflow-hidden rounded border border-border">
+                  <img src={imageUrl(observingImage)} alt="观察图" className="h-full w-full object-cover" />
+                  <button
+                    onClick={() => setObservingImage('')}
+                    className="absolute inset-y-0 right-0 flex w-3 items-center justify-center bg-black/50 text-white"
+                    title="清除观察图"
+                  >
+                    <X size={8} />
+                  </button>
+                </span>
+              ) : (
+                <span className="text-[11px] text-text-muted">未配置</span>
+              )}
+            </div>
           </div>
         </div>
       </div>
 
       <p className="text-[11px] text-text-muted">
         说话图在「正在说话且状态=平静/默认状态」时使用（默认状态可设为其它词，说话时显示该状态的图）；思考图在 AI
-        准备回答期间使用。二者为系统演出态，不属于词表。释义可选：不填时 prompt 只注入状态词本身。
+        准备回答期间使用；观察图在你点桌宠眼睛、角色看屏幕的那几秒使用，未配置时回落思考图。
+        三者为系统演出态，不属于词表，且只作用于桌面端（剧情窗不参与观察图）。释义可选：不填时 prompt 只注入状态词本身。
       </p>
 
       {/* 底部：默认状态 + 保存 */}

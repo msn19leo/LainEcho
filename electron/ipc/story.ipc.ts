@@ -18,9 +18,44 @@ import { generateStoryDraft, importStoryDraft } from '../services/storyEngine/dr
 import { getStorySnapshot, resendStoryState, respondStory, setRunSpriteView, startStory, stopStory } from '../services/storyEngine/engine'
 import { consolidateStoryMemory } from '../services/storyEngine/storyMemory'
 import { getGenieConfig, synthesizeGenie } from '../services/genieTts'
+import { getSbv2Status, synthesizeSbv2FromCard } from '../services/sbv2Tts'
 import { getSpritePalette, getTTSModel, genId, paletteHash } from '../services/repository'
 import { paths } from '../services/storage'
-import type { StoryResponse } from '../../src/types'
+import type { StoryResponse, StoryVoiceConfig } from '../../src/types'
+
+/**
+ * 解析剧情语音用哪个引擎。
+ * 新存档带 engine 字段；旧存档没有，按卡片归属推断（SBV2 卡 engine='sbv2'）。
+ */
+async function resolveStoryVoiceEngine(voice: StoryVoiceConfig | null): Promise<'genie' | 'sbv2' | null> {
+  if (!voice?.ttsModelId) return null
+  if (voice.engine === 'sbv2' || voice.engine === 'genie') return voice.engine
+  const model = await getTTSModel(voice.ttsModelId)
+  return model?.engine === 'sbv2' ? 'sbv2' : 'genie'
+}
+
+/**
+ * 开始演出前的就绪检查。
+ * SBV2 需要 sidecar 常驻，未启动时整场演出会静默无声——必须在启动前拦下并说明原因，
+ * 否则用户只会看到「剧情没有语音」而不知道去哪修。
+ */
+async function assertStoryVoiceReady(voice: StoryVoiceConfig | null): Promise<void> {
+  if (!voice?.ttsModelId) return
+  const model = await getTTSModel(voice.ttsModelId)
+  if (!model) throw new Error('语音模型卡不存在，请在「设置 → 剧情演出 → 语音」中重新选择')
+
+  const engine = await resolveStoryVoiceEngine(voice)
+  if (engine !== 'sbv2') return
+
+  const st = getSbv2Status()
+  if (st.state === 'ready') return
+  if (st.state === 'starting') {
+    throw new Error('本地 SBV2 正在加载模型，请等几秒后再开始演出')
+  }
+  throw new Error(
+    '本地 SBV2 服务未启动：请先到「设置 → 语音合成 → 本地 SBV2」点击【启动服务】，再回到这里开始演出',
+  )
+}
 
 /** 校验 id 形态，防止路径穿越 */
 const SAFE_ID = /^[A-Za-z0-9_-]{1,80}$/
@@ -114,6 +149,8 @@ export function registerStoryIpc(): void {
       if (p.mode !== 'resume' && p.mode !== 'start') throw new Error('缺少启动模式')
       if (p.mode === 'resume' && (typeof p.runId !== 'string' || !p.runId)) throw new Error('继续演出缺少 runId')
       if (p.backgroundOverride != null && (typeof p.backgroundOverride !== 'string' || !p.backgroundOverride)) throw new Error('非法覆盖背景')
+      // 本地引擎（尤其 SBV2）未就绪时直接拦下，避免"开场无声"这种无从排查的失败
+      await assertStoryVoiceReady(p.voice ?? null)
       const res = await startStory({
         scriptId: p.scriptId,
         cardId: String(p.cardId ?? ''),
@@ -535,14 +572,21 @@ export function registerStoryIpc(): void {
 
   // ---------------- 剧情 TTS（本地 Genie 声库，与角色卡声音模块解耦） ----------------
 
-  ipcMain.handle('story:tts-synthesize', async (_e, params: { ttsModelId: string; language: 'zh' | 'ja'; text: string }) => {
+  ipcMain.handle('story:tts-synthesize', async (_e, params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2' }) => {
     try {
-      const { ttsModelId, language, text } = params ?? ({} as typeof params)
+      const { ttsModelId, language, text, engine } = params ?? ({} as typeof params)
       if (typeof ttsModelId !== 'string' || !ttsModelId) throw new Error('缺少声库模型')
       const model = await getTTSModel(ttsModelId)
       if (!model) throw new Error('声库模型卡不存在')
       const cleaned = typeof text === 'string' ? text.trim() : ''
       if (!cleaned) throw new Error('合成文本为空')
+
+      // 本地 SBV2：只读日文，取卡/翻译/规范化/随机度都在共用函数里（与角色卡语音同一份实现）
+      if ((engine ?? (model.engine === 'sbv2' ? 'sbv2' : 'genie')) === 'sbv2') {
+        const wav = await synthesizeSbv2FromCard({ ttsModelId, text: cleaned })
+        return { ok: true, audioBase64: Buffer.from(wav).toString('base64') }
+      }
+
       const config = await getGenieConfig()
       const wav = await synthesizeGenie({
         config,

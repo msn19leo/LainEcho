@@ -88,6 +88,7 @@ export function StoryPanel() {
   const [cardId, setCardId] = useState('')
   const [spriteId, setSpriteId] = useState('')
   const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [voiceEngine, setVoiceEngine] = useState<'genie' | 'sbv2'>('genie')
   const [voiceModelId, setVoiceModelId] = useState('')
   const [voiceLang, setVoiceLang] = useState<'zh' | 'ja'>('zh')
   /** 覆盖背景（'' = 不覆盖；本次演出强制使用，优先级高于剧本指令，随 run 存档） */
@@ -160,13 +161,33 @@ export function StoryPanel() {
     setSpriteId(suggested)
   }, [cardId, cards, sprites])
 
-  // 声库默认值
+  // 候选声库按引擎分组：Genie 卡与 SBV2 卡共用同一份卡池，选错会走错合成通道
+  const voiceCards = ttsModels.filter((m) => (m.engine ?? 'genie') === voiceEngine)
+
+  // 声库默认值：当前选中项不属于当前引擎时，自动落到该引擎的第一张卡
   useEffect(() => {
-    if (!voiceModelId && ttsModels.length > 0) setVoiceModelId(ttsModels[0]!.id)
-  }, [ttsModels, voiceModelId])
+    if (!voiceCards.some((m) => m.id === voiceModelId)) {
+      setVoiceModelId(voiceCards[0]?.id ?? '')
+    }
+  }, [voiceCards, voiceModelId])
+
+  /** 切引擎：重置声线为该引擎的第一张卡；SBV2 只读日文，语言一并拨到日文 */
+  const applyVoiceEngine = (next: 'genie' | 'sbv2') => {
+    setVoiceEngine(next)
+    const pool = ttsModels.filter((m) => (m.engine ?? 'genie') === next)
+    setVoiceModelId(pool[0]?.id ?? '')
+    if (next === 'sbv2') setVoiceLang('ja')
+  }
 
   const voice: StoryVoiceConfig | null =
-    voiceEnabled && voiceModelId ? { ttsModelId: voiceModelId, language: voiceLang } : null
+    voiceEnabled && voiceModelId
+      ? {
+          ttsModelId: voiceModelId,
+          // SBV2 恒定日文，忽略界面上的中文选择
+          language: voiceEngine === 'sbv2' ? 'ja' : voiceLang,
+          engine: voiceEngine,
+        }
+      : null
 
   const handleImport = async () => {
     const report = await api.story.import()
@@ -741,7 +762,7 @@ export function StoryPanel() {
             })()}
           </label>
           <div>
-            <span className="mb-1 block text-xs text-text-muted">语音（本地声库，与角色卡声音模块无关）</span>
+            <span className="mb-1 block text-xs text-text-muted">语音（与角色卡声音模块无关）</span>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setVoiceEnabled((v) => !v)}
@@ -752,14 +773,23 @@ export function StoryPanel() {
               {voiceEnabled && (
                 <>
                   <SelectMenu
+                    value={voiceEngine}
+                    onChange={(v) => applyVoiceEngine(v as 'genie' | 'sbv2')}
+                    options={[
+                      { value: 'genie', label: 'Genie-TTS' },
+                      { value: 'sbv2', label: '本地 SBV2' },
+                    ]}
+                  />
+                  <SelectMenu
                     value={voiceModelId}
                     onChange={setVoiceModelId}
-                    options={ttsModels.map((m) => ({ value: m.id, label: m.name || m.characterName }))}
+                    options={voiceCards.map((m) => ({ value: m.id, label: m.name || m.characterName }))}
                     className="min-w-0 flex-1"
                   />
                   <SelectMenu
-                    value={voiceLang}
+                    value={voiceEngine === 'sbv2' ? 'ja' : voiceLang}
                     onChange={(v) => setVoiceLang(v as 'zh' | 'ja')}
+                    disabled={voiceEngine === 'sbv2'}
                     options={[
                       { value: 'zh', label: '中文' },
                       { value: 'ja', label: '日文' },
@@ -768,6 +798,16 @@ export function StoryPanel() {
                 </>
               )}
             </div>
+            {voiceEnabled && voiceEngine === 'sbv2' && (
+              <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                本地 SBV2 仅支持日文：中文台词会先翻译为日语再合成。开始演出前需先在「语音合成 → 本地 SBV2」启动服务，否则会被拦下。
+              </p>
+            )}
+            {voiceEnabled && voiceCards.length === 0 && (
+              <p className="mt-1 text-[11px] text-warning">
+                当前引擎还没有模型卡，请先到「设置 → 语音合成」里添加。
+              </p>
+            )}
           </div>
           <label className="block">
             <span className="mb-1 block text-xs text-text-muted">覆盖背景（可选，本次演出强制使用）</span>

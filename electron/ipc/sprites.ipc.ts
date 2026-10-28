@@ -74,6 +74,7 @@ export function registerSpritesIpc(): void {
       defaultEmotion: '',
       speakingImage: null,
       thinkingImage: null,
+      observingImage: null,
       createdAt: Date.now(),
     }
     await addSprite(meta)

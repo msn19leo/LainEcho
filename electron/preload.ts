@@ -6,17 +6,24 @@
  *   - API Key 明文永不经过这里
  */
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, WindowApi } from '../src/types'
+import type { AppSettings, ContextStats, StreamDonePayload, StreamErrorPayload, StreamUserPayload, ModelSettings, SessionRewoundPayload, TTSEngine, WindowApi } from '../src/types'
 
 const api: WindowApi = {
   ai: {
     sendMessage: (params) => ipcRenderer.invoke('ai:send-message', params),
-    /** 消息重答（截断最后一轮后重走正常链路；editText 非空 = 编辑并重发） */
+    /** 消息重答（截断最后一轮后重走正常链路） */
     regenerate: (params) => ipcRenderer.invoke('ai:regenerate', params),
+    /** 编辑并重发任意 user 消息（截断该消息及其后全部消息，不可撤销） */
+    rewindEdit: (params) => ipcRenderer.invoke('ai:rewind-edit', params),
     onSessionRewound: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { sessionId: string; messages: import('../src/types').ChatMessage[] }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: SessionRewoundPayload) => cb(payload)
       ipcRenderer.on('ai:session-rewound', listener)
       return () => ipcRenderer.removeListener('ai:session-rewound', listener)
+    },
+    onTurnCleared: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('ai:turn-cleared', listener)
+      return () => ipcRenderer.removeListener('ai:turn-cleared', listener)
     },
     onStreamDone: (cb) => {
       const listener = (_e: Electron.IpcRendererEvent, payload: StreamDonePayload) => cb(payload)
@@ -199,6 +206,12 @@ const api: WindowApi = {
       ipcRenderer.on('chat:voice-mode', listener)
       return () => ipcRenderer.removeListener('chat:voice-mode', listener)
     },
+    /** 附件：粘贴/拖入的图片字节交给主进程压缩落盘，回传附件描述 */
+    attachImage: (params) => ipcRenderer.invoke('chat:attach-image', params),
+    /** 删除未发送的附件文件（用户移除缩略图） */
+    discardImage: (params) => ipcRenderer.invoke('chat:discard-image', params),
+    /** 附件 URL：pet-res://chat-images/{sessionId}/{fileName} */
+    imageUrl: (relPath) => `pet-res://chat-images/${relPath.split('\\').join('/')}`,
   },
   pet: {
     onCardChanged: (cb) => {
@@ -230,7 +243,7 @@ const api: WindowApi = {
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步）；
      *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本 */
     onSpeak: (cb) => {
-      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../src/types').CharacterGenieOverride | null; displayOnly?: boolean; ttsSpeed?: number | null }) => cb(payload)
+      const listener = (_e: Electron.IpcRendererEvent, payload: { text: string; voiceId: string | null; languageOverride: import('../src/types').TTSLanguage | null; chunks?: import('../src/types').DialogueChunk[]; follow?: boolean; engine?: TTSEngine; localVoice?: import('../src/types').CharacterLocalVoice | null; displayOnly?: boolean; ttsSpeed?: number | null }) => cb(payload)
       ipcRenderer.on('pet:speak', listener)
       return () => ipcRenderer.removeListener('pet:speak', listener)
     },
@@ -247,6 +260,12 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, thinking: boolean) => cb(thinking)
       ipcRenderer.on('pet:thinking', listener)
       return () => ipcRenderer.removeListener('pet:thinking', listener)
+    },
+    /** 订阅"观察中"状态（点眼睛后看屏幕的那几秒），立绘切观察立绘 */
+    onObserving: (cb: (observing: boolean) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, observing: boolean) => cb(observing)
+      ipcRenderer.on('pet:observing', listener)
+      return () => ipcRenderer.removeListener('pet:observing', listener)
     },
     /** 订阅流式开始时的"本轮语音模式"（是否有语音），提前决定文本展示 */
     onVoiceMode: (cb) => {
@@ -303,8 +322,15 @@ const api: WindowApi = {
     genieSaveConfig: (patch) => ipcRenderer.invoke('tts:genie-save-config', patch),
     genieCheck: (baseUrl) => ipcRenderer.invoke('tts:genie-check', baseUrl),
     genieStart: (workPath, dataDir) => ipcRenderer.invoke('tts:genie-start', workPath, dataDir),
+    genieStop: () => ipcRenderer.invoke('tts:genie-stop'),
     chooseFolder: () => ipcRenderer.invoke('tts:choose-folder'),
     chooseAudioFile: () => ipcRenderer.invoke('tts:choose-audio-file'),
+    sbv2Config: () => ipcRenderer.invoke('tts:sbv2-config'),
+    sbv2SaveConfig: (patch) => ipcRenderer.invoke('tts:sbv2-save-config', patch),
+    sbv2Devices: () => ipcRenderer.invoke('tts:sbv2-devices'),
+    sbv2Start: () => ipcRenderer.invoke('tts:sbv2-start'),
+    sbv2Stop: () => ipcRenderer.invoke('tts:sbv2-stop'),
+    sbv2Status: () => ipcRenderer.invoke('tts:sbv2-status'),
   },
   /** 角色 TTS 模型卡管理 */
   ttsModel: {
@@ -327,6 +353,8 @@ const api: WindowApi = {
       ipcRenderer.on('proactive:state', listener)
       return () => ipcRenderer.removeListener('proactive:state', listener)
     },
+    /** 用户主动识屏（眼睛按钮）：立刻看一次并让角色开口；不消耗每日次数 */
+    lookNow: () => ipcRenderer.invoke('proactive:look-now') as Promise<{ ok: boolean; error?: string }>,
   },
   /** 剧情演出：剧本库/run 存档/演出控制/事件订阅（与聊天系统完全分离） */
   story: {

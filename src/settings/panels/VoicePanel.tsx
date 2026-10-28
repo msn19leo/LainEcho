@@ -1,7 +1,8 @@
 /**
  * 语音合成配置面板。
- * 双引擎：
- * - 本地声库（engine=genie，默认）：本地 GenieTTS 服务，声库自带性格；自动拉起 + 健康检测。
+ * 三引擎：
+ * - Genie-TTS（engine=genie，默认）：Genie-TTS 服务；启动后常驻，可手动结束。
+ * - 本地 SBV2（engine=sbv2）：Style-Bert-VITS2，仅日文，见 Sbv2Section。
  * - 云端声音克隆（engine=mimo）：MiMo，需 API Key + 参考音频。
  * 功能：
  * - 引擎切换
@@ -12,11 +13,12 @@
  * - 测试合成试听
  */
 import { useEffect, useRef, useState } from 'react'
-import { CheckCircle2, Play, Plus, Trash2, XCircle, Pencil, PlugZap, Rocket, Loader2, FolderOpen, FileAudio } from 'lucide-react'
+import { CheckCircle2, Play, Plus, Power, Trash2, XCircle, Pencil, PlugZap, Rocket, Loader2, FolderOpen, FileAudio } from 'lucide-react'
 import { api } from '../../api'
 import type { TTSConfig, VoiceReference, TTSLanguage, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../types'
 import { Button, Card, ConfirmModal, Field, Input, Loading, Modal, PanelHeader, Slider } from '../../components/ui'
 import { toast } from '../../components/toast'
+import { Sbv2Section } from './voice/Sbv2Section'
 
 /** 测试合成的按语言默认文本 */
 const TEST_TEXT_DEFAULTS: Record<TTSLanguage, string> = {
@@ -329,6 +331,13 @@ export function VoicePanel() {
     if (p) setEditor((prev) => ({ ...prev, refAudioPath: p }))
   }
 
+  /** 结束 Genie-TTS 服务（之后合成不再自动拉起，直到再次点启动） */
+  async function handleStopGenie() {
+    await api.tts.genieStop()
+    setCheckResult(null)
+    toast('Genie-TTS 服务已结束')
+  }
+
   /** 测试合成（Web Audio 试听，不驱动 Live2D） */
   const handleTest = async () => {
     const isGenie = config?.engine === 'genie'
@@ -358,7 +367,7 @@ export function VoicePanel() {
         text: speakText,
         voiceId: isGenie ? null : targetVoice!.id,
         engine: isGenie ? 'genie' : 'mimo',
-        genieOverride: isGenie && selectedModelId ? { ttsModelId: selectedModelId } : null,
+        localVoice: isGenie && selectedModelId ? { ttsModelId: selectedModelId } : null,
         speed: config?.ttsSpeed ?? 1,
       })
       if (!audio) {
@@ -389,7 +398,7 @@ export function VoicePanel() {
     <div className="space-y-5">
       <PanelHeader
         title="语音合成"
-        desc="本地声库(GenieTTS)语音由声库自带性格；也可切换到云端声音克隆。"
+        desc="三选一：Genie-TTS 声库、本地 SBV2（日文）、云端声音克隆。"
       />
 
       {/* 引擎切换 */}
@@ -397,12 +406,14 @@ export function VoicePanel() {
         <Field label="语音引擎">
           <div className="flex gap-2">
             {([
-              { value: 'genie', label: '本地声库' },
+              { value: 'genie', label: 'Genie-TTS' },
+              { value: 'sbv2', label: '本地 SBV2' },
               { value: 'mimo', label: '云端声音克隆' },
             ] as const).map((o) => (
               <button
                 key={o.value}
-                onClick={() => void handleSaveConfig({ engine: o.value })}
+                // SBV2 只能读日文：切过去时把输出语言一并拨到日文，避免显示与行为不一致
+                onClick={() => void handleSaveConfig(o.value === 'sbv2' ? { engine: o.value, language: 'ja' } : { engine: o.value })}
                 className={`rounded-[var(--radius-sm)] border px-4 py-2 text-sm transition-all ${
                   config.engine === o.value
                     ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
@@ -416,40 +427,39 @@ export function VoicePanel() {
         </Field>
       </Card>
 
-      {/* 语言（双引擎共用） */}
+      {/* 语言（三引擎共用；SBV2 固定日文） */}
       <Card>
         <div className="space-y-4">
-          <Field label="输出语言" hint="中文/日文：Genie 引擎按角色声库能力朗读对应语言">
-            <div className="flex gap-2">
-              {(['zh', 'ja'] as const).map((lang) => (
-                <button
-                  key={lang}
-                  onClick={() => void handleSaveConfig({ language: lang as TTSLanguage })}
-                  className={`rounded-[var(--radius-sm)] border px-4 py-2 text-sm transition-all ${
-                    config.language === lang
-                      ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
-                      : 'border-border text-text-2 hover:border-border-strong hover:text-text'
-                  }`}
-                >
-                  {lang === 'zh' ? '中文' : '日文'}
-                </button>
-              ))}
-            </div>
-          </Field>
           <Field
-            label="整段合音"
-            hint="开启后一段回复整段一次合成（音调更连贯），中文/日文均适用；失去逐句实时朗读与逐句切立绘。"
+            label="输出语言"
+            hint={
+              config.engine === 'sbv2'
+                ? '本地 SBV2 仅支持日文：中文台词会先翻译为日语再合成，因此中文选项不可选。'
+                : '中文/日文：Genie-TTS 按角色声库能力朗读对应语言'
+            }
           >
-            <button
-              onClick={() => void handleSaveConfig({ mergeSpeech: !(config.mergeSpeech ?? false) })}
-              className={`rounded-[var(--radius-sm)] border px-4 py-2 text-sm transition-all ${
-                config.mergeSpeech
-                  ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
-                  : 'border-border text-text-2 hover:border-border-strong hover:text-text'
-              }`}
-            >
-              {config.mergeSpeech ? '已开启' : '已关闭'}
-            </button>
+            <div className="flex gap-2">
+              {(['zh', 'ja'] as const).map((lang) => {
+                const disabled = config.engine === 'sbv2' && lang === 'zh'
+                const active = config.engine === 'sbv2' ? lang === 'ja' : config.language === lang
+                return (
+                  <button
+                    key={lang}
+                    disabled={disabled}
+                    onClick={() => void handleSaveConfig({ language: lang as TTSLanguage })}
+                    className={`rounded-[var(--radius-sm)] border px-4 py-2 text-sm transition-all ${
+                      disabled
+                        ? 'cursor-not-allowed border-border text-text-muted opacity-40'
+                        : active
+                          ? 'border-brand bg-brand-gradient text-[var(--on-brand)] shadow-[0_0_12px_var(--primary-glow)]'
+                          : 'border-border text-text-2 hover:border-border-strong hover:text-text'
+                    }`}
+                  >
+                    {lang === 'zh' ? '中文' : '日文'}
+                  </button>
+                )
+              })}
+            </div>
           </Field>
           <Field
             label="TTS 语速"
@@ -469,7 +479,7 @@ export function VoicePanel() {
         </div>
       </Card>
 
-      {/* ==================== 本地声库(GenieTTS) ==================== */}
+      {/* ==================== Genie-TTS ==================== */}
       {config.engine === 'genie' && (
         <>
           {/* GenieTTS 服务配置 */}
@@ -499,6 +509,15 @@ export function VoicePanel() {
                   <Button variant="outline" onClick={() => void handleStartGenie()} disabled={starting}>
                     <Rocket size={14} strokeWidth={2.25} />
                     {starting ? '启动中…' : '启动服务'}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => void handleStopGenie()}
+                    disabled={starting}
+                    title="结束 Genie-TTS 服务，释放内存；结束期间合成不再自动拉起"
+                  >
+                    <Power size={14} strokeWidth={2.25} />
+                    结束
                   </Button>
                 </div>
               </Field>
@@ -540,7 +559,7 @@ export function VoicePanel() {
             <div className="mb-3 flex items-center justify-between">
               <div>
                 <span className="text-[13px] font-medium text-text-2">角色 TTS 模型</span>
-                <p className="mt-0.5 text-xs text-text-muted">管理本地声库的角色模型，选中后可用于测试合成</p>
+                <p className="mt-0.5 text-xs text-text-muted">管理 Genie-TTS 的角色模型，选中后可用于测试合成</p>
               </div>
               <Button variant="outline" size="sm" onClick={() => void handleNewModel()}>
                 <Plus size={14} strokeWidth={2.25} />
@@ -599,6 +618,9 @@ export function VoicePanel() {
           </Card>
         </>
       )}
+
+      {/* ==================== 本地 SBV2（独立组件，不与 Genie 共用） ==================== */}
+      {config.engine === 'sbv2' && <Sbv2Section ttsSpeed={config.ttsSpeed ?? 1} />}
 
       {/* ==================== 云端引擎：MiMo ==================== */}
       {config.engine === 'mimo' && (
@@ -740,7 +762,8 @@ export function VoicePanel() {
         </>
       )}
 
-      {/* 测试合成 */}
+      {/* 测试合成（SBV2 在 Sbv2Section 内有独立测试卡） */}
+      {config.engine !== 'sbv2' && (
       <Card>
         <div className="mb-3">
           <span className="text-[13px] font-medium text-text-2">测试合成</span>
@@ -755,7 +778,7 @@ export function VoicePanel() {
         <div className="flex items-center justify-between">
           <span className="text-xs text-text-muted">
             {config.engine === 'genie'
-              ? selectedModel ? `本地声库：${selectedModel.name}` : '请先选择一个 TTS 模型卡'
+              ? selectedModel ? `Genie-TTS：${selectedModel.name}` : '请先选择一个 TTS 模型卡'
               : selectedVoice
                 ? `云端引擎：使用「${selectedVoice.name}」合成`
                 : '云端引擎：未选中参考音频，将使用第一条合成'}
@@ -776,12 +799,13 @@ export function VoicePanel() {
           </div>
         )}
       </Card>
+      )}
 
       {/* 删除模型卡确认弹窗 */}
       <ConfirmModal
         open={!!deletingModel}
         title="删除 TTS 模型"
-        message={`确定删除模型「${deletingModel?.name ?? ''}」吗？绑定该模型的角色卡将失去本地声库语音。`}
+        message={`确定删除模型「${deletingModel?.name ?? ''}」吗？绑定该模型的角色卡将失去 Genie-TTS 语音。`}
         confirmText="删除"
         danger
         onConfirm={() => {

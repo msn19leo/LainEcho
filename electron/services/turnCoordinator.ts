@@ -301,7 +301,18 @@ function armWatchdog(): void {
       console.warn('[turn] reading 看门狗触发（零进度，语音链疑似全灭/宠物窗未消费）→ 强制落定')
     }
     forceFinish()
+    // 前端兜底：stream-done 若在链路上丢失，渲染端 streaming 永不复位（发送按钮卡在停止、
+    // 回包不进入消息列表，直播气泡卸载后整条回复消失）。强制落定后补发一次唤醒复位——
+    // 渲染端幂等（已落定则跳过追加），重复广播无害。
+    broadcastFallbackStreamDone()
   }, READING_WATCHDOG_MS)
+}
+
+/** 看门狗兜底：把已落定的定型消息补发为 stream-done，唤醒渲染端复位 streaming */
+function broadcastFallbackStreamDone(): void {
+  if (!doc || !doc.final) return
+  windowManager.broadcastAI('ai:stream-done', { sessionId: doc.sessionId, message: doc.final })
+  console.warn('[turn] 已补发 stream-done（session=%s），复位渲染端 streaming', doc.sessionId)
 }
 
 /** 修正本轮语音可用性标记（chatTurn 在 settings/角色卡加载完成、voiceActive 求值后调用） */
@@ -314,7 +325,7 @@ export function markVoice(voice: boolean): void {
 /**
  * 语音进度记账（字符口径，方案A主门控）：宠物窗每消费一个槽位上行累计字符数。
  * 单调取 max（乱序/重复上报无害）；speaking ≥ spoken，差值 = 正在播放的块。
- * 渲染端揭示上限 = speakingChars、下限（快进）= spokenChars——与提取器变体/合音/兜底完全解耦。
+ * 渲染端揭示上限 = speakingChars、下限（快进）= spokenChars——与提取器变体/兜底完全解耦。
  */
 export function markProgress(turnId: string, speakingChars: number, spokenChars: number): void {
   if (!doc || doc.turnId !== turnId) return
@@ -396,6 +407,22 @@ export function abortTurn(final?: import('../../src/types').ChatMessage): void {
   doc.phase = 'done'
   if (final) doc.final = final
   broadcastDone()
+}
+
+/**
+ * 主动清空回合文档（编辑重发截断后）：被删回复的直播/跟读气泡必须立即消失。
+ * sessionId 传入时只清属于该会话的文档，避免误伤其他会话/剧情 run。
+ */
+export function clearTurn(sessionId?: string): void {
+  if (sessionId && doc && doc.sessionId !== sessionId) return
+  clearWatchdog()
+  if (throttleTimer) {
+    clearTimeout(throttleTimer)
+    throttleTimer = null
+  }
+  doc = null
+  dirty = false
+  windowManager.broadcastAI('ai:turn-cleared', {})
 }
 
 /** 拉取当前快照（ai:get-turn-snapshot invoke；无文档返回 null。原子读、幂等） */

@@ -15,7 +15,6 @@ import { getTTSConfig } from './tts.ipc'
 import { resolveProfile } from '../services/apiProfiles'
 import {
   buildSystemPrompt,
-  deleteLastTurnMessages,
   getCharacterCard,
   getSession,
   getSettings,
@@ -23,6 +22,7 @@ import {
   removeFailedDuplicateUser,
   updateSessionSummary,
 } from '../services/repository'
+import { isRewindBusy, performRewind } from '../services/rewind'
 import { buildSystemParts } from '../services/prompt/sections'
 import { composeSystemPrompt } from '../services/prompt/composer'
 import { retrieveMemories } from '../services/memory/retriever'
@@ -39,9 +39,12 @@ export function registerAiIpc(): void {
     if (!Array.isArray(messages) || messages.length === 0) throw new Error('消息内容为空')
     const last = messages[messages.length - 1]
     const content = last?.content ?? ''
+    // 本轮附带图片（已由 chat:attach-image 压缩落盘；仅取最后一条，历史图片随磁盘消息重建）
+    const images = Array.isArray(last?.images) && last.images.length > 0 ? last.images : undefined
     // 并发防护：上一轮（LLM/持久化阶段）未结束前拒绝新消息（重答期间渲染端 streamUser 会
     // 置 streaming，但 rewound→stream-user 的窗口期 streaming 尚未置位，此处兜底）
     if (isTurnBusy()) throw new Error('上一轮回复还在生成中，请稍候')
+    if (isRewindBusy(sessionId)) throw new Error('正在处理上一条消息的重发，请稍候')
     // 重发去重：磁盘末条是带 error 的失败 user 且内容与本次相同 → 移除（本次发送替代失败尝试），
     // 否则历史出现相邻重复 user（进入上下文还可能诱发模型输出劣化，2026-10-17 实锤）
     await removeFailedDuplicateUser(sessionId, content).catch(() => {})
@@ -53,41 +56,60 @@ export function registerAiIpc(): void {
     // 轮次执行失败不再向调用方 rethrow：失败态（stream-error 广播 + 落盘）已全权驱动渲染端，
     // invoke 拒绝仅保留给「轮次从未开始」的前置拒绝（busy/校验），渲染端据此区分回滚与横幅。
     try {
-      return await runChatTurn({ sessionId, content })
+      return await runChatTurn({ sessionId, content, images })
     } catch {
       return null
     }
   })
 
   /**
-   * 消息重答（ reroll："截断最后一轮 → 重走正常链路"）：
-   * 删除最后一轮（user+assistant）后用原 user 内容（或编辑后文本）重跑 runChatTurn——
-   * 流式/语音/持久化/记忆沉淀全部复用，无独立重答管线。
-   * 编辑并重发 = editText 非空；重新回答 = editText 为空。
-   * 广播 ai:session-rewound 让两窗用磁盘最新消息列表替换本地（旧轮气泡消失），
-   * 随后的 ai:stream-user 正常走既有同步链。
+   * 消息重答：截断最后一轮（user+assistant）后重跑正常链路。
+   * 保留旧 editText 参数的兼容路径；新 UI 的编辑重发走 ai:rewind-edit。
+   * 返回删除范围；轮次失败由 stream-error 广播驱动。
    */
-  ipcMain.handle('ai:regenerate', async (_event, params: { sessionId: string; editText?: string }) => {
-    const { sessionId, editText } = params ?? {}
+  ipcMain.handle('ai:regenerate', async (_event, params: { sessionId: string; expectedRevision?: number; editText?: string }) => {
+    const { sessionId, expectedRevision, editText } = params ?? {}
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
-    if (isTurnBusy()) throw new Error('上一轮回复还在生成中，无法重新回答')
-    const removedUser = await deleteLastTurnMessages(sessionId)
-    if (!removedUser) throw new Error('没有可重新回答的轮次')
-    const content = (editText ?? removedUser.content ?? '').trim()
-    if (!content) throw new Error('编辑后的消息内容为空')
-
-    // 广播截断结果（先于重跑：两窗立刻丢弃旧轮消息），再按用户活跃刷新调度器
-    const session = await getSession(sessionId)
-    windowManager.broadcastAI('ai:session-rewound', { sessionId, messages: session.messages })
-    noteUserMessage(sessionId)
-
-    // 轮次失败返回 null（语义同 send-message），前置拒绝（busy/无轮次/内容为空）仍 reject
-    try {
-      return await runChatTurn({ sessionId, content })
-    } catch {
-      return null
-    }
+    return performRewind({
+      sessionId,
+      mode: editText?.trim() ? 'edit' : 'regen',
+      editText,
+      expectedRevision,
+    })
   })
+
+  /**
+   * 编辑并重发任意一条 user 消息：删除该消息及其后全部消息，用 editText 重跑。
+   * 删除不可撤销；expectedRevision/expectedTimestamp/expectedContent 用于乐观并发校验。
+   */
+  ipcMain.handle(
+    'ai:rewind-edit',
+    async (
+      _event,
+      params: {
+        sessionId: string
+        targetIndex: number
+        editText: string
+        expectedRevision?: number
+        expectedTimestamp?: number
+        expectedContent?: string
+      },
+    ) => {
+      const { sessionId, targetIndex, editText, expectedRevision, expectedTimestamp, expectedContent } = params ?? {}
+      if (typeof sessionId !== 'string' || !sessionId) throw new Error('缺少会话 id')
+      if (!Number.isInteger(targetIndex) || targetIndex < 0) throw new Error('目标消息不存在')
+      if (typeof editText !== 'string') throw new Error('缺少编辑后的消息内容')
+      return performRewind({
+        sessionId,
+        mode: 'edit',
+        targetIndex,
+        editText,
+        expectedRevision,
+        expectedTimestamp,
+        expectedContent,
+      })
+    },
+  )
 
   ipcMain.on('ai:cancel', () => {
     cancelCurrentTurn()

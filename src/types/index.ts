@@ -62,9 +62,33 @@ export interface ChatMessageMeta {
   cancelled?: boolean
 }
 
+/**
+ * 聊天消息附带的图片（仅 user 消息）。
+ *
+ * 落盘于 data/chat-images/{sessionId}/{fileName}，渲染经 pet-res://chat-images/ 读取。
+ * 与 content 是双通道关系：content 始终是纯文本（纯图消息落 `[图片]` 占位），
+ * 因此摘要/导出/记忆抽取/宠物窗渲染/token 估算等下游无需认识本字段。
+ */
+export interface ChatImage {
+  /** 相对 chat-images 根目录的路径：`{sessionId}/{fileName}` */
+  path: string
+  width: number
+  height: number
+  /** 压缩后字节数 */
+  bytes: number
+  /**
+   * 首次发送时生成的图片转述文本。
+   * 读图方式=视觉模型辅助时为必需（它就是模型"看到"的全部内容）；
+   * 主模型直读 + 记忆轮数为 0 时为空串（后续轮次用 content 里的占位兜底）。
+   */
+  caption: string
+}
+
 export interface ChatMessage {
   role: ChatRole
   content: string
+  /** 本轮附带图片（仅 user 消息；纯图时 content 落 `[图片]` 占位） */
+  images?: ChatImage[]
   timestamp?: number
   /** 消息来源标记（普通聊天无此字段） */
   meta?: ChatMessageMeta
@@ -95,11 +119,17 @@ export interface CharacterTTSOverride {
   language: TTSLanguage | null
 }
 
-/** 角色卡声音模式：不启用 / 本地 Genie-TTS / 云端声音克隆 */
-export type CharacterVoiceMode = 'none' | 'genie' | 'mimo'
+/** 语音引擎：genie 本地 Genie-TTS / mimo 云端声音克隆 / sbv2 本地 Style-Bert-VITS2（仅日文） */
+export type TTSEngine = 'genie' | 'mimo' | 'sbv2'
 
-/** 角色级 Genie-TTS 覆盖：该角色绑定哪个本地 TTS 模型卡（null = 用全局默认） */
-export interface CharacterGenieOverride {
+/** 角色卡声音模式：不启用 / 本地 Genie-TTS / 本地 SBV2 / 云端声音克隆 */
+export type CharacterVoiceMode = 'none' | 'genie' | 'sbv2' | 'mimo'
+
+/**
+ * 角色级本地模型绑定：该角色用哪张 TTS 模型卡（null = 走全局默认）。
+ * Genie 指向角色 TTS 模型卡，SBV2 指向声线卡，两种卡共用 tts-models.json。
+ */
+export interface CharacterLocalVoice {
   /** 绑定的 TTS 模型卡 id */
   ttsModelId: string
 }
@@ -205,7 +235,7 @@ export interface CharacterCard {
   /** 角色声音模式：不启用 / 本地 Genie-TTS / 云端声音克隆 */
   voiceMode: CharacterVoiceMode
   /** 角色级 Genie-TTS 覆盖（voiceMode='genie' 时；null = 跟随全局 Genie 配置） */
-  genieOverride: CharacterGenieOverride | null
+  localVoice: CharacterLocalVoice | null
   /** 角色 TTS 语速倍率（0.75–1.5，null/1 = 原速）：主进程合成后对音频重采样变速，两引擎通用 */
   ttsSpeed: number | null
 
@@ -246,7 +276,7 @@ export type CharacterCardInput = Pick<
   | 'modelId'
   | 'voiceId'
   | 'voiceMode'
-  | 'genieOverride'
+  | 'localVoice'
   | 'ttsSpeed'
   | 'ttsOverride'
   | 'renderMode'
@@ -281,15 +311,13 @@ export interface TTSConfig {
   language: TTSLanguage
   /** MiMo 模型名（如 mimo-v2.5-tts-voiceclone）；engine=genie 时忽略 */
   model: string
-  /** 语音引擎：genie 本地声库语音服务(GenieTTS) / mimo 云端声音克隆 */
-  engine: 'genie' | 'mimo'
-  /** 整段合音（默认为关）：开启时一段回复的多个合成分段合并为整段一次合成（音调更连贯），代价是失去逐句实时朗读与逐句切立绘。中文/日文均适用。 */
-  mergeSpeech?: boolean
+  /** 语音引擎：genie 本地 Genie-TTS / mimo 云端声音克隆 / sbv2 本地 SBV2（仅日文） */
+  engine: TTSEngine
   /** TTS 语速倍率（0.75–1.5，默认 1.0）：主进程合成后对音频重采样变速，供模型试听测试用 */
   ttsSpeed?: number
 }
 
-/** GenieTTS(本地声库语音服务) 配置 */
+/** Genie-TTS 配置 */
 export interface TTSGenieConfig {
   /** 服务地址（GenieTTS start_server 默认 8000 端口） */
   baseUrl: string
@@ -299,9 +327,42 @@ export interface TTSGenieConfig {
   dataDir: string
 }
 
-/** 角色 TTS 模型卡：一组本地 GenieTTS 声库参数 */
+/** 本地 SBV2（Style-Bert-VITS2）配置：tts-sbv2.json */
+export interface TTSsbv2Config {
+  /** DeBERTa 目录（含 deberta.onnx 与 tokenizer.json）；全局只配一份 */
+  bertDir: string
+  /** 推理设备：cpu / dml / dml:<adapterId> */
+  device: string
+  /** 随机度 sdp_ratio（0–1，默认 0.2）：时长预测里「随机分支」的占比，越高节奏起伏越大 */
+  sdpRatio: number
+  /** sidecar 可执行文件目录（留空 = 用安装包内置的 resources/sbv2） */
+  exeDir: string
+}
+
+/** DXGI 枚举出的显卡（id 即 DirectML 的 device_id） */
+export interface Sbv2Device {
+  id: number
+  name: string
+  vendorId: number
+  deviceId: number
+}
+
+/** SBV2 sidecar 运行状态 */
+export interface Sbv2ServerStatus {
+  state: 'stopped' | 'starting' | 'ready' | 'error'
+  /** 面向用户的说明（加载中/已停止/错误原因） */
+  message: string
+  /** 当前推理设备 spec（cpu / dml / dml:0） */
+  device?: string
+  /** 已驻留内存的声线 ident 列表 */
+  voices?: string[]
+}
+
+/** 角色 TTS 模型卡：Genie 角色模型 或 SBV2 声线，共用一份存储 */
 export interface TTSModelCard {
   id: string
+  /** 归属引擎（缺省 = genie，兼容旧数据）；sbv2 卡只用 name + onnxModelDir */
+  engine?: 'genie' | 'sbv2'
   /** 模型卡名称（如 "菲比"） */
   name: string
   /** GenieTTS 角色名（对应 onnx 模型） */
@@ -317,6 +378,8 @@ export interface TTSModelCard {
 
 /** 创建/更新 TTS 模型卡的输入 */
 export interface TTSModelCardInput {
+  /** 归属引擎（缺省 genie）；sbv2 卡只用 name + onnxModelDir */
+  engine?: 'genie' | 'sbv2'
   name: string
   characterName: string
   onnxModelDir: string
@@ -383,8 +446,41 @@ export interface SessionDetail {
   id: string
   characterCardId: string
   messages: ChatMessage[]
+  /**
+   * 消息修订号：只在消息数组发生增删时自增（append / 截断）。
+   * 渲染端重答用它做乐观并发校验，避免在另一窗口追加消息后按旧下标截断。
+   */
+  revision?: number
+  /**
+   * 情景摘要代际：消息变更、截断、手动编辑摘要时自增。
+   * 异步的情景摘要更新携带旧代际写回时会被丢弃，防止 rewind 后被旧轮覆盖。
+   */
+  sceneEpoch?: number
   /** 情景摘要缓存（Phase 1）：本会话"此刻"的场景状态（对话层，辅助模型逐轮增量更新），注入【当前情景】Section */
   sceneDigest?: string
+  /**
+   * 摘要对应的消息数（写摘要时的 messages.length）：用于判断摘要是否覆盖了某条消息。
+   * sceneDigestAt <= 目标下标 → 摘要只描述目标之前的状态，编辑重发时可直接保留。
+   */
+  sceneDigestAt?: number
+}
+
+/** 消息重答（截断 + 重跑）的回执：删除范围 */
+export interface RewindReceipt {
+  ok: true
+  deletedCount: number
+  targetIndex: number
+}
+
+/** 会话截断广播载荷（编辑重发 / 重新回答） */
+export interface SessionRewoundPayload {
+  sessionId: string
+  messages: ChatMessage[]
+  revision: number
+  /** 本次删除的消息条数（含目标消息） */
+  deletedCount?: number
+  /** 被编辑/重答的 user 消息下标 */
+  targetIndex?: number
 }
 
 /** 主题模式：dark / light / system（跟随系统 prefers-color-scheme） */
@@ -410,6 +506,60 @@ export interface ApiProfile {
    * 渲染端回传/落盘时忽略此字段）
    */
   hasKey?: boolean
+}
+
+/**
+ * 读图方式：
+ * - `direct`：图片原样发给主模型（要求主模型支持图片输入，由用户自行确认）；
+ * - `describe`：先由视觉模型转述成文字，再交给主模型（不依赖主模型能力，默认）。
+ */
+export type VisionReadMode = 'direct' | 'describe'
+
+/** 感知范围：整屏 / 活动窗口 */
+export type ScreenRange = 'screen' | 'window'
+
+/**
+ * 点眼睛时的识图方式：
+ * - ambient（速览）：视觉模型转述成氛围描述，不读画面文字；
+ * - detail（详述）：视觉模型如实转述主要内容（不逐字抄），约 400 字；
+ * - native（直读）：截图作为临时图片直发主模型，不落盘不写历史，旁白只有一句"看过去"。
+ * 只影响眼睛按钮；主动搭话固定走 ambient。
+ */
+export type EyeReadMode = 'ambient' | 'detail' | 'native'
+
+/** 视觉能力配置（设置页「视觉」模块；聊天发图与屏幕感知共用） */
+export interface VisionSettings {
+  /** 读图方式（默认 describe） */
+  readMode: VisionReadMode
+  /** 是否允许在聊天窗口发送图片 */
+  chatImagesEnabled: boolean
+  /**
+   * 图片记忆轮数：原图进入模型上下文的对话轮数（0 = 仅发送当轮带原图）。
+   * 超出轮数后只用首次发送时生成的 caption 文本（≈30 token），不重复上传原图。
+   */
+  captionRounds: number
+  /** 原图保留天数（0 = 永久保留；超出后清理磁盘文件，消息里的图片退化为占位） */
+  imageRetentionDays: number
+  /**
+   * 感知范围：window = 只截当前活动窗口（字更清楚、天然不含自家窗口）／screen = 整屏。
+   * 默认 window。
+   */
+  screenRange: ScreenRange
+  /**
+   * 读取前台窗口标题（L0 信号）：只读窗口标题，不截图、不联网。
+   * 关闭时感知退化为"整屏截图 + 盲看"，搭话时机评分也拿不到应用信息。
+   */
+  readForeground: boolean
+  /** 把用户正在使用的应用写进【当前情景】告诉模型（关闭则 L0 只服务时机评分，模型不知情） */
+  injectActivity: boolean
+  /**
+   * 截图时隐藏本应用的窗口（Windows: SetWindowDisplayAffinity / WDA_EXCLUDEFROMCAPTURE）。
+   * 开启后：桌宠/聊天/设置等窗口不会出现在屏幕感知的截图里，用户自己截图录屏也拍不到；
+   * 关闭后需要靠 prompt 让模型"忽略自家窗口"，不可靠。
+   */
+  hideFromCapture: boolean
+  /** 点眼睛时的识图方式（默认 ambient；主动搭话始终 ambient） */
+  eyeReadMode: EyeReadMode
 }
 
 /** 非敏感 API 配置（settings.json） */
@@ -448,12 +598,20 @@ export interface AppSettings {
   enableProactive: boolean
   /** 是否启用屏幕感知（与主动搭话同时开启时：先感知屏幕内容再搭话；截图不落盘） */
   enableScreenSense: boolean
+  /** 视觉能力配置（设置页「视觉」模块：聊天发图 + 屏幕感知共用） */
+  vision: VisionSettings
   /** 每日主动搭话次数上限（用户回复后会重置计数） */
   maxProactivePerDay: number
   /** 主动搭话兴趣值增长间隔（秒）：每 X 秒累积一轮兴趣值（+5~10），默认 30，范围 10~600 */
   proactiveInterestIntervalSec: number
   /** 话题搭话旁白由 LLM 随机生成（关闭 = 固定模板；LLM 失败自动回退模板） */
   proactiveLlmNarration: boolean
+  /**
+   * 屏幕搭话占比 0–100（默认 70）：主动搭话时"先看一眼屏幕再说话"的概率。
+   * 只影响主动搭话的意图选择，不影响频率（频率由兴趣值 + 每日上限决定），
+   * 也不影响用户点眼睛的主动识屏。
+   */
+  proactiveScreenWeight: number
   /** 免打扰时段（'HH:MM' 24 小时制；start/end 任一为空 = 不启用；支持跨零点，如 23:00-08:00） */
   quietHours: { start: string; end: string }
   /** @deprecated 旧版视觉模型地址，仅启动迁移读取；运行时以激活档案为准 */
@@ -484,14 +642,14 @@ export interface AppSettings {
    */
   voiceTextFollowAudio: boolean
   /**
-   * 语音段截断二次重试时重载模型（默认开，仅 Genie 本地声库）：段时长过短（截断）先免重载
+   * 语音段截断二次重试时重载模型（默认开，仅 Genie Genie-TTS）：段时长过短（截断）先免重载
    * 直接重试一次；仍截断时开启则重载角色模型后兜底重试一次（多花 8~13s 换完整重试机会），
    * 关闭则直接放行较短音频（响应更快）。2026-10-22 实验实锤：同状态重发三次全部完整，
    * 截断非确定性行为——免重载重试是主路径，重载只是未知的"真·模型状态坏"场景的保险
    */
   truncationReloadRetry: boolean
   /**
-   * Genie 本地声库多句段严格判定（默认开）：多句段（内部含 。！？）使用单独的截断阈值，
+   * Genie Genie-TTS多句段严格判定（默认开）：多句段（内部含 。！？）使用单独的截断阈值，
    * 且取消 20 字豁免；关闭后全部回落单句阈值（原行为）。仅影响 Genie 合成
    */
   genieMultiSentenceStrict: boolean
@@ -625,6 +783,12 @@ export interface CharacterSprite {
   speakingImage: string | null
   /** 思考立绘图（相对文件路径，空 = 未配置）：AI 开始准备回答到输出文本前使用 */
   thinkingImage: string | null
+  /**
+   * 观察立绘图（相对文件路径，空 = 未配置）：用户点桌宠「眼睛」按钮后，
+   * 角色看屏幕（截图 + 视觉模型转述）的那几秒使用；转述完成进入思考即被覆盖。
+   * 仅桌面端演出，剧情窗不参与；未配置时回落 thinkingImage。
+   */
+  observingImage: string | null
   createdAt: number
 }
 
@@ -803,6 +967,8 @@ export interface ContextStats {
 export interface StreamDonePayload {
   sessionId: string
   message: ChatMessage
+  /** 落盘后的消息修订号：渲染端原子对齐，避免紧接着的重答因 revision 过期被拒 */
+  revision?: number
 }
 
 /** AI 流式出错 / 取消事件负载 */
@@ -811,6 +977,8 @@ export interface StreamErrorPayload {
   error: string
   /** true 表示用户主动点击「停止」（cancel），非真实错误 */
   cancelled?: boolean
+  /** 失败轮落盘后的消息修订号（渲染端用于紧接的重答校验） */
+  revision?: number
   /**
    * 失败轮落盘的权威 user 消息（携带 error 原因或 meta.cancelled 标记）：
    * 渲染端用它原子对齐本地列表（就地替换末条同文 user 或补挂缺失气泡），
@@ -1077,12 +1245,14 @@ export interface StorySpriteView {
   y: number
 }
 
-/** 剧情语音配置（随 run 存档；与角色卡声音模块解耦，仅支持本地 Genie 声库） */
+/** 剧情语音配置（随 run 存档；与角色卡声音模块解耦，支持本地 Genie-TTS 与本地 SBV2） */
 export interface StoryVoiceConfig {
-  /** 本地声库模型卡 id（tts-model_xxx） */
+  /** 模型卡 id（tts-model_xxx）；Genie 与 SBV2 共用同一份卡池，靠 engine 区分 */
   ttsModelId: string
-  /** 语音输出语言：zh 中文 / ja 日语（日语模式自动翻译，复用现有 Genie 逻辑） */
+  /** 语音输出语言：zh 中文 / ja 日语；engine=sbv2 时强制 ja（该引擎只读日文） */
   language: 'zh' | 'ja'
+  /** 引擎（缺省 = genie，兼容旧存档）；sbv2 的中文台词会先翻译成日语再合成 */
+  engine?: 'genie' | 'sbv2'
 }
 
 /** 剧情 run 存档（data/story-runs/{runId}.json）——与聊天系统完全分离，永不进入聊天会话 */
@@ -1206,7 +1376,7 @@ export type StoryResponse =
   | { kind: 'free'; text?: string; end?: boolean }
   | { kind: 'retry' }
 
-/** 剧情 TTS 合成结果（story:tts-synthesize；WAV 32kHz mono int16 → base64） */
+/** 剧情 TTS 合成结果（story:tts-synthesize；WAV int16 单声道 → base64；采样率随引擎：Genie 32kHz / SBV2 44.1kHz） */
 export interface StoryTtsResult {
   ok: boolean
   audioBase64?: string
@@ -1313,14 +1483,28 @@ export interface WindowApi {
      */
     sendMessage: (params: { sessionId: string; messages: ChatMessage[] }) => Promise<ChatMessage | null>
     /**
-     * 消息重答：删除最后一轮（user+assistant）后重跑正常聊天链路。
-     * editText 非空 = 编辑并重发（用编辑后文本）；为空 = 重新回答（原 user 内容）。
-     * 轮次进行中（LLM/持久化阶段）由主进程 busy 标志拒绝。
-     * 返回语义同 sendMessage：轮次执行失败返回 null，前置拒绝 reject。
+     * 消息重答：截断最后一轮（user+assistant）后重跑正常聊天链路。
+     * 返回删除范围；轮次执行失败由 stream-error 广播驱动，调用方无需处理。
+     * 轮次进行中（LLM/持久化阶段）或同会话重发处理中由主进程拒绝。
      */
-    regenerate: (params: { sessionId: string; editText?: string }) => Promise<ChatMessage | null>
-    /** 订阅会话截断广播（重答删除最后一轮后）：两窗用磁盘最新消息列表替换本地（旧轮气泡消失） */
-    onSessionRewound: (cb: (payload: { sessionId: string; messages: ChatMessage[] }) => void) => () => void
+    regenerate: (params: { sessionId: string; expectedRevision?: number }) => Promise<RewindReceipt>
+    /**
+     * 编辑并重发任意一条 user 消息：删除该消息及其后全部消息，用 editText 重跑。
+     * 删除不可撤销；expectedRevision / expectedTimestamp / expectedContent 用于乐观并发校验。
+     */
+    rewindEdit: (params: {
+      sessionId: string
+      targetIndex: number
+      editText: string
+      expectedRevision?: number
+      expectedTimestamp?: number
+      expectedContent?: string
+    }) => Promise<RewindReceipt>
+    /** 订阅会话截断广播（编辑重发 / 重新回答）：两窗用磁盘最新消息列表替换本地 */
+    onSessionRewound: (cb: (payload: SessionRewoundPayload) => void) => () => void
+    /** 回合文档被主动清空（编辑重发截断后） */
+    onTurnCleared: (cb: () => void) => () => void
+
     onStreamDone: (cb: (payload: StreamDonePayload) => void) => () => void
     onStreamError: (cb: (payload: StreamErrorPayload) => void) => () => void
     /** 订阅主进程广播的用户消息（跟随窗口即时补上用户气泡，无需等 stream-done 全量拉取） */
@@ -1336,7 +1520,7 @@ export interface WindowApi {
     onTurnDone: (cb: (doc: TurnDocument) => void) => () => void
     /**
      * 上报语音进度（字符口径，方案A主门控）：宠物窗每消费一个槽位（播放中/播完/displayOnly 旁白）
-     * 上行该槽位及其之前所有已消费文本的累计字符数；主进程单调取 max。与提取器变体/合音/兜底
+     * 上行该槽位及其之前所有已消费文本的累计字符数；主进程单调取 max。与提取器变体/兜底
      * 完全解耦——语音播到哪、两窗文本就放行到哪。speaking 与 spoken 的差值 = 正在播放的块。
      */
     reportTurnProgress: (turnId: string, speakingChars: number, spokenChars: number) => void
@@ -1448,7 +1632,7 @@ export interface WindowApi {
     /** 删除指定立绘集（同时删除资源目录与索引条目） */
     remove: (spriteId: string) => Promise<void>
     /** 更新立绘集展示资产：名称 / 状态词表 / 说话立绘 / 思考立绘 */
-    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>) => Promise<void>
+    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>) => Promise<void>
     /** 视觉打标：对指定立绘集逐张生成状态词建议（产物不落库，回填编辑器确认）；未配置视觉模型时返回 ok:false */
     annotate: (spriteId: string) => Promise<{ ok: boolean; suggestions?: Array<{ filePath: string; name: string; desc: string }>; failed?: number; error?: string }>
     /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
@@ -1510,7 +1694,7 @@ export interface WindowApi {
       text: string,
       voiceId: string | null,
       languageOverride?: TTSLanguage | null,
-      payload?: { chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; cumChars?: number | null },
+      payload?: { chunks?: DialogueChunk[]; follow?: boolean; engine?: TTSEngine; localVoice?: CharacterLocalVoice | null; cumChars?: number | null },
     ) => void
     /** 上报当前会话（聊天窗切会话/新建会话时调用，主进程转发给宠物窗同步内容框；null 表示清空） */
     notifyCurrentSession: (sessionId: string | null) => void
@@ -1536,11 +1720,13 @@ export interface WindowApi {
      *  payload 含主进程拆好的合成分段（dialogue 逐项）供段级合成播放；
      *  displayOnly=true 为纯旁白块：不合成不发声，仅按序上屏文本（零时长槽位）；
      *  segIndex：本块对应的回合文档分段索引（方案A进度回报用，null/缺省 = 不参与回报） */
-    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null; /** 角色 TTS 语速倍率（主进程随分段下发，null = 原速） */ ttsSpeed?: number | null }) => void) => () => void
+    onSpeak: (cb: (payload: { text: string; voiceId: string | null; languageOverride: TTSLanguage | null; chunks?: DialogueChunk[]; follow?: boolean; engine?: TTSEngine; localVoice?: CharacterLocalVoice | null; displayOnly?: boolean; segIndex?: number | null; /** 角色 TTS 语速倍率（主进程随分段下发，null = 原速） */ ttsSpeed?: number | null }) => void) => () => void
     /** 订阅 AI 回复状态事件（主进程在聊天完成时广播，驱动桌宠切表情/切立绘；词表方案下为自由状态词） */
     onEmotion: (cb: (emotion: string) => void) => () => void
     /** 订阅"思考中"状态（AI 开始准备回答到输出文本前），立绘模式切思考立绘 */
     onThinking: (cb: (thinking: boolean) => void) => () => void
+    /** 订阅"观察中"状态（点眼睛后看屏幕的那几秒），立绘切观察图 */
+    onObserving: (cb: (observing: boolean) => void) => () => void
     /** 订阅流式开始时的"本轮语音模式"（是否有语音），宠物窗提前决定文本展示方式 */
     onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
@@ -1571,12 +1757,12 @@ export interface WindowApi {
     removeReference: (id: string) => Promise<void>
     /** 合成语音：传入文本与参考音频 id，返回 wav 格式的 ArrayBuffer。
      *  languageOverride 覆盖全局语言（角色级 TTS 覆盖）；
-     *  engine=genie 时 voiceId 可空（本地声库语音服务不需要参考音频）；
+     *  engine=genie 时 voiceId 可空（Genie-TTS不需要参考音频）；
      *  speed 为语速倍率（0.75–1.5，缺省 1 = 原速），主进程合成后对音频重采样变速。 */
-    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: 'genie' | 'mimo'; genieOverride?: CharacterGenieOverride | null; speed?: number }) => Promise<ArrayBuffer | null>
+    synthesize: (params: { text: string; voiceId: string | null; languageOverride?: TTSLanguage | null; emotion?: string | null; engine?: TTSEngine; localVoice?: CharacterLocalVoice | null; speed?: number }) => Promise<ArrayBuffer | null>
     /** 重命名参考音频，返回更新后的对象 */
     renameReference: (id: string, name: string) => Promise<VoiceReference>
-    /** 读取 GenieTTS(本地声库语音服务) 配置 */
+    /** 读取 GenieTTS(Genie-TTS) 配置 */
     genieConfig: () => Promise<TTSGenieConfig>
     /** 保存 GenieTTS 配置（部分合并） */
     genieSaveConfig: (patch: Partial<TTSGenieConfig>) => Promise<TTSGenieConfig>
@@ -1584,10 +1770,24 @@ export interface WindowApi {
     genieCheck: (baseUrl: string) => Promise<{ ok: boolean; error?: string }>
     /** 用 GenieTTS 环境 + GenieData 目录自动拉起服务 */
     genieStart: (workPath: string, dataDir: string) => Promise<{ ok: boolean; error?: string }>
+    /** 结束 GenieTTS 服务（停止后不再自动拉起，直到再次点启动或重启应用） */
+    genieStop: () => Promise<void>
     /** 弹目录选择框，返回选中目录（取消返回 null） */
     chooseFolder: () => Promise<string | null>
     /** 弹文件选择框选择音频（wav/mp3），返回路径（取消返回 null） */
     chooseAudioFile: () => Promise<string | null>
+    /** 读取本地 SBV2 配置 */
+    sbv2Config: () => Promise<TTSsbv2Config>
+    /** 保存本地 SBV2 配置（部分合并） */
+    sbv2SaveConfig: (patch: Partial<TTSsbv2Config>) => Promise<TTSsbv2Config>
+    /** 枚举本机显卡（DXGI；id 即 DirectML device_id） */
+    sbv2Devices: () => Promise<Sbv2Device[]>
+    /** 启动 sidecar（加载 DeBERTa） */
+    sbv2Start: () => Promise<{ ok: boolean; error?: string }>
+    /** 结束 sidecar 进程 */
+    sbv2Stop: () => Promise<void>
+    /** 查询 sidecar 状态（设置页轮询用） */
+    sbv2Status: () => Promise<Sbv2ServerStatus>
   }
   /** 角色 TTS 模型卡管理 */
   ttsModel: {
@@ -1611,6 +1811,15 @@ export interface WindowApi {
   chat: {
     /** 订阅"打开聊天窗口并进入指定会话"，聊天窗据此 loadSession；返回取消订阅函数 */
     onOpenSession: (cb: (sessionId: string) => void) => () => void
+    /**
+     * 附件：把粘贴/拖入的图片交给主进程压缩落盘，返回附件描述。
+     * 统一走 ArrayBuffer（粘贴与拖拽同一条路径），失败时抛出可直接展示的中文错误。
+     */
+    attachImage: (params: { sessionId: string; buffer: ArrayBuffer; mime: string }) => Promise<ChatImage>
+    /** 删除尚未发送的附件文件（用户移除缩略图时调用；失败静默，由保留期清理兜底） */
+    discardImage: (params: { path: string }) => Promise<void>
+    /** 读取附件 URL（pet-res://chat-images/...） */
+    imageUrl: (relPath: string) => string
     /** 订阅流式开始的"本轮语音模式"，与宠物窗一致决定段落跟读显示 */
     onVoiceMode: (cb: (opts: { voiceEnabled: boolean }) => void) => () => void
     /** renderer 就绪通知（用于向主进程补发最近的语音模式） */
@@ -1622,6 +1831,11 @@ export interface WindowApi {
     getState: () => Promise<ProactiveState>
     /** 订阅调度状态变化（每次成功搭话/用户消息重置后广播） */
     onState: (cb: (state: ProactiveState) => void) => () => void
+    /**
+     * 用户主动识屏（眼睛按钮）：立刻看一次屏幕并让角色开口。
+     * 不计入每日搭话次数、不受免打扰限制；失败时返回可直接展示的中文原因。
+     */
+    lookNow: () => Promise<{ ok: boolean; error?: string }>
   }
   /** 剧情演出：剧本库/run 存档/演出控制/事件订阅（与聊天系统完全分离） */
   story: {
@@ -1652,7 +1866,7 @@ export interface WindowApi {
     /** 调整立绘视图（大小/位置；随 run 存档并广播快照） */
     setSpriteView: (runId: string, view: StorySpriteView) => Promise<{ ok: boolean }>
     /** 剧情 TTS 合成（本地 Genie 声库 + 语言）→ WAV base64 */
-    synthesize: (params: { ttsModelId: string; language: 'zh' | 'ja'; text: string }) => Promise<StoryTtsResult>
+    synthesize: (params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2' }) => Promise<StoryTtsResult>
     /** 背景库文件名列表（data/story-backgrounds/；背景事件 user: 前缀引用） */
     listBackgrounds: () => Promise<string[]>
     /** 打开文件对话框选择图片并导入背景库（返回新增文件名） */

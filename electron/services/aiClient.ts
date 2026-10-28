@@ -4,6 +4,20 @@
  */
 import type { ChatMessage } from '../../src/types'
 
+/** 多模态内容片段（OpenAI 兼容协议）：带图轮次的 content 用数组承载 */
+export type ApiContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
+/**
+ * 请求消息形状：content 为纯文本（绝大多数场景）或内容片段数组（带图轮次）。
+ * 比 ChatMessage 更宽，便于 chatTurn 在发送前把图片拼成多模态 parts。
+ */
+export interface ApiMessage {
+  role: ChatMessage['role']
+  content: string | ApiContentPart[]
+}
+
 export interface ChatRequestOptions {
   model: string
   baseURL: string
@@ -47,7 +61,7 @@ function extractErrorMessage(err: unknown): string {
  * 出错时抛出用户可读的错误信息。
  */
 export async function sendChatCompletion(
-  messages: ChatMessage[],
+  messages: ApiMessage[],
   options: ChatRequestOptions,
 ): Promise<string> {
   const { model, baseURL, apiKey, temperature, maxTokens, stream = true, onChunk, onReasoning, disableThinking, signal, maxTokensOverride } = options

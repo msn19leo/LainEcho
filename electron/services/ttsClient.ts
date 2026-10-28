@@ -24,7 +24,7 @@ import type { TTSConfig } from '../../src/types'
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions'
 
 /** 合成请求超时（毫秒）：请求挂起时主动中断，避免桌宠端合成锁被长期占用导致语音流水线停摆。
- *  取 60s：整段合音模式下长文本合成耗时较长，30s 可能误伤。 */
+ *  取 60s：长文本与首次合成的模型/kernel 编译耗时较长，30s 可能误伤。 */
 const SYNTHESIS_TIMEOUT_MS = 60_000
 
 /** MiMo API 请求体（chat completions 变种） */

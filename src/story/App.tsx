@@ -249,7 +249,7 @@ export function StoryApp() {
               if (!prefetchRef.current.has(key)) {
                 prefetchRef.current.set(
                   key,
-                  api.story.synthesize({ ttsModelId: voice.ttsModelId, language: voice.language, text: it.text }).catch(() => ({ ok: false }) as StoryTtsResult),
+                  api.story.synthesize({ ttsModelId: voice.ttsModelId, language: voice.language, text: it.text, engine: voice.engine }).catch(() => ({ ok: false }) as StoryTtsResult),
                 )
               }
             }
@@ -399,7 +399,7 @@ export function StoryApp() {
             const key = `${snap!.voice!.ttsModelId}|${snap!.voice!.language}|${item.text}`
             let p = prefetchRef.current.get(key)
             if (!p) {
-              p = api.story.synthesize({ ttsModelId: snap!.voice!.ttsModelId, language: snap!.voice!.language, text: item.text }).catch(() => ({ ok: false }) as StoryTtsResult)
+              p = api.story.synthesize({ ttsModelId: snap!.voice!.ttsModelId, language: snap!.voice!.language, text: item.text, engine: snap!.voice!.engine }).catch(() => ({ ok: false }) as StoryTtsResult)
               prefetchRef.current.set(key, p)
             }
             const res = await p

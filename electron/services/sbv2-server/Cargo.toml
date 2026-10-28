@@ -1,0 +1,27 @@
+[package]
+name = "sbv2-sidecar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 本地 vendor 版本：ndarray 升到 0.17、ort 升到 rc.12，并给 load_model 加了设备参数。
+# crates.io 的 0.2.0-alpha8 只能用 ort rc.10（对应 ORT 1.22，CPU 跑不了 int8 DeBERTa）。
+sbv2_core = { path = "vendor/sbv2_core", default-features = false, features = ["directml"] }
+# 必须和 ort 同版本锁定：ort-sys 用 caret 解析会跳到 rc.15，OrtApi 对不上会编译失败。
+ort-sys = "=2.0.0-rc.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Foundation"] }
+
+# 该 crate 的 build.rs 会从 github.com 拉 18.6 MB 的 NAIST-JDIC 词典，
+# 国内网络极易被截断导致构建失败。vendor 后改为可配置镜像（见 vendor/.../build.rs）。
+[patch.crates-io]
+jpreprocess-naist-jdic = { path = "vendor/jpreprocess-naist-jdic" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

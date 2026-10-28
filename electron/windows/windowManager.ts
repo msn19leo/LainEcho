@@ -4,11 +4,11 @@
  */
 import { app, BrowserWindow, Menu, Tray, nativeImage } from 'electron'
 import path from 'path'
-import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE } from './petWindow'
+import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE, reassertTopmost } from './petWindow'
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
 import { createStoryWindow } from './storyWindow'
-import type { ModelSettings, PetCardPayload, TTSLanguage } from '../../src/types'
+import type { ModelSettings, PetCardPayload, TTSEngine, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -48,13 +48,18 @@ class WindowManager {
     languageOverride: TTSLanguage | null
     chunks?: Array<{ text: string; emotion: string }>
     follow: boolean
-    engine?: 'genie' | 'mimo'
-    genieOverride?: import('../../src/types').CharacterGenieOverride | null
+    engine?: TTSEngine
+    localVoice?: import('../../src/types').CharacterLocalVoice | null
   }> = []
+
+  /** 桌宠窗口是否对截图隐藏（设置项 vision.hideFromCapture，默认开）。
+   *  缓存一份，窗口重建（关掉再开）时按它恢复 */
+  private contentProtection = true
 
   /** app ready 后调用：创建桌宠窗口 + 托盘 */
   init(): void {
     this.pet = createPetWindow()
+    this.pet.setContentProtection(this.contentProtection)
     this.armPetSpeakReady(this.pet)
     this.setupTray()
 
@@ -116,13 +121,15 @@ class WindowManager {
   showPet(): void {
     if (!this.pet || this.pet.isDestroyed()) {
       this.pet = createPetWindow()
+      // 重建后按缓存的设置恢复"截图时隐藏"
+      this.pet.setContentProtection(this.contentProtection)
       this.armPetSpeakReady(this.pet)
       return
     }
     this.pet.show()
     this.pet.focus()
     // 显式补一次置顶：置顶属性若曾在拖动中被清掉，仅靠 show()/focus() 只能抬到普通层顶部
-    this.pet.setAlwaysOnTop(true)
+    reassertTopmost(this.pet)
   }
 
   togglePet(): void {
@@ -135,7 +142,7 @@ class WindowManager {
     else {
       this.pet.show()
       this.pet.focus()
-      this.pet.setAlwaysOnTop(true)
+      reassertTopmost(this.pet)
     }
   }
 
@@ -182,12 +189,14 @@ class WindowManager {
    * languageOverride 为角色级 TTS 语言覆盖（null 表示跟随全局）。
    * displayOnly=true 表示纯旁白块（（）描写）：不合成语音，仅按序上屏文本（段落随语音顺序出现）。
    */
-  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: 'genie' | 'mimo'; genieOverride?: import('../../src/types').CharacterGenieOverride | null; displayOnly?: boolean; segIndex?: number | null; ttsSpeed?: number | null }): void {
+  speak(text: string, voiceId: string | null, languageOverride?: TTSLanguage | null, payload?: { chunks?: import('../../src/types').DialogueChunk[]; follow?: boolean; engine?: TTSEngine; localVoice?: import('../../src/types').CharacterLocalVoice | null; displayOnly?: boolean; segIndex?: number | null; ttsSpeed?: number | null }): void {
     // ①翻译/合成并行化（2026-10-22 日志实锤：翻译串行在上一段合成之后，每段白等 2~4s）：
     // Genie+日语模式下在 speak 事件时刻预发射翻译——翻译走辅助模型（网络 LLM），与本地 GPU
     // 合成无资源竞争，上一段合成期间本段翻译已并行完成，tts:synthesize 到达时直接取结果。
     // displayOnly 旁白不合成不预取；预取失败静默（合成路径取不到缓存会现场直译兜底）。
-    if ((payload?.engine ?? 'genie') === 'genie' && !payload?.displayOnly && text.trim()) {
+    // Genie 与 SBV2 都是「中文台词 → 日文语音」，都受益于 translateWithCache 预取
+    const jaEngine = (payload?.engine ?? 'genie') === 'genie' || payload?.engine === 'sbv2'
+    if (jaEngine && !payload?.displayOnly && text.trim()) {
       void (async () => {
         try {
           const effLang = languageOverride ?? (await (await import('../ipc/tts.ipc')).getTTSConfig()).language
@@ -206,8 +215,8 @@ class WindowManager {
       languageOverride: TTSLanguage | null
       chunks?: Array<{ text: string; emotion: string }>
       follow: boolean
-      engine?: 'genie' | 'mimo'
-      genieOverride?: import('../../src/types').CharacterGenieOverride | null
+      engine?: TTSEngine
+      localVoice?: import('../../src/types').CharacterLocalVoice | null
       displayOnly?: boolean
       segIndex?: number | null
       ttsSpeed?: number | null
@@ -218,7 +227,7 @@ class WindowManager {
       chunks: payload?.chunks,
       follow: payload?.follow ?? true,
       engine: payload?.engine,
-      genieOverride: payload?.genieOverride ?? null,
+      localVoice: payload?.localVoice ?? null,
       displayOnly: payload?.displayOnly ?? false,
       segIndex: payload?.segIndex ?? null,
       ttsSpeed: payload?.ttsSpeed ?? null,
@@ -348,6 +357,16 @@ class WindowManager {
     }
   }
 
+  /**
+   * 通知桌宠"正在观察屏幕"（用户点眼睛后、视觉模型转述期间）。
+   * 只发给桌宠窗口：剧情窗有自己的立绘解析链，观察图不参与。
+   */
+  notifyObserving(observing: boolean): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:observing', observing)
+    }
+  }
+
   /** 向所有窗口广播事件（会话变化等，用于跨窗口同步） */
   broadcast(channel: string, ...args: unknown[]): void {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -358,6 +377,20 @@ class WindowManager {
   /** 返回当前全部活跃窗口（供 updater IPC 广播更新状态） */
   getAllWindows(): BrowserWindow[] {
     return BrowserWindow.getAllWindows()
+  }
+
+  /**
+   * 对桌宠窗口应用「截图时隐藏」。
+   * Windows 上 Electron 走 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)：
+   * 窗口对截屏/录屏 API 不可见（用户屏幕上照常可见），因此屏幕感知的整屏截图
+   * 不会再拍到桌宠，用户自己截图也不会带上它。
+   *
+   * 只作用于桌宠窗口：聊天/设置/编辑器窗口被保护后用户截出来是空白，
+   * 而"截图设置页反馈问题"是常见操作，不能破坏。
+   */
+  applyContentProtection(enabled: boolean): void {
+    this.contentProtection = enabled
+    if (this.pet && !this.pet.isDestroyed()) this.pet.setContentProtection(enabled)
   }
 
   /** 会话新建/删除后广播，聊天窗口据此刷新并处理「当前会话被删」的情况 */

@@ -32,14 +32,19 @@ function TestResultView({ result }: { result: TestResult | undefined }) {
   if (!result) return null
   return (
     <div
-      className={`flex items-center gap-2 rounded-[var(--radius-md)] border px-4 py-2 text-sm ${
+      className={`flex items-start gap-2 rounded-[var(--radius-md)] border px-4 py-2 text-sm ${
         result.ok
           ? 'border-success/30 bg-success/10 text-success'
           : 'border-danger/30 bg-danger/10 text-danger'
       }`}
     >
-      {result.ok ? <CheckCircle2 size={15} strokeWidth={1.75} /> : <XCircle size={15} strokeWidth={1.75} />}
-      {result.ok ? '连接成功' : result.message}
+      <span className="mt-0.5 shrink-0">
+        {result.ok ? <CheckCircle2 size={15} strokeWidth={1.75} /> : <XCircle size={15} strokeWidth={1.75} />}
+      </span>
+      {/* 错误里常带原始 JSON（无空格长串），必须允许任意位置断行，否则会横向撑破容器 */}
+      <span className="min-w-0 break-all whitespace-pre-wrap">
+        {result.ok ? '连接成功' : result.message}
+      </span>
     </div>
   )
 }
@@ -341,13 +346,13 @@ export function ApiConfigPanel() {
         </div>
       </AccordionItem>
 
-      {/* ===== 视觉模型（屏幕感知/立绘打标，可选；独立必填不回落） ===== */}
-      <AccordionItem title="视觉模型（屏幕感知 / 立绘打标 用，可选）" icon={<Eye size={15} strokeWidth={1.75} />} defaultOpen={false}>
+      {/* ===== 视觉模型（屏幕感知/立绘打标/图片转述，可选；独立必填不回落） ===== */}
+      <AccordionItem title="视觉模型（屏幕感知 / 立绘打标 / 图片转述 用，可选）" icon={<Eye size={15} strokeWidth={1.75} />} defaultOpen={false}>
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
-            用于屏幕感知（角色"偷看"桌面转述话题）与立绘集 AI 视觉打标两类图像理解任务，
+            用于屏幕感知（角色"偷看"桌面转述话题）、立绘集 AI 视觉打标、聊天图片转述（读图方式选「视觉模型辅助」时）三类图像理解任务，
             需激活支持图像输入的多模态模型档案（如 gemini-flash / qwen-vl / gpt-4o-mini）。
-            未启用则相关功能不使用：屏幕感知自动降级为普通话题，立绘打标不可用（不回落主模型）
+            未启用则相关功能不使用：屏幕感知自动降级为普通话题，立绘打标不可用，聊天发图会提示模型不支持（均不回落主模型）
           </div>
           <SelectMenu
             value={settings.activeVisionProfileId ?? ''}
