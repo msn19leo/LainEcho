@@ -9,7 +9,7 @@ import { dialog, ipcMain } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
 import type { Live2DModelMeta, ExpressionMeta, ExpressionParameter, ExpressionBlend, ModelScanResult, ModelPalette } from '../../src/types'
-import { addModel, genId, listModels, removeModel, isCorePresent, updateModel, deleteModelPalette, readModelPalette, updateModelPalette } from '../services/repository'
+import { addModel, genId, listModels, removeModel, isCorePresent, updateModel, deleteModelPalette, readModelPalette, updateModelPalette, dropModelSettings } from '../services/repository'
 import { paths, fileExists } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
 
@@ -273,7 +273,41 @@ export function registerModelIpc(): void {
     await removeModel(modelId)
     // 清理该模型的演出词表配置（Live2D 模型词表与模型生命周期绑定）
     await deleteModelPalette(modelId)
+    // 清理该模型的姿态参数覆盖与外观选中项（避免配置里留下孤儿键）
+    const cleaned = await dropModelSettings(modelId)
+    if (cleaned) windowManager.notifyModelSettingsChanged(cleaned)
     windowManager.notifyModelsChanged()
+  })
+
+  /** 桌宠窗加载模型后上报参数能力表（存在性/量程/物理驱动），主进程缓存并转发设置窗 */
+  ipcMain.on('pet:model-profile', (_e, profile: import('../../src/types').ModelProfile) => {
+    if (!profile || typeof profile.modelId !== 'string') return
+    windowManager.notifyModelProfile(profile)
+  })
+
+  /** 设置窗按模型取能力表；模型未加载时返回 null（UI 回退到兜底量程） */
+  ipcMain.handle('model:profile', (_e, modelId: string) => windowManager.getModelProfile(modelId))
+
+  /** 桌宠窗上报"当前状态表情"（null = 无），主进程缓存并转发设置窗 */
+  ipcMain.on('pet:state-expression', (_e, name: string | null) => {
+    windowManager.notifyStateExpression(typeof name === 'string' && name.trim() ? name.trim() : null)
+  })
+
+  /** 设置窗挂载时取当前状态表情（用于外观面板标记） */
+  ipcMain.handle('model:state-expression', () => windowManager.getStateExpression())
+
+  /** 设置窗取消当前状态表情（外观面板点"·状态"项） */
+  ipcMain.handle('model:dismiss-state-expression', () => {
+    windowManager.dismissStateExpression()
+  })
+
+  /**
+   * 一键动作：让桌宠立即播放指定动作组（外观面板的按钮）。
+   * 只播一次，不写入动画设置里的「空闲动作」。
+   */
+  ipcMain.handle('model:play-motion', (_e, group: string) => {
+    if (typeof group !== 'string' || !group.trim()) return
+    windowManager.playMotion(group.trim())
   })
 
   /** 读取模型演出词表（编辑器用，含 expression；未配置 = null） */

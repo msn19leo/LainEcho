@@ -7,13 +7,13 @@
  *  - 节奏：所有段落（含同一回答的各分段）默认点击推进，自动模式按文本长度定时衔接；
  *    语音播放中点击 = 跳过当前段语音；引擎连续入史的新段只入队，绝不抢占正在播放的段；
  *  - 语音：剧情窗独立本地 Genie TTS（run.voice 配置），合成在主进程、播放在本窗；
- *  - 立绘：thinkingImage（AI 等待期）> emotionMap[emotion] > speakingImage；大小/位置可调（随 run 存档）；
+ *  - 立绘：仅 emotionMap[emotion]（剧情窗不使用思考/说话图；思考态由「思考中…」名牌表达）；大小/位置可调（随 run 存档）；
  *  - backlog：run.messages 全量回看（剧情记录唯一查看入口）。
  * 引擎在主进程：关闭本窗不中断演出；点「退出」= 存档并直接关闭本窗。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { History, Music, Settings2, X } from 'lucide-react'
+import { History, Music, Settings2, Volume2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../api'
 import { WindowTitlebar } from '../components/WindowTitlebar'
@@ -21,6 +21,8 @@ import { initSettingsSync, useSettingsStore, typingSpeedToMs } from '../store/se
 import type {
   CharacterSprite,
   ChatMessage,
+  StoryEventLogEntry,
+  StoryRun,
   StorySnapshot,
   StorySpriteView,
   StoryTtsResult,
@@ -104,8 +106,16 @@ export function StoryApp() {
   // ---- 段级语音预取（7.7 性能第一批）：消息到达即按序发起合成，播放到段时音频多半已就绪，
   //      段间合成等待清零（Genie 主进程串行链天然排队）。key = ttsModelId|language|text ----
   // 注：流式预览（生成期间全文上屏）已移除——整块文本先冒出再收起重演的观感差于等待，
-  //     生成期间以「思考中…」名牌 + 思考立绘表达；主进程广播保留，供后续逐段流式方案复用。
+  //     生成期间以「思考中…」名牌表达（剧情窗不切换思考立绘）；主进程广播保留，供后续逐段流式方案复用。
   const prefetchRef = useRef<Map<string, Promise<{ ok: boolean; audioBase64?: string }>>>(new Map())
+
+  /**
+   * 回放状态（非 null = 当前处于只读重看）。
+   * 回放不走引擎：本地按事件日志推进，游标与"等待点击"全由渲染端自己管。
+   */
+  const replayRef = useRef<{ run: StoryRun; entries: StoryEventLogEntry[]; index: number; title: string } | null>(null)
+  const [replayDone, setReplayDone] = useState(false)
+  const advanceReplayRef = useRef<(() => void) | null>(null)
 
   // ---- 背景与 BGM ----
   const [background, setBackground] = useState<string | null>(null)
@@ -256,8 +266,18 @@ export function StoryApp() {
           }
         }
       }
-      // 仅在空闲时启动播放：正在播放的段落不被新入队内容打断
-      if (fresh.length > 0 && queueRef.current.length > 0 && phaseRef.current === 'idle') processQueueRef.current?.('sync')
+      // 新内容到达时的接管条件：
+      // - idle：上一段已播完、界面空着 → 直接播
+      // - wait：上一段播完正等玩家点击。这里必须接管 —— 玩家点击已经发过 advance，
+      //   主进程才刚把下一条推进来；若还要求"再点一次"，体感就是点了没反应。
+      //   正在播（typing / voice）时仍然不打断。
+      if (
+        fresh.length > 0 &&
+        queueRef.current.length > 0 &&
+        (phaseRef.current === 'idle' || phaseRef.current === 'wait')
+      ) {
+        processQueueRef.current?.('sync')
+      }
     } catch {
       // 忽略
     }
@@ -362,7 +382,10 @@ export function StoryApp() {
     if (!autoModeRef.current) return
     const ms = 900 + it.text.length * 55
     setTimeout(() => {
-      if (token === playTokenRef.current && phaseRef.current === 'wait') processQueueRef.current?.('auto')
+      if (token === playTokenRef.current && phaseRef.current === 'wait') {
+        if (autoModeRef.current && queueRef.current.length === 0) void advanceStory()
+        else processQueueRef.current?.('auto')
+      }
     }, ms)
   }, [])
 
@@ -441,8 +464,212 @@ export function StoryApp() {
 
   processQueueRef.current = processQueue
 
+  // ---- 只读重看（本地按事件日志推进，完全不经过引擎） ----
+
+  /** 构造回放用快照，让现有 UI（章节名 / 立绘 / 对话框 / 语音）无需改动即可工作 */
+  const buildReplaySnapshot = useCallback(
+    (run: StoryRun, entries: StoryEventLogEntry[], index: number, title: string): StorySnapshot => {
+      const entry = entries[index]
+      return {
+        runId: run.runId,
+        scriptId: run.scriptId,
+        title,
+        status: 'running',
+        mode: 'start',
+        cardId: run.cardId,
+        spriteId: run.spriteId,
+        voice: run.voice,
+        spriteView: run.spriteView ?? DEFAULT_SPRITE_VIEW,
+        chapterIndex: entry?.chapterIndex ?? 0,
+        chapterName: '',
+        eventIndex: entry?.eventIndex ?? 0,
+        vars: run.storyState.vars ?? {},
+        background: entry?.background ?? null,
+        music: entry?.music ?? null,
+        pending: null,
+        thinking: false,
+      }
+    },
+    [],
+  )
+
+  /** 推进一条回放记录：应用场景变化 + 把该事件产生的消息入队 */
+  const advanceReplay = useCallback(() => {
+    const st = replayRef.current
+    if (!st) return
+    if (st.index >= st.entries.length) {
+      setReplayDone(true)
+      return
+    }
+    const entry = st.entries[st.index]
+    if (!entry) {
+      setReplayDone(true)
+      return
+    }
+    st.index++
+    if (entry.background !== undefined) setBackground(entry.background ?? null)
+    if (entry.music !== undefined) setMusic(entry.music ?? null)
+    // 必须同时写 snapshotRef：播放器与喇叭按钮都从 ref 读 voice/scriptId，
+    // setSnapshot 只更新渲染用的 state，不同步 ref 会读到上一场的快照（表现为"重看没语音"）。
+    const snap = buildReplaySnapshot(st.run, st.entries, st.index, st.title)
+    snapshotRef.current = snap
+    setSnapshot(snap)
+
+    const hasMsg = entry.messageFrom !== undefined && entry.messageTo !== undefined
+    if (hasMsg) {
+      for (const m of st.run.messages.slice(entry.messageFrom, entry.messageTo)) {
+        queueRef.current.push(...messageToItems(m))
+      }
+    }
+    if (queueRef.current.length > 0) {
+      setPhaseBoth('idle')
+      processQueueRef.current?.('replay')
+      return
+    }
+    // 队列仍为空 = 本条没有可播内容（空消息 / 被过滤的演出指令 / 纯场景事件）
+    // 直接看下一条。此前只在 !hasMsg 时前进，遇到"有消息但拆不出段落"的条目会永久卡住。
+    setTimeout(() => advanceReplayRef.current?.(), 0)
+  }, [buildReplaySnapshot, messageToItems])
+
+  advanceReplayRef.current = advanceReplay
+
+  /**
+   * 播放对话历史里某条消息的语音。
+   * 只播已落盘的缓存（allowSynthesize=false）—— 历史回听不该悄悄产生云端费用。
+   */
+  const playHistoryVoice = useCallback(
+    async (m: ChatMessage) => {
+      const voice = snapshotRef.current?.voice
+      if (!voice) {
+        toast('本场演出未启用语音')
+        return
+      }
+      const items = messageToItems(m).filter(
+        (it) => it.kind === 'line' && it.voice && it.speaker === 'ai' && it.text.trim(),
+      )
+      if (items.length === 0) {
+        toast('这条没有可播放的语音')
+        return
+      }
+      // 打断当前正在播的段落，避免两条声音叠在一起
+      playTokenRef.current++
+      playingRef.current = false
+      voiceStopRef.current?.()
+      voiceStopRef.current = null
+      const token = playTokenRef.current
+
+      let played = 0
+      for (const it of items) {
+        const res = await api.story.synthesize({
+          ttsModelId: voice.ttsModelId,
+          language: voice.language,
+          text: it.text,
+          engine: voice.engine,
+          allowSynthesize: false,
+        })
+        if (!res.ok || !res.audioBase64) continue
+        played++
+        const { ended, stop } = startWav(res.audioBase64, token)
+        voiceStopRef.current = stop
+        await ended
+        voiceStopRef.current = null
+        if (token !== playTokenRef.current) return
+      }
+      if (played === 0) toast('这段语音还没有缓存（关闭了重看补充合成时不会自动生成）')
+    },
+    [messageToItems, startWav],
+  )
+
+  /** 启动回放：读存档 → 展开事件日志 → 播第一条 */
+  const startReplay = useCallback(
+    async (runId: string) => {
+      const run = await api.story.getRun(runId).catch(() => null)
+      if (!run) {
+        toast.error('存档读取失败')
+        return
+      }
+      const scriptList = await api.story.list().catch(() => [])
+      const title = `${scriptList.find((x) => x.id === run.scriptId)?.title ?? '剧情'} · 重看`
+
+      /**
+       * 以「消息」为轴重建回放条目，而不是直接用 eventLog。
+       *
+       * 原因：事件日志可能不完整 —— 旧存档没有日志、或某次中途退出时事件没走到提交。
+       * 直接按日志播会在中途"重看结束"，剩下一半台词看得到却播不到。
+       * 这里保证每条消息都有对应条目；背景 / 音乐取它所属事件的终态（同一事件的多条消息共享）。
+       */
+      const logByMsg = new Map<number, StoryEventLogEntry>()
+      for (const e of run.eventLog ?? []) {
+        if (e.messageFrom === undefined || e.messageTo === undefined) continue
+        for (let i = e.messageFrom; i < e.messageTo; i++) logByMsg.set(i, e)
+      }
+      const entries: StoryEventLogEntry[] =
+        run.messages.length === 0
+          ? (run.eventLog ?? [])
+          : run.messages.map((_, i) => {
+              const e = logByMsg.get(i)
+              return {
+                chapterIndex: e?.chapterIndex ?? 0,
+                eventIndex: e?.eventIndex ?? i,
+                type: e?.type ?? 'message',
+                messageFrom: i,
+                messageTo: i + 1,
+                background: e?.background,
+                music: e?.music,
+              }
+            })
+
+      replayRef.current = { run, entries, index: 0, title }
+      setReplayDone(false)
+      resetPlayback()
+      attachReadyRef.current = false // 回放不订阅引擎增量，避免串进正在跑的演出
+      processedRef.current = run.messages.length
+      setBacklogMessages(run.messages)
+      const firstSnap = buildReplaySnapshot(run, entries, 0, title)
+      snapshotRef.current = firstSnap
+      setSnapshot(firstSnap)
+      setBackground(entries[0]?.background ?? null)
+      setMusic(entries[0]?.music ?? null)
+
+      const cards = await api.characterCard.list().catch(() => [])
+      setCardName(cards.find((c) => c.id === run.cardId)?.name ?? 'AI')
+      const sprites = await api.sprite.list().catch(() => [])
+      const spr = sprites.find((sp) => sp.id === run.spriteId) ?? null
+      setSprite(spr)
+      if (spr) setSpriteEmotion(paletteFromSprite(spr).defaultEmotion)
+      setSpriteView(run.spriteView ?? DEFAULT_SPRITE_VIEW)
+
+      advanceReplay()
+    },
+    [advanceReplay, buildReplaySnapshot, resetPlayback],
+  )
+
+  /** 请主进程推进叙事挂起点（游标与展示同步：本地队列播完、玩家点击时才前进） */
+  async function advanceStory() {
+    // 回放模式：本地推进，不打扰引擎
+    if (replayRef.current) {
+      advanceReplay()
+      return
+    }
+    const snap = snapshotRef.current
+    if (!snap) return
+    // 先收起上一条再推进：否则 current 会一直占着对话框，
+    // 主进程转入 AI 生成（thinking）或流式预览时界面毫无变化，看起来就是"点了没反应"。
+    setCurrent(null)
+    setTypedText('')
+    setPhaseBoth('idle')
+    const res = await api.story.respond({ runId: snap.runId, response: { kind: 'advance' } })
+    if (!res.ok && res.error) toast.error(res.error)
+  }
+
   /** 舞台点击推进（对话框文本区） */
   const onTextClick = useCallback(() => {
+    // 回放模式：引擎不参与，点击只推进本地日志游标
+    if (replayRef.current) {
+      if (phaseRef.current === 'wait' || phaseRef.current === 'idle') advanceReplayRef.current?.()
+      else if (phaseRef.current === 'typing') skipTypingRef.current = true
+      return
+    }
     if (phaseRef.current === 'typing') {
       skipTypingRef.current = true
       return
@@ -453,11 +680,50 @@ export function StoryApp() {
       playingRef.current = false
       voiceStopRef.current?.()
       voiceStopRef.current = null
-      processQueueRef.current?.('skip')
+      // 语音期间点击 = "我不想听这段，继续" —— 若当前已是最后一段，
+      // 必须直接推进剧情；否则会停在空的"剧情进行中"，还得再点一次。
+      if (queueRef.current.length > 0) processQueueRef.current?.('skip')
+      else void advanceStory()
+      return
+    }
+    // idle 兜底：advanceStory 会先清空 current 并把 phase 置 idle（为了让"思考中"露出来）。
+    // 若那一次 advance 没生效，界面就停在"剧情进行中"且后续点击进不了任何分支 —— 永久卡死。
+    if (phaseRef.current === 'idle') {
+      const snap0 = snapshotRef.current
+      if (!snap0 || snap0.status !== 'running') return
+      if (snap0.pending?.kind === 'advance') {
+        void advanceStory()
+        return
+      }
+      if (!snap0.thinking && !snap0.pending) {
+        console.warn('[story] idle 态无挂起，尝试 retry 恢复')
+        void api.story.respond({ runId: snap0.runId, response: { kind: 'retry' } })
+      }
       return
     }
     if (phaseRef.current === 'wait') {
-      processQueueRef.current?.('click')
+      const snap = snapshotRef.current
+      if (queueRef.current.length > 0) {
+        // 队列里还有待播条目 → 推进本地播放。
+        // 兜底释放互斥：phase=wait 说明当前段确实播完了，若锁仍被占着（异常路径漏放）会永久卡点击。
+        playingRef.current = false
+        processQueueRef.current?.('click')
+        return
+      }
+      if (snap?.pending?.kind === 'advance') {
+        // 正常路径：主进程在叙事挂起点等我们
+        void advanceStory()
+        return
+      }
+      // 挂起在 choices / input / free：该由玩家点选项或输入，点文本区不推进。
+      // （这里若误发 retry，会被 choices 的 `if (resp.kind === 'retry') continue` 吞掉再重等，形成死循环）
+      if (snap?.pending) return
+      // 生成中（thinking）：主进程正在跑，没有挂起可推，点击应当安静等待
+      if (snap?.thinking) return
+      // 兜底：主进程完全没有挂起（引擎版本较旧 / 状态漂移）→ 用 retry 让它从游标恢复执行。
+      // 没有这条兜底时，界面会停在"点击继续"但点击永远无响应。
+      console.warn('[story] wait 态但主进程无挂起，尝试 retry 恢复：thinking=%s', String(snap?.thinking))
+      if (snap) void api.story.respond({ runId: snap.runId, response: { kind: 'retry' } })
     }
   }, [])
 
@@ -467,6 +733,8 @@ export function StoryApp() {
     api.story.reportRendererReady()
     const unsubs = [
       api.story.onState((s) => {
+        // 回放是只读的：引擎若同时在跑别的场次，不要覆盖回放快照
+        if (replayRef.current) return
         const prev = snapshotRef.current
         snapshotRef.current = s
         setSnapshot(s)
@@ -475,6 +743,16 @@ export function StoryApp() {
           if (s.spriteView && (s.spriteView.scale !== remoteViewRef.current.scale || s.spriteView.x !== remoteViewRef.current.x || s.spriteView.y !== remoteViewRef.current.y)) {
             remoteViewRef.current = s.spriteView
             setSpriteView(s.spriteView)
+          }
+          // 主进程转入 AI 生成，或转为"等玩家操作"（choices / input / free）时，
+          // 必须清掉上一段停留的文本：
+          // - thinking：否则 current 挡住"思考中"与流式预览，看起来像点了没反应
+          // - choices/input/free：showInteraction 要求 !current && phase==='idle'，
+          //   否则显示"请选择 / 输入"却没有任何选项可点（2026-10-29 实测）
+          if ((s.thinking || (s.pending && s.pending.kind !== 'advance')) && phaseRef.current !== 'idle') {
+            setCurrent(null)
+            setTypedText('')
+            setPhaseBoth('idle')
           }
           return
         }
@@ -508,7 +786,12 @@ export function StoryApp() {
               // max 防护：若消息广播抢先推进了游标，不回退（否则最后一条会被重复演出）
               processedRef.current = Math.max(processedRef.current, run.messages.length - 1)
               attachReadyRef.current = true
-              if (run.messages.length > 0) {
+              // 主进程若正等玩家选择/输入，界面必须让位给交互 UI（showInteraction 要求 current 为空）
+              if (s.pending && s.pending.kind !== 'advance') {
+                setCurrent(null)
+                setTypedText('')
+                setPhaseBoth('idle')
+              } else if (run.messages.length > 0) {
                 const items = messageToItems(run.messages[run.messages.length - 1]!)
                 if (items.length > 0) {
                   const last = { ...items[items.length - 1]!, voice: false }
@@ -528,6 +811,10 @@ export function StoryApp() {
         if (event.type === 'background') setBackground(event.image)
         else if (event.type === 'music') setMusic(event.stop ? null : (event.file ?? null))
       }),
+      /** 回放启动：窗口是被「重看」打开的，切到只读模式 */
+      api.story.onReplayInit(({ runId }) => {
+        void startReplay(runId)
+      }),
       api.story.onMessageSync(({ runId }) => {
         void syncFromRun(runId)
       }),
@@ -537,7 +824,7 @@ export function StoryApp() {
       }),
     ]
     return () => unsubs.forEach((u) => u())
-  }, [resetPlayback, syncFromRun, messageToItems])
+  }, [resetPlayback, syncFromRun, messageToItems, startReplay])
 
   // ---- 背景解析（剧本素材相对路径 / user: 背景库引用；素材缺失时保持当前背景） ----
   const backgroundUrl = background && snapshot ? api.story.assetUrl(snapshot.scriptId, background) : null
@@ -594,31 +881,24 @@ export function StoryApp() {
     api.win.close()
   }, [])
 
-  // ---- 立绘解析（词表单链）：thinkingImage（仅队列空闲且无当前段时，避免语音已起播仍锁思考图）
-  //      > 说话图（正在播放语音且状态未命中/等于默认图时先落说话图，兜底顺序：说话图 → 默认状态图）
-  //      > 词表图（命中词条图 → 默认状态图；未打标集=内置最小词表，解析落首图）----
-  const speakingNow = phase === 'voice' && current?.kind === 'line' && current.speaker === 'ai'
+  // ---- 立绘解析（剧情窗只认剧本情绪）----
+  // 剧情窗不使用 CharacterSprite 的 thinkingImage / speakingImage：两者是桌宠实时演出的系统态，
+  // 在剧本驱动场景里会覆盖台词情绪，造成"思考图 → 旧情绪 → 新情绪"的多余切换。
+  // 思考状态仍由 snapshot.thinking 驱动「思考中…」名牌与点击门控，不参与立绘。
+  // 解析链：命中词条图 → 默认状态图；未打标集（内置最小词表）= 首图。
   const spriteSrc = (() => {
     if (!sprite) return null
-    if (snapshot?.thinking && phase === 'idle' && !current && sprite.thinkingImage) return api.story.spriteUrl(sprite.id, sprite.thinkingImage)
-    // 状态查表（词表单链）：命中词条图 → 默认状态图；未打标集（内置最小词表）= 首图
     const emotionFile = resolvePaletteImage(sprite, spriteEmotion)
-    // 说话图使用条件：正在说话且状态=「平静」；默认状态可设为其它词，说话时显示其对应图
-    const calmFile = resolvePaletteImage(sprite, BUILTIN_DEFAULT_EMOTION)
-    // 说话图让位规则：语音播放中且状态=平静（默认状态出场才让位，不覆盖真正的状态演出）
-    const speakingFile = sprite.speakingImage && sprite.images.some((i) => i.filePath === sprite.speakingImage) ? sprite.speakingImage : null
-    if (speakingNow && speakingFile && (emotionFile == null || (calmFile != null && emotionFile === calmFile))) {
-      return api.story.spriteUrl(sprite.id, speakingFile)
-    }
     if (emotionFile) return api.story.spriteUrl(sprite.id, emotionFile)
-    if (speakingFile) return api.story.spriteUrl(sprite.id, speakingFile)
     const first = sprite.images[0]?.filePath
     return first ? api.story.spriteUrl(sprite.id, first) : null
   })()
 
   const pending = snapshot?.status === 'running' ? snapshot.pending : null
   /** 交互 UI 显示条件：队列排空 + 不在播放 + 有挂起交互 */
-  const showInteraction = phase === 'idle' && !current && !!pending && !snapshot?.thinking
+  /** advance 只是"等点击推进"，不需要渲染选项/输入框 */
+  const pendingActionable = !!pending && pending.kind !== 'advance'
+  const showInteraction = phase === 'idle' && !current && pendingActionable && !snapshot?.thinking
   const inputActive = !!pending && (pending.kind === 'input' || pending.kind === 'free' || (pending.kind === 'choices' && pending.allowFree))
   /** 空闲继续/重试：队列排空、无挂起、非思考（AI 轮次失败后的重试入口） */
   const showContinue = snapshot?.status === 'running' && phase === 'idle' && !current && !pending && !snapshot.thinking
@@ -672,7 +952,8 @@ export function StoryApp() {
               className="absolute inset-0 z-0"
             >
               <img src={backgroundUrl} alt="" className="h-full w-full object-cover" draggable={false} />
-              <div className="absolute inset-0" style={{ background: 'color-mix(in srgb, var(--bg-base) 42%, transparent)' }} />
+              {/* 蒙版按主题给：深色压暗突出浅色文字，浅色透明以保留插画原色（--story-scrim 见 index.css） */}
+              <div className="absolute inset-0" style={{ background: 'var(--story-scrim)' }} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -702,7 +983,7 @@ export function StoryApp() {
             立绘调整浮层从按钮行上方弹出，不遮挡按钮 */}
         <div
           className="app-no-drag relative z-20 mt-auto shrink-0 px-4 pb-4 pt-2"
-          style={{ background: 'linear-gradient(to top, color-mix(in srgb, var(--bg-base) 92%, transparent), transparent)' }}
+          style={{ background: 'linear-gradient(to top, var(--story-fade), transparent)' }}
         >
           {/* 演出控制按钮行（与对话框同宽右对齐）；立绘调整浮层向上弹出，不遮挡按钮 */}
           <div className="relative mx-auto mb-1 flex w-full max-w-[880px] items-center justify-end gap-1">
@@ -825,7 +1106,15 @@ export function StoryApp() {
                 </>
               ) : (
                 <span className="text-xs text-text-2">
-                  {snapshot.thinking ? '思考中…' : pending ? '请选择 / 输入' : '剧情进行中'}
+                  {replayDone
+                    ? '重看结束 · 可直接关闭窗口'
+                    : snapshot.thinking
+                      ? '思考中…'
+                      : pendingActionable
+                        ? '请选择 / 输入'
+                        : replayRef.current
+                          ? '重看中'
+                          : '剧情进行中'}
                 </span>
               )}
               {showInteraction && pending?.kind === 'free' ? (
@@ -878,7 +1167,9 @@ export function StoryApp() {
                   <p className="selectable min-h-[32px] whitespace-pre-wrap break-words text-sm leading-relaxed text-text">
                     {current ? typedText : ''}
                     {/* 剧情系统保持既有闪烁行为（光标态区分仅作用于聊天/桌宠的语音门控揭示） */}
-                    {phase !== 'idle' && <span className="streaming-cursor streaming-cursor--waiting" />}
+                    {(phase !== 'idle' || (!current && !!snapshot?.thinking)) && (
+                      <span className="streaming-cursor streaming-cursor--waiting" />
+                    )}
                   </p>
                 )}
               </div>
@@ -937,7 +1228,19 @@ export function StoryApp() {
                           <p className="max-w-[85%] text-center text-xs italic leading-relaxed text-text-2">{m.content}</p>
                         ) : (
                           <div className="max-w-[80%]">
-                            <p className="mb-0.5 px-1 text-[10px] text-text-2">{m.role === 'user' ? '你' : cardName}</p>
+                            <p className="mb-0.5 flex items-center gap-1.5 px-1 text-[10px] text-text-2">
+                              <span>{m.role === 'user' ? '你' : cardName}</span>
+                              {m.role !== 'user' && snapshot?.voice && (
+                                <button
+                                  type="button"
+                                  onClick={() => void playHistoryVoice(m)}
+                                  title="重听这段语音（只播已落盘的缓存）"
+                                  className="rounded p-0.5 transition-colors hover:bg-card-hover hover:text-text"
+                                >
+                                  <Volume2 size={11} strokeWidth={1.75} />
+                                </button>
+                              )}
+                            </p>
                             <div
                               className={cn(
                                 'selectable whitespace-pre-wrap break-words rounded-[var(--radius-lg)] px-3.5 py-2 text-sm leading-relaxed',

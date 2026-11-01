@@ -38,7 +38,6 @@ import type {
 import {
   AccordionItem,
   Button,
-  Card,
   ConfirmModal,
   Empty,
   Field,
@@ -417,32 +416,58 @@ export function CharacterCardPanel() {
       ) : cards.length === 0 ? (
         <Empty text="还没有角色卡，点击右上角「新建角色卡」开始" />
       ) : (
-        cards.map((card) => (
-          <Card key={card.id} className="flex items-start gap-3">
+        <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-lg)] border border-border bg-card/70">
+        {cards.map((card) => {
+          const voiceMode = card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')
+          // 绑定名解析：显示「实际用了哪一个」，而不是「已绑定」这种还得再点进去确认的占位
+          const spriteName = card.spriteId ? sprites.find((sp) => sp.id === card.spriteId)?.name : undefined
+          const modelName = card.modelId ? models.find((m) => m.id === card.modelId)?.name : undefined
+          // 外观标签只在绑定真正生效时显示（跟随全局 = 不显示，与桌宠侧判定一致）
+          const appearance =
+            (card.renderMode ?? 'global') === 'sprite' && spriteName
+              ? { kind: '立绘', name: spriteName }
+              : (card.renderMode ?? 'global') === 'live2d' && modelName
+                ? { kind: 'Live2D 模型', name: modelName }
+                : null
+          const voiceName =
+            voiceMode === 'genie' || voiceMode === 'sbv2'
+              ? ttsModels.find((m) => m.id === card.localVoice?.ttsModelId)?.name
+              : voiceMode === 'mimo'
+                ? voices.find((v) => v.id === card.voiceId)?.name
+                : undefined
+          return (
+          <div key={card.id} className="flex items-start gap-3 px-4 py-3">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-surface-2 text-sm ring-1 ring-border">
               {card.name.slice(0, 1)}
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-medium text-text">{card.name}</span>
-                {card.modelId && (
-                  <span className="rounded-full bg-accent/15 px-2 py-1 text-[10px] text-accent ring-1 ring-accent/30">
-                    绑定模型
+                {/* 外观：当前实际生效的绑定（跟随全局 / 未绑定时不显示） */}
+                {appearance && (
+                  <span className="max-w-[180px] truncate rounded-full bg-accent/15 px-2 py-1 text-[10px] text-accent ring-1 ring-accent/30">
+                    {appearance.kind} · {appearance.name}
                   </span>
                 )}
-                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'genie' && (
+                {voiceMode === 'genie' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
                     Genie-TTS
                   </span>
                 )}
-                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'sbv2' && (
+                {voiceMode === 'sbv2' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
                     本地 SBV2
                   </span>
                 )}
-                {(card.voiceMode ?? (card.voiceId ? 'mimo' : 'none')) === 'mimo' && (
+                {voiceMode === 'mimo' && (
                   <span className="rounded-full bg-primary-500/15 px-2 py-1 text-[10px] text-primary-400 ring-1 ring-primary-500/30">
                     声音克隆
+                  </span>
+                )}
+                {/* 声音：绑定的声库 / 声线 / 参考音频名称 */}
+                {voiceName && (
+                  <span className="max-w-[180px] truncate rounded-full bg-surface-2 px-2 py-1 text-[10px] text-text-2 ring-1 ring-border">
+                    {voiceName}
                   </span>
                 )}
               </div>
@@ -464,8 +489,10 @@ export function CharacterCardPanel() {
                 删除
               </Button>
             </div>
-          </Card>
-        ))
+          </div>
+          )
+        })}
+        </div>
       )}
 
       {/* 新建 / 编辑弹窗：分 Tab 编辑器 */}
@@ -824,42 +851,47 @@ export function CharacterCardPanel() {
                   />
                 </Field>
 
-                {editor.renderMode === 'live2d' ? (
-                  <>
-                    <Field label="绑定 Live2D 模型（可选）" hint="不绑定则使用全局当前模型">
-                      <SelectMenu
-                        value={editor.modelId}
-                        onChange={(v) => setEditor({ ...editor, modelId: v })}
-                        options={[
-                          { value: '', label: '不绑定（使用全局当前模型）' },
-                          ...models.map((m) => ({ value: m.id, label: m.name })),
-                        ]}
-                        className="w-full"
-                      />
-                    </Field>
-                  </>
-                ) : editor.renderMode === 'sprite' ? (
-                  <>
-                    <Field label="绑定 2D 立绘集（可选）" hint="不绑定则使用全局当前立绘集（在「角色模型」中选中）。">
-                      <SelectMenu
-                        value={editor.spriteId}
-                        onChange={(v) => setEditor({ ...editor, spriteId: v })}
-                        options={[
-                          { value: '', label: '不绑定（使用全局当前立绘集）' },
-                          ...sprites.map((s) => ({ value: s.id, label: s.name })),
-                        ]}
-                        className="w-full"
-                      />
-                    </Field>
-                    {editor.spriteId && (
-                      <p className="text-xs text-text-muted">状态映射使用角色模型中 2D 立绘卡所设置的状态映射</p>
-                    )}
-                  </>
-                ) : (
-                  <p className="text-xs leading-relaxed text-text-muted">
-                    跟随全局当前形象：到「角色模型」面板切换当前 Live2D 模型或 2D 立绘集，桌宠会随之切换。
-                  </p>
+                {/* 按模式只显示对应的绑定：Live2D 模式下摆一个立绘下拉框，等于让用户去填一个不会生效的值。
+                    「跟随全局」两个都不显示 —— 该模式完全不看本卡的绑定（桌宠侧同样按模式过滤，
+                    见 PetStage 的 getEffectiveModelId / getEffectiveSpriteId）。 */}
+                {editor.renderMode === 'live2d' && (
+                  <Field label="绑定 Live2D 模型（可选）" hint="不绑定则使用全局当前模型">
+                    <SelectMenu
+                      value={editor.modelId}
+                      onChange={(v) => setEditor({ ...editor, modelId: v })}
+                      options={[
+                        { value: '', label: '不绑定（使用全局当前模型）' },
+                        ...models.map((m) => ({ value: m.id, label: m.name })),
+                      ]}
+                      className="w-full"
+                    />
+                  </Field>
                 )}
+
+                {editor.renderMode === 'sprite' && (
+                  <Field label="绑定 2D 立绘集（可选）" hint="不绑定则使用全局当前立绘集（在「角色模型」中选中）。">
+                    <SelectMenu
+                      value={editor.spriteId}
+                      onChange={(v) => setEditor({ ...editor, spriteId: v })}
+                      options={[
+                        { value: '', label: '不绑定（使用全局当前立绘集）' },
+                        ...sprites.map((s) => ({ value: s.id, label: s.name })),
+                      ]}
+                      className="w-full"
+                    />
+                  </Field>
+                )}
+
+                <p className="text-xs leading-relaxed text-text-muted">
+                  {editor.renderMode === 'global'
+                    ? '跟随全局：完全使用「角色模型」里当前选中的形象，本卡不单独绑定。'
+                    : editor.renderMode === 'sprite'
+                      ? '固定为 2D 立绘：使用上面的立绘绑定，未绑定则用全局当前立绘集。状态映射取自该立绘卡在「角色模型」中的设置。'
+                      : '固定为 Live2D：使用上面的模型绑定，未绑定则用全局当前模型。'}
+                  {(editor.modelId || editor.spriteId) && editor.renderMode === 'global'
+                    ? '（原有的模型/立绘绑定已保留，切回对应固定模式即恢复）'
+                    : ''}
+                </p>
               </div>
             )}
 

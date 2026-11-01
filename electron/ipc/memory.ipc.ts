@@ -77,11 +77,20 @@ export function registerMemoryIpc(): void {
   // ---------------- 向量检索 ----------------
 
   /** 语义搜索已确认记忆（MemoryPanel 搜索框；嵌入不可用时前端自行回退本地过滤） */
-  ipcMain.handle('memory:semantic-search', async (_e, params: { query: string; topK?: number }) => {
-    const { query, topK = 10 } = params ?? {}
+  ipcMain.handle('memory:semantic-search', async (_e, params: { query: string; topK?: number; category?: MemoryCategory | 'all'; owner?: string }) => {
+    const { query, topK = 10, category, owner } = params ?? {}
     if (typeof query !== 'string' || !query.trim()) return []
     const all = await listMemories()
-    const candidates = all.filter((m) => m.confirmed)
+    // 先在候选池上应用面板筛选，再向量检索：保证 topK 名额落在当前分类/归属范围内
+    const candidates = all.filter((m) => {
+      if (!m.confirmed) return false
+      if (category && category !== 'all' && m.category !== category) return false
+      if (owner && owner !== 'all') {
+        if (owner === 'global') return m.characterCardId == null
+        return m.characterCardId === owner
+      }
+      return true
+    })
     return semanticSearchAmong(query.trim(), candidates, topK)
   })
 

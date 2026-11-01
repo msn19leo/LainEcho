@@ -19,8 +19,8 @@ function emotionTemplate(listBlock: string, exampleBlock: string): string {
 
 必须返回的结构（严格照抄，键名一致）：
 {"dialogue":[
-  {"text":"台词或描写","emotion":"标准情绪","kind":"speak"},
-  {"text":"……","emotion":"标准情绪","kind":"narr"}
+  {"text":"台词或描写","emotion":1,"kind":"speak"},
+  {"text":"……","emotion":1,"kind":"narr"}
 ]}
 
 硬性规定：
@@ -44,32 +44,42 @@ ${exampleBlock}`
 
 /**
  * 按角色状态词表生成输出格式段（系统内唯一入口，palette 缺省 = 内置最小词表）。
- * 值域块与示例块都来自词表：每词附中文释义；示例取非默认词轮转填充、括号旁白行固定用默认词。
+ * 值域块与示例块都来自词表：一行 = 一条标签 = 一个编号。
  * @param palette 角色绑定的状态词表（缺省/未打标立绘集 = 内置最小词表，仅"平静"）
  */
-export function buildEmotionPrompt(palette?: { entries: Array<{ name: string; gloss: string }>; defaultEmotion: string } | null): string {
+export function buildEmotionPrompt(palette?: { entries: Array<{ name: string }>; defaultEmotion: string } | null): string {
   const pal = palette && palette.entries.length > 0
     ? palette
-    : { entries: [{ name: '平静', gloss: '从容放松' }], defaultEmotion: '平静' }
-  // 词值域行：每词附中文释义，帮助模型按语义选词；超过 4 词换行分组，避免单行过长
-  const items = pal.entries.map((e) => (e.gloss.trim() ? `${e.name}(${e.gloss.trim()})` : e.name))
-  const lines: string[] = []
-  for (let i = 0; i < items.length; i += 4) lines.push('  ' + items.slice(i, i + 4).join(' / '))
-  const defEntry = pal.entries.find((e) => e.name === pal.defaultEmotion)
-  const defLabel = defEntry ? pal.defaultEmotion : pal.entries[0]!.name
-  const listBlock = `- "emotion" 是演出状态词，只能从本角色的状态表中选取（共 ${pal.entries.length} 个）：可能是情绪（开心/害羞），也可能是姿态/行为（解释/警告/沉思）——按台词内容选最贴切的一个：
+    : { entries: [{ name: '平静' }], defaultEmotion: '平静' }
+  // 默认词编号：清单是 1 基，找不到时落 1
+  const defIdx = Math.max(1, pal.entries.findIndex((e) => e.name === pal.defaultEmotion) + 1)
+  const defLabel = pal.entries[defIdx - 1]!.name
+
+  /**
+   * 值域清单：**编号 + 标签**（标签是整体，可含「，」分隔的多段同义描述）。
+   *
+   * 为什么让模型填编号而不是词：词有语义，模型会为了"更贴切"自造表外词（实测连续 6 轮
+   * 输出「心动」，而该立绘集的 8 个状态里没有它），事后只能靠别名表兜、兜不住就掉默认词。
+   * 编号没有语义联想，模型没有动机去发明一个不存在的编号；校验也退化成 1..N 的范围检查。
+   */
+  const lines = pal.entries.map((e, i) => `  ${i + 1}. ${e.name}`)
+  const listBlock = `- "emotion" 填下面状态清单里的**编号**（清单第几项就填几，裸数字，不加引号）：按台词内容选最贴切的一项：
 ${lines.join('\n')}
-  匹配不到时：使用 ${defLabel}${defEntry?.gloss.trim() ? `(${defEntry.gloss.trim()})` : ''}。`
-  // 示例状态值替换：优先取 3 个非默认词（不足时循环复用），括号旁白行固定用默认词
-  const others = pal.entries.map((e) => e.name).filter((n) => n !== defLabel)
-  const pick = (i: number) => (others.length > 0 ? others[i % others.length]! : defLabel)
-  const exampleBlock = `示例（你唯一允许的输出形态，前后无任何多余字符）：
+  一行里用「，」分开的多个词，表示它们指向同一种状态（同一张立绘/同一个表情），填这一行的编号即可。
+  清单里没有完全贴切的，也照样用${defLabel}那一项的编号（${defIdx}）。
+  **禁止写词**：写「心动」「感动」「期待」这类清单外的词会被系统直接丢弃并降级成默认状态。`
+
+  // 示例编号：从默认词之后轮转，避免"最强烈的情绪示范成默认词"（旧写法把「心跳漏了一拍」
+  // 标成平静，等于教模型把心动类描写压平，反而诱发它自造一个更贴切的词）
+  const others = pal.entries.map((_, i) => i + 1).filter((idx) => idx !== defIdx)
+  const pick = (i: number) => String(others.length > 0 ? others[i % others.length]! : defIdx)
+  const exampleBlock = `示例（emotion 是裸编号数字，不填词、不加引号；前后无任何多余字符）：
 {"dialogue":[
-  {"text":"（心跳漏了一拍，站在原地）","emotion":"${defLabel}","kind":"narr"},
-  {"text":"……你终于来了。","emotion":"${pick(0)}","kind":"speak"},
-  {"text":"（快步走到门口，却又停住脚步）","emotion":"${pick(1)}","kind":"narr"},
-  {"text":"这次、这次你要去哪里？","emotion":"${pick(1)}","kind":"speak"},
-  {"text":"不过、现在看到你，就都好了。","emotion":"${pick(2)}","kind":"speak"}
+  {"text":"（心跳漏了一拍，站在原地）","emotion":${pick(0)},"kind":"narr"},
+  {"text":"……你终于来了。","emotion":${pick(1)},"kind":"speak"},
+  {"text":"（快步走到门口，却又停住脚步）","emotion":${pick(2)},"kind":"narr"},
+  {"text":"这次、这次你要去哪里？","emotion":${pick(3)},"kind":"speak"},
+  {"text":"不过、现在看到你，就都好了。","emotion":${pick(4)},"kind":"speak"}
 ]}`
   return emotionTemplate(listBlock, exampleBlock)
 }
@@ -263,7 +273,7 @@ export function buildSystemParts(
   proactiveHint?: boolean,
   storyDirective?: string | null,
   stripParenNarration?: boolean,
-  emotionPalette?: { entries: Array<{ name: string; gloss: string }>; defaultEmotion: string } | null,
+  emotionPalette?: { entries: Array<{ name: string }>; defaultEmotion: string } | null,
 ): PromptSection[] {
   const sections: PromptSection[] = []
   let order = 0

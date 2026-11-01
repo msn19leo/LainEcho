@@ -4,11 +4,16 @@
  * 更新流程全程由用户决定：发现新版 → 是否下载 → 下载完成 → 是否重启安装。
  */
 import { useEffect, useState } from 'react'
-import { ArrowUpCircle, RefreshCw, RotateCw } from 'lucide-react'
+import { ArrowUpCircle, ExternalLink, RefreshCw } from 'lucide-react'
 import { api } from '../../api'
-import { Button, Card, Modal } from '../../components/ui'
+import { Button, Modal } from '../../components/ui'
+import { Section, SettingRow } from '../components/PanelShell'
+import { toast } from '../../components/toast'
 
 type UpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error' | 'latest'
+
+/** 项目主页（关于页展示 + 一键跳转） */
+const REPO_URL = 'https://github.com/msn19leo/LainEcho'
 
 export function AboutPanel() {
   const [phase, setPhase] = useState<UpdatePhase>('idle')
@@ -83,33 +88,48 @@ export function AboutPanel() {
     void api.updater.install()
   }
 
+  /** 用系统默认浏览器打开项目主页（失败时把主进程返回的原因告诉用户） */
+  const handleOpenRepo = async () => {
+    const err = await api.app.openExternal(REPO_URL)
+    if (err) toast(err, 'error')
+  }
+
   const checking = phase === 'checking'
-  const currentPhrase =
-    phase === 'idle' ? '检查是否有新版本可更新' : phase === 'error' ? '检查出错' : phase === 'latest' ? '当前已是最新版本' : ''
 
   return (
-    <Card className="space-y-4">
-      <div className="flex items-center gap-2">
-        <RotateCw size={15} strokeWidth={1.75} color="var(--primary-400)" />
-        <span className="text-sm font-medium text-text-2">软件更新</span>
-      </div>
+    <div>
+      <Section title="软件更新">
+        <SettingRow
+          title="检查更新"
+          desc="需在 GitHub Releases 发布新版本后，由你在本页面或系统托盘手动触发检查"
+        >
+          <Button size="sm" onClick={() => void handleCheck()} disabled={checking}>
+            {checking ? (
+              <>
+                <RefreshCw size={13} className="animate-spin" /> 检查中…
+              </>
+            ) : (
+              '检查更新'
+            )}
+          </Button>
+        </SettingRow>
 
-      <Button onClick={() => void handleCheck()} disabled={checking}>
-        {checking ? (
-          <>
-            <RefreshCw size={14} className="animate-spin" /> 检查中…
-          </>
-        ) : (
-          '检查更新'
+        {phase === 'latest' && (
+          <div className="px-4 py-2.5">
+            <div className="rounded-[var(--radius-sm)] bg-primary-500/10 px-3 py-2">
+              <p className="text-[11.5px] leading-relaxed text-primary-400">当前已是最新版本。</p>
+            </div>
+          </div>
         )}
-      </Button>
-      {phase === 'latest' && (
-        <div className="rounded-[var(--radius-sm)] bg-primary-500/10 px-3 py-2">
-          <p className="text-xs leading-relaxed text-primary-400">当前已是最新版本。</p>
-        </div>
-      )}
 
-      {phase === 'idle' && <p className="text-xs leading-relaxed text-text-muted">{currentPhrase}</p>}
+        {phase === 'error' && (
+          <div className="px-4 py-2.5">
+            <div className="rounded-[var(--radius-sm)] bg-danger/10 px-3 py-2">
+              <p className="text-[11.5px] leading-relaxed text-danger">{error}</p>
+            </div>
+          </div>
+        )}
+      </Section>
 
       {/* 发现新版：询问是否下载 */}
       <Modal
@@ -170,19 +190,18 @@ export function AboutPanel() {
         </p>
       </Modal>
 
-      {/* 检查出错 */}
-      {phase === 'error' && (
-        <div className="rounded-[var(--radius-sm)] bg-danger/10 px-3 py-2">
-          <p className="text-xs leading-relaxed text-danger">{error}</p>
-        </div>
-      )}
+      <Section title="关于">
+        <SettingRow title="LainEcho · AI 桌宠" desc={`版本 v${version || '0.1.0'}`}>
+          <span className="text-[11px] text-text-muted">msn19leo</span>
+        </SettingRow>
 
-      <div className="border-t border-border pt-3">
-        <p className="text-xs leading-relaxed text-text-muted">
-          LainEcho · AI 桌宠（v{version || '0.1.0'}）<br />
-          更新需在 GitHub Releases 发布新版本后，由你在本页面或系统托盘手动触发检查。
-        </p>
-      </div>
-    </Card>
+        {/* 整行可点 + 右侧按钮：两条路都走主进程 shell.openExternal，不在应用内嵌浏览器 */}
+        <SettingRow title="项目地址" desc={REPO_URL} onClick={() => void handleOpenRepo()}>
+          <Button variant="outline" size="sm" onClick={() => void handleOpenRepo()}>
+            <ExternalLink size={13} strokeWidth={1.75} /> 打开
+          </Button>
+        </SettingRow>
+      </Section>
+    </div>
   )
 }

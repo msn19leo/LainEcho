@@ -13,7 +13,7 @@
  * AI 以自己的口吻消化后自然开口，而非硬拼模板话术。
  */
 import type { AppSettings } from '../../../src/types'
-import { resolveProfile } from '../apiProfiles'
+import { llmRequest, resolveProfile } from '../apiProfiles'
 import { sendChatCompletion } from '../aiClient'
 import { analyzeScreen, captureScreenImage } from './screenAnalyzer'
 import { stripTrailingPunct } from '../../../src/lib/utils'
@@ -155,14 +155,11 @@ async function topicNarration(settings: AppSettings, charName: string): Promise<
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      {
-        model: mainCfg.model,
-        baseURL: mainCfg.baseURL,
-        apiKey: mainCfg.apiKey,
-        temperature: 0.9,
-        stream: false,
-        maxTokensOverride: NARRATION_MAX_TOKENS,
-      },
+      llmRequest(
+        mainCfg,
+        { temperature: 0.9, stream: false, maxTokensOverride: NARRATION_MAX_TOKENS },
+        { aux: true },
+      ),
     )
     // 思考型模型（如 mimo）：剥离 <think> 推理块，仅保留正文
     const text = (raw ?? '')

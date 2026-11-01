@@ -13,6 +13,7 @@
  * 主进程内存；profileId 拼入文件路径，必须先过格式校验防路径穿越。
  */
 import type { ApiProfile, AppSettings } from '../../src/types'
+import type { ChatRequestOptions } from './aiClient'
 import { decryptSecret, readSecret, saveSecret } from './crypto'
 import { genId, getSettings, saveSettings } from './repository'
 import { paths, readBuffer, fileExists, deleteFile } from './storage'
@@ -28,6 +29,67 @@ export interface ResolvedLlmConfig {
   model: string
   baseURL: string
   apiKey: string
+  /** 思考模式（undefined = 不注入） */
+  enableThinking?: boolean
+  /** 已解析的额外请求参数（原样并入请求体；null = 未配置或解析失败） */
+  extraBody?: Record<string, unknown> | null
+}
+
+/**
+ * 辅助任务**不透传**的额外参数：它们改变「输出契约」，会把纯文本任务变成 JSON / 工具调用。
+ * 例：主对话里为了结构化台词设了 response_format=json_object，透传给翻译会让译文变成 JSON。
+ */
+const AUX_BLOCKED_EXTRA_KEYS = new Set(['response_format', 'tools', 'tool_choice'])
+
+/**
+ * 把档案配置摊成 `sendChatCompletion` 的请求参数（唯一入口）。
+ *
+ * 存在的理由：此前每个调用点手写 `{ model, baseURL, apiKey }` 三件套，档案上的
+ * 「思考模式」与「额外请求参数」只在主对话生效 —— 用户在档案里点了"关闭思考"，
+ * 摘要/翻译/人设收到的请求里压根没有 thinking 字段，GLM 照旧默认开思考，
+ * 预算被 reasoning 吃光后 content 为空（2026-10-31 定位）。
+ *
+ * @param overrides 任务专属参数（temperature / maxTokensOverride / signal 等）
+ * @param opts.aux  辅助任务：剔除会改变输出契约的 extraBody 键
+ */
+export function llmRequest(
+  cfg: ResolvedLlmConfig,
+  overrides: Partial<ChatRequestOptions> = {},
+  opts: { aux?: boolean } = {},
+): ChatRequestOptions {
+  let extra = cfg.extraBody ?? null
+  if (extra && opts.aux) {
+    const filtered = Object.entries(extra).filter(([k]) => !AUX_BLOCKED_EXTRA_KEYS.has(k))
+    extra = filtered.length > 0 ? Object.fromEntries(filtered) : null
+  }
+  return {
+    model: cfg.model,
+    baseURL: cfg.baseURL,
+    apiKey: cfg.apiKey,
+    ...(cfg.enableThinking === undefined ? {} : { enableThinking: cfg.enableThinking }),
+    ...(extra ? { extraBody: extra } : {}),
+    ...overrides,
+  } as ChatRequestOptions
+}
+
+/**
+ * 解析档案里的「额外请求参数」JSON。
+ * 只接受普通对象；语法错误只告警不阻断（否则用户改错一个逗号就没法发消息）。
+ */
+export function parseExtraBody(raw: string | undefined): Record<string, unknown> | null {
+  const text = raw?.trim()
+  if (!text) return null
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+    console.warn('[api-profile] 额外请求参数必须是 JSON 对象，已忽略')
+    return null
+  } catch (err) {
+    console.warn('[api-profile] 额外请求参数解析失败，已忽略：', err instanceof Error ? err.message : err)
+    return null
+  }
 }
 
 /** 各类型在 AppSettings 中对应的激活档案字段名 */
@@ -66,7 +128,13 @@ export async function resolveProfile(type: ProfileType): Promise<ResolvedLlmConf
   const model = profile.model.trim()
   const apiKey = await readSecret(paths.profileKeyFile(profile.id)).catch(() => null)
   if (!baseURL || !model || !apiKey) return null
-  return { model, baseURL, apiKey }
+  return {
+    model,
+    baseURL,
+    apiKey,
+    enableThinking: profile.enableThinking,
+    extraBody: parseExtraBody(profile.extraBody),
+  }
 }
 
 /**
@@ -89,6 +157,8 @@ export async function upsertProfile(input: {
   baseURL: string
   model: string
   key?: string
+  enableThinking?: boolean
+  extraBody?: string
 }): Promise<ApiProfile> {
   const name = input.name.trim().slice(0, 40) || '未命名档案'
   const baseURL = input.baseURL.trim()
@@ -98,16 +168,40 @@ export async function upsertProfile(input: {
 
   if (!profileId) {
     // 新建：genId 与其他资源同一套生成器（前缀 prof_）
-    const created: ApiProfile = { id: genId('prof'), name, baseURL, model }
+    const created: ApiProfile = {
+      id: genId('prof'),
+      name,
+      baseURL,
+      model,
+      // undefined = 自动（不注入）；显式 true/false 才落盘
+      ...(input.enableThinking === undefined ? {} : { enableThinking: input.enableThinking }),
+      ...(input.extraBody?.trim() ? { extraBody: input.extraBody.trim() } : {}),
+    }
     await saveProfiles((profiles) => [...profiles, created])
     if (input.key?.trim()) await saveSecret(paths.profileKeyFile(created.id), input.key.trim())
     return { ...created, hasKey: await hasProfileKey(created.id) }
   }
 
-  // 更新：仅覆写名称/地址/模型三字段
-  await saveProfiles((profiles) => profiles.map((p) => (p.id === profileId ? { ...p, name, baseURL, model } : p)))
+  // 更新：名称/地址/模型 + 思考与额外参数。
+  // enableThinking 直接赋值（undefined 也要写回，否则用户从「关闭」改回「自动」时旧值清不掉）。
+  const nextExtra = input.extraBody?.trim()
+  await saveProfiles((profiles) =>
+    profiles.map((p) =>
+      p.id === profileId
+        ? { ...p, name, baseURL, model, enableThinking: input.enableThinking, extraBody: nextExtra || undefined }
+        : p,
+    ),
+  )
   if (input.key?.trim()) await saveSecret(paths.profileKeyFile(profileId), input.key.trim())
-  return { id: profileId, name, baseURL, model, hasKey: await hasProfileKey(profileId) }
+  return {
+    id: profileId,
+    name,
+    baseURL,
+    model,
+    enableThinking: input.enableThinking,
+    extraBody: nextExtra || undefined,
+    hasKey: await hasProfileKey(profileId),
+  }
 }
 
 /**

@@ -17,7 +17,8 @@
     "sbv2:dist": "node scripts/prepare-sbv2-runtime.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "probe:profile": "node scripts/probe-model-profile.mjs"
   },
   "dependencies": {
     "adm-zip": "^0.6.0",

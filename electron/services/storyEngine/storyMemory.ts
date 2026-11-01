@@ -16,7 +16,7 @@
  */
 import type { ChatMessage, MemoryCategory, StoryConsolidateResult } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { resolveProfile } from '../apiProfiles'
+import { llmRequest, resolveProfile } from '../apiProfiles'
 import { resolveEmbeddingConfig, syncMemoryVectors } from '../memory/memoryVectors'
 import {
   addPendingMemory,
@@ -168,14 +168,11 @@ export async function consolidateStoryMemory(runId: string, opts?: { manual?: bo
         { role: 'system', content: buildConsolidateSystemPrompt(cardName, scriptTitle) },
         { role: 'user', content: `以下是这段经历的记录：\n${material}\n\n请整理记忆：` },
       ],
-      {
-        model: mainCfg.model,
-        baseURL: mainCfg.baseURL,
-        apiKey: mainCfg.apiKey,
-        temperature: 0.2,
-        stream: false,
-        maxTokensOverride: CONSOLIDATE_MAX_TOKENS,
-      },
+      llmRequest(
+        mainCfg,
+        { temperature: 0.2, stream: false, maxTokensOverride: CONSOLIDATE_MAX_TOKENS },
+        { aux: true },
+      ),
     )
     const parsed = parseConsolidation(raw)
     if (!parsed) {

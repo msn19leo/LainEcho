@@ -117,10 +117,11 @@ export function LogPanel() {
   }
 
   return (
-    <div className="space-y-4">
+    // 工具型面板：占满可视高度，只有日志列表内部滚动，避免外层再出一条滚动条
+    <div className="flex h-[calc(100vh-124px)] min-h-[380px] flex-col gap-2.5">
       {/* 统计 + 操作行 */}
-      <div className="flex items-center justify-between gap-3">
-        <div className="text-xs text-text-muted">
+      <div className="flex shrink-0 items-center justify-between gap-3">
+        <div className="text-[11px] text-text-muted">
           共 {entries.length} 条{errorCount > 0 && <span className="ml-2 text-[var(--danger)]">错误 {errorCount} 条</span>}
         </div>
         <div className="flex items-center gap-2">
@@ -150,7 +151,7 @@ export function LogPanel() {
       </div>
 
       {/* 过滤器 */}
-      <div className="glass flex flex-wrap items-center gap-2 rounded-[var(--radius-md)] p-3">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-[var(--radius-md)] border border-border bg-card/60 p-2">
         <div className="flex items-center gap-1">
           {LEVEL_FILTERS.map((f) => (
             <FilterChip key={f.id} active={levelFilter === f.id} onClick={() => setLevelFilter(f.id)}>
@@ -181,7 +182,7 @@ export function LogPanel() {
           const el = e.currentTarget
           stickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
         }}
-        className="selectable h-[480px] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-[var(--bg-surface-2)]/60 p-3 font-mono text-xs leading-relaxed"
+        className="selectable min-h-0 flex-1 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface-2/60 p-3 font-mono text-[11.5px] leading-relaxed"
       >
         {visible.length === 0 ? (
           <div className="flex h-full items-center justify-center text-text-muted">暂无符合条件的日志</div>
@@ -200,7 +201,7 @@ export function LogPanel() {
       </div>
 
       {/* 底部状态 */}
-      <div className="flex items-center justify-between text-xs text-text-muted">
+      <div className="flex shrink-0 items-center justify-between text-[11px] text-text-muted">
         <span>显示 {visible.length} 条{filtered.length !== entries.length && `（过滤自 ${entries.length} 条）`}</span>
         <label className="flex cursor-pointer items-center gap-1.5 select-none">
           <input

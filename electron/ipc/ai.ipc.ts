@@ -255,23 +255,37 @@ export function registerAiIpc(): void {
    */
   ipcMain.handle('ai:test-connection', async (_e, profile: 'main' | 'aux' | 'vision' = 'main') => {
     try {
+      // 必须按 target 分别解析：此前写成 "vision 之外一律先取 aux"，
+      // 导致点「主模型」测试实际测的是辅助模型（日志里 model 名对不上才发现）。
       const resolved =
         profile === 'vision'
           ? await resolveProfile('vision')
-          : (await resolveProfile('aux')) ?? (await resolveProfile('main'))
+          : profile === 'aux'
+            ? // 辅助未启用时回落主模型（与运行时语义一致，文案里注明）
+              (await resolveProfile('aux')) ?? (await resolveProfile('main'))
+            : await resolveProfile('main')
       if (!resolved) {
         const target = profile === 'vision' ? '视觉模型' : profile === 'aux' ? '辅助（或主）模型' : '主模型'
-        return { ok: false, error: `未配置${target}档案（地址/模型/Key 需完整），请先在「设置 → AI API 配置」中选择并配置` }
+        return { ok: false, error: `未配置${target}档案（地址/模型/Key 需完整），请先在「AI 模型接入」中选择并配置` }
       }
       const content = await sendChatCompletion([{ role: 'user', content: 'ping' }], {
         model: resolved.model,
         baseURL: resolved.baseURL,
         apiKey: resolved.apiKey,
         stream: false,
-        maxTokensOverride: 5,
+        // 只验证连通性，不看内容：思考型模型会把这点预算全花在 reasoning 上，
+        // 但 HTTP 200 已足以说明地址/模型/Key 可用
+        maxTokensOverride: 16,
+        // 探测不重试：截断是预期内的（预算故意给得很小），重试只会让"连接成功"晚一倍出现并刷 WARN
+        retryOnIncomplete: false,
+        // 与正式对话同一套思考配置：否则"测试通过"不代表实际能通
+        enableThinking: resolved.enableThinking,
+        extraBody: resolved.extraBody,
         signal: new AbortController().signal,
       })
-      return { ok: true, data: content }
+      // 回传实际被测的模型名：右栏显示「连接成功 · glm-5.3-flashx」，
+      // 一旦解析和配置不一致能立刻看出来（本次 bug 就是靠日志里的 model 名才发现的）
+      return { ok: true, data: content, model: resolved.model }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }

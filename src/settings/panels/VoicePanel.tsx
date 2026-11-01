@@ -16,8 +16,10 @@ import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, Play, Plus, Power, Trash2, XCircle, Pencil, PlugZap, Rocket, Loader2, FolderOpen, FileAudio } from 'lucide-react'
 import { api } from '../../api'
 import type { TTSConfig, VoiceReference, TTSLanguage, TTSGenieConfig, TTSModelCard, TTSModelCardInput } from '../../types'
-import { Button, Card, ConfirmModal, Field, Input, Loading, Modal, PanelHeader, Slider } from '../../components/ui'
+import { Button, ConfirmModal, Field, Input, Loading, Modal, Slider, Switch } from '../../components/ui'
 import { toast } from '../../components/toast'
+import { useSettingsStore } from '../../store/settingsStore'
+import { SELECTABLE_OFF, SELECTABLE_ON, Section, SettingRow } from '../components/PanelShell'
 import { Sbv2Section } from './voice/Sbv2Section'
 
 /** 测试合成的按语言默认文本 */
@@ -36,6 +38,12 @@ const EMPTY_EDITOR: TTSModelCardInput = {
 }
 
 export function VoicePanel() {
+  /** Genie-TTS 截断判定参数存在全局 settings（原在「通用设置」，已归位到本面板） */
+  const settings = useSettingsStore((s) => s.settings)
+  const saveSettings = useSettingsStore((s) => s.save)
+  /** 缺省即视为开启，避免 undefined 时整行点击取反出错 */
+  const genieMultiSentenceStrict = settings.genieMultiSentenceStrict ?? true
+  const truncationReloadRetry = settings.truncationReloadRetry ?? true
   const [config, setConfig] = useState<TTSConfig | null>(null)
   const [hasApiKey, setHasApiKey] = useState(false)
   const [apiKeyInput, setApiKeyInput] = useState('')
@@ -395,14 +403,10 @@ export function VoicePanel() {
   const selectedVoice = voices.find((v) => v.id === selectedVoiceId) ?? null
 
   return (
-    <div className="space-y-5">
-      <PanelHeader
-        title="语音合成"
-        desc="三选一：Genie-TTS 声库、本地 SBV2（日文）、云端声音克隆。"
-      />
-
+    <div className="space-y-3">
+      {/* 标题与说明由 SettingsLayout 的吸顶标题条统一渲染，此处不再重复 */}
       {/* 引擎切换 */}
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <Field label="语音引擎">
           <div className="flex gap-2">
             {([
@@ -425,10 +429,10 @@ export function VoicePanel() {
             ))}
           </div>
         </Field>
-      </Card>
+      </div>
 
       {/* 语言（三引擎共用；SBV2 固定日文） */}
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <div className="space-y-4">
           <Field
             label="输出语言"
@@ -477,13 +481,13 @@ export function VoicePanel() {
             </div>
           </Field>
         </div>
-      </Card>
+      </div>
 
       {/* ==================== Genie-TTS ==================== */}
       {config.engine === 'genie' && (
         <>
           {/* GenieTTS 服务配置 */}
-          <Card>
+          <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
             <div className="mb-3">
               <span className="text-[13px] font-medium text-text-2">GenieTTS 服务配置</span>
               <p className="mt-0.5 text-xs text-text-muted">
@@ -552,10 +556,10 @@ export function VoicePanel() {
                 </div>
               )}
             </div>
-          </Card>
+          </div>
 
           {/* 角色 TTS 模型卡 */}
-          <Card>
+          <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
             <div className="mb-3 flex items-center justify-between">
               <div>
                 <span className="text-[13px] font-medium text-text-2">角色 TTS 模型</span>
@@ -578,9 +582,7 @@ export function VoicePanel() {
                     key={model.id}
                     onClick={() => setSelectedModelId(model.id === selectedModelId ? null : model.id)}
                     className={`flex items-center gap-3 rounded-[var(--radius-md)] border px-3 py-2.5 cursor-pointer transition-all ${
-                      model.id === selectedModelId
-                        ? 'border-brand bg-brand/5 shadow-[0_0_8px_var(--primary-glow)]'
-                        : 'border-border bg-surface-2/50 hover:border-border-strong'
+                      model.id === selectedModelId ? SELECTABLE_ON : SELECTABLE_OFF
                     }`}
                   >
                     <div className="min-w-0 flex-1">
@@ -615,7 +617,61 @@ export function VoicePanel() {
                 <span className="font-medium text-info">当前选中：</span> {selectedModel.name}（{selectedModel.characterName}）
               </div>
             )}
-          </Card>
+          </div>
+
+          {/* 截断与质量：原在「通用设置」的 4 项，按归位原则移到 Genie-TTS 内部 */}
+          <Section title="截断与质量" hint="仅影响 Genie-TTS">
+            <SettingRow
+              title="多句段严格判定"
+              desc="多句段（内部含句号 / 问号 / 叹号）使用单独阈值，并取消 20 字豁免；关闭后全部回落单句阈值"
+              onClick={() => void saveSettings({ genieMultiSentenceStrict: !genieMultiSentenceStrict })}
+            >
+              <Switch
+                checked={genieMultiSentenceStrict}
+                onChange={(v) => void saveSettings({ genieMultiSentenceStrict: v })}
+              />
+            </SettingRow>
+
+            <SettingRow
+              title="多句段截断阈值"
+              desc="实际时长低于「预期时长 × 阈值」时判定截断，先免重载重试一次"
+              disabled={!genieMultiSentenceStrict}
+            >
+              <Slider
+                value={settings.genieMultiSentenceTruncationRatio ?? 0.9}
+                min={0.5}
+                max={1}
+                step={0.01}
+                defaultValue={0.9}
+                disabled={!genieMultiSentenceStrict}
+                onChange={(v) => void saveSettings({ genieMultiSentenceTruncationRatio: Math.round(v * 100) / 100 })}
+                format={(v) => `${Math.round(v * 100)}%`}
+              />
+            </SettingRow>
+
+            <SettingRow title="单句截断阈值" desc="单句（内部无句末标点）的截断判定阈值">
+              <Slider
+                value={settings.genieTruncationRatio ?? 0.55}
+                min={0.3}
+                max={0.9}
+                step={0.01}
+                defaultValue={0.55}
+                onChange={(v) => void saveSettings({ genieTruncationRatio: Math.round(v * 100) / 100 })}
+                format={(v) => `${Math.round(v * 100)}%`}
+              />
+            </SettingRow>
+
+            <SettingRow
+              title="截断二次重试时重载模型"
+              desc="仍截断时开启则重载角色模型后再兜底一次（多花 8~13 秒），关闭则直接放行较短音频（响应更快）"
+              onClick={() => void saveSettings({ truncationReloadRetry: !truncationReloadRetry })}
+            >
+              <Switch
+                checked={truncationReloadRetry}
+                onChange={(v) => void saveSettings({ truncationReloadRetry: v })}
+              />
+            </SettingRow>
+          </Section>
         </>
       )}
 
@@ -626,7 +682,7 @@ export function VoicePanel() {
       {config.engine === 'mimo' && (
         <>
           {/* MiMo API Key */}
-          <Card>
+          <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
             <Field label="MiMo API Key" hint="仅用于访问小米 MiMo voiceclone 模型，与 LLM API Key 隔离加密存储。">
               <div className="flex gap-2">
                 <Input
@@ -646,10 +702,10 @@ export function VoicePanel() {
                 <span>API Key 已配置</span>
               </div>
             )}
-          </Card>
+          </div>
 
           {/* MiMo 模型名 */}
-          <Card>
+          <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
             <Field label="模型（model）" hint="小米 MiMo TTS 模型名，如 mimo-v2.5-tts-voiceclone（声音克隆）">
               <Input
                 value={config.model}
@@ -657,10 +713,10 @@ export function VoicePanel() {
                 placeholder="mimo-v2.5-tts-voiceclone"
               />
             </Field>
-          </Card>
+          </div>
 
           {/* 参考音频管理 */}
-          <Card>
+          <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
             <div className="mb-3 flex items-center justify-between">
               <div>
                 <span className="text-[13px] font-medium text-text-2">参考音频</span>
@@ -701,10 +757,8 @@ export function VoicePanel() {
                           setSelectedVoiceId(isSelected ? null : voice.id)
                         }
                       }}
-                      className={`flex items-center gap-3 rounded-[var(--radius-md)] border px-3 py-2.5 transition-all ${
-                        isSelected
-                          ? 'border-brand bg-brand/5 shadow-[0_0_8px_var(--primary-glow)] cursor-pointer'
-                          : 'border-border bg-surface-2/50 hover:border-border-strong cursor-pointer'
+                      className={`flex cursor-pointer items-center gap-3 rounded-[var(--radius-md)] border px-3 py-2.5 transition-all ${
+                        isSelected ? SELECTABLE_ON : SELECTABLE_OFF
                       }`}
                     >
                       <div className="min-w-0 flex-1">
@@ -758,13 +812,13 @@ export function VoicePanel() {
                 <span className="font-medium text-info">当前选中：</span> {selectedVoice.name}（测试合成将使用此音频）
               </div>
             )}
-          </Card>
+          </div>
         </>
       )}
 
       {/* 测试合成（SBV2 在 Sbv2Section 内有独立测试卡） */}
       {config.engine !== 'sbv2' && (
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <div className="mb-3">
           <span className="text-[13px] font-medium text-text-2">测试合成</span>
           <p className="mt-0.5 text-xs text-text-muted">测试文本可编辑；留空按当前语言使用默认文本。</p>
@@ -798,7 +852,7 @@ export function VoicePanel() {
             <span>{testResult.message}</span>
           </div>
         )}
-      </Card>
+      </div>
       )}
 
       {/* 删除模型卡确认弹窗 */}

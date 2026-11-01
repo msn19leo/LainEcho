@@ -21,7 +21,8 @@ import {
 } from 'lucide-react'
 import { api } from '../../../api'
 import type { Sbv2Device, Sbv2ServerStatus, TTSsbv2Config, TTSModelCard, TTSModelCardInput } from '../../../types'
-import { Button, Card, ConfirmModal, Field, Input, Modal, Slider } from '../../../components/ui'
+import { Button, ConfirmModal, Field, Input, Modal, Slider } from '../../../components/ui'
+import { SELECTABLE_OFF, SELECTABLE_ON } from '../../components/PanelShell'
 import { SelectMenu } from '../../../components/DropdownMenu'
 import { toast } from '../../../components/toast'
 
@@ -268,7 +269,7 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
     }
   }
 
-  if (!cfg) return <Card>正在加载 SBV2 配置…</Card>
+  if (!cfg) return <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">正在加载 SBV2 配置…</div>
 
   const deviceOptions = [
     { value: 'cpu', label: 'CPU' },
@@ -279,7 +280,7 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
   return (
     <>
       {/* ==================== 引擎卡 ==================== */}
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
@@ -343,7 +344,7 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
 
           <Field
             label="推理设备"
-            hint="切换后服务会自动重建会话（约 2–5 秒）。本机实测 CPU 比核显 DirectML 更快。"
+            hint="切换后服务会自动重建会话（约 2–5 秒）。"
           >
             <div className="flex gap-2">
               <SelectMenu
@@ -358,10 +359,10 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
             </div>
           </Field>
         </div>
-      </Card>
+      </div>
 
       {/* ==================== 声线卡 ==================== */}
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <div className="mb-3 flex items-center justify-between">
           <div>
             <span className="text-[13px] font-medium text-text-2">声线</span>
@@ -386,7 +387,7 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
                 key={m.id}
                 onClick={() => setSelectedId(m.id === selectedId ? null : m.id)}
                 className={`flex cursor-pointer items-center justify-between rounded-[var(--radius-md)] border px-3 py-2 transition-colors ${
-                  m.id === selectedId ? 'border-brand bg-brand-gradient/10' : 'border-border hover:border-border-strong'
+                  m.id === selectedId ? SELECTABLE_ON : SELECTABLE_OFF
                 }`}
               >
                 <div className="min-w-0">
@@ -405,10 +406,10 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
             ))}
           </div>
         )}
-      </Card>
+      </div>
 
       {/* ==================== 测试卡 ==================== */}
-      <Card>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-card/70 p-4">
         <div className="mb-3">
           <span className="text-[13px] font-medium text-text-2">测试合成</span>
           <p className="mt-0.5 text-xs text-text-muted">
@@ -457,7 +458,7 @@ export function Sbv2Section({ ttsSpeed = 1 }: { ttsSpeed?: number }) {
             </div>
           )}
         </div>
-      </Card>
+      </div>
 
       {/* ==================== 声线编辑弹窗 ==================== */}
       <Modal

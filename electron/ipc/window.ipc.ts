@@ -4,7 +4,7 @@
  * - 自定义标题栏（minimize / toggleMaximize / close）
  * - 应用级操作（打开聊天/设置、同步桌宠模型、退出）
  */
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import type { PetCardPayload, TTSLanguage } from '../../src/types'
 import { markPetWindowQuitting, setPetPanelHeight } from '../windows/petWindow'
 import { windowManager } from '../windows/windowManager'
@@ -19,6 +19,20 @@ function windowFromEvent(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEv
 const winSizeCache = new Map<number, { width: number; height: number }>()
 
 export function registerWindowIpc(): void {
+  /**
+   * 打开外部链接（系统默认浏览器）。
+   * 只放行 http/https —— 避免渲染端被注入 file:// 或 javascript: 协议后越权打开本地文件。
+   */
+  ipcMain.handle('app:open-external', async (_e, url: unknown) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return '仅支持 http/https 链接'
+    try {
+      await shell.openExternal(url)
+      return ''
+    } catch (err) {
+      return err instanceof Error ? err.message : '打开失败'
+    }
+  })
+
   // ---------------- 窗口控制 ----------------
 
   ipcMain.on('win:minimize', (e) => {

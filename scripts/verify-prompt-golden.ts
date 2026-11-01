@@ -12,11 +12,12 @@ import { composeSystemPrompt } from '../electron/services/prompt/composer'
 // ---------- 参考实现（重构前 buildSystemPrompt 的逐字节拷贝，禁止修改） ----------
 
 /**
- * 参考实现 emotion 段（内置最小词表变体，2026-10-03 P2a 词表微调后同步）：
+ * 参考实现 emotion 段（内置最小词表变体，2026-10-31 编号契约后重新钉版）：
  * 词表方案重构后 emotion 段永远按词表生成；未打标立绘集/未绑定 = 内置最小词表（仅"平静"）。
- * P2a 变更：硬性规定新增「对象数组形态禁止纯字符串」「括号成对闭合」两条契约；
- * 旁白规范条目补「同项混合形态（括号后台词，emotion 取台词情绪）」；示例第 3 项改为混合形态。
- * 文本必须与 sections.buildEmotionPrompt(builtinPalette()) 逐字节一致。
+ * 2026-10-31 变更：emotion 值域从"词"改为"编号"（1..N），示例同步用编号——
+ * 模型会为了"更贴切"自造表外词（实测连续输出「心动」），编号没有语义联想，从根上堵住。
+ * 同日再改：gloss 删除，一行 = 一条标签（可含「，」分隔的多段，共用一个编号）。
+ * 文本必须与 sections.buildEmotionPrompt(内置最小词表) 逐字节一致。
  */
 const REF_EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背）】
 你的【整条回复都必须且只能是】一个 JSON 对象，除此之外【一个字都不能多输出】——
@@ -24,16 +25,18 @@ const REF_EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背�
 
 必须返回的结构（严格照抄，键名一致）：
 {"dialogue":[
-  {"text":"台词或描写","emotion":"标准情绪","kind":"speak"},
-  {"text":"……","emotion":"标准情绪","kind":"narr"}
+  {"text":"台词或描写","emotion":1,"kind":"speak"},
+  {"text":"……","emotion":1,"kind":"narr"}
 ]}
 
 硬性规定：
 - 只有一个顶层键 "dialogue"，它是数组，通常 2~6 项，每项是一个情绪/语义节奏。
 - 每一项必须同时有 "text"、"emotion"、"kind" 三个字段，缺一不可，"emotion" 与 "kind" 都不得缺省。
-- "emotion" 只能从本角色的情绪表中选取（共 1 个）：
-  平静(从容放松)
-  匹配不到时：使用 平静(从容放松)。
+- "emotion" 填下面状态清单里的**编号**（清单第几项就填几，裸数字，不加引号）：按台词内容选最贴切的一项：
+  1. 平静
+  一行里用「，」分开的多个词，表示它们指向同一种状态（同一张立绘/同一个表情），填这一行的编号即可。
+  清单里没有完全贴切的，也照样用平静那一项的编号（1）。
+  **禁止写词**：写「心动」「感动」「期待」这类清单外的词会被系统直接丢弃并降级成默认状态。
 - "kind" 只有两个取值："speak"（角色真正说出口的台词）与 "narr"（心理活动/动作/环境等不可发声的内容）。按内容如实填写。
 - 【双重标记，缺一不可】narr 项的 "text" 必须用圆括号（）完整包裹；speak 项的 "text" 里禁止出现圆括号。系统按 kind 分类、按括号兜底校验，两者不一致时以括号为准——只写 kind 忘了括号的旁白会被误当台词朗读。
 - 一句话里既有动作又有台词时，拆成两项：动作/心理一项（kind="narr"，带括号），台词一项（kind="speak"，不带括号），按发生顺序排列。
@@ -46,13 +49,13 @@ const REF_EMOTION_PROMPT = `【输出格式（最高优先，绝对不可违背�
 - "text" 的值内部禁止使用引号（"" '' "" ''）把整句台词或整段旁白包裹起来——台词就是台词本身，不需要加任何引号包装；引用他人话语时才在句中使用引号。
 - 严禁输出【内心独白】【台词】【动作】等任何以【】包裹的剧本标签或章节标记，写进 "text" 里也不行；心理/动作内容一律作为 kind="narr" 的独立项，不加任何标签头或圆括号。
 
-示例（你唯一允许的输出形态，前后无任何多余字符）：
+示例（emotion 是裸编号数字，不填词、不加引号；前后无任何多余字符）：
 {"dialogue":[
-  {"text":"（心跳漏了一拍，站在原地）","emotion":"平静","kind":"narr"},
-  {"text":"……你终于来了。","emotion":"平静","kind":"speak"},
-  {"text":"（快步走到门口，却又停住脚步）","emotion":"平静","kind":"narr"},
-  {"text":"这次、这次你要去哪里？","emotion":"平静","kind":"speak"},
-  {"text":"不过、现在看到你，就都好了。","emotion":"平静","kind":"speak"}
+  {"text":"（心跳漏了一拍，站在原地）","emotion":1,"kind":"narr"},
+  {"text":"……你终于来了。","emotion":1,"kind":"speak"},
+  {"text":"（快步走到门口，却又停住脚步）","emotion":1,"kind":"narr"},
+  {"text":"这次、这次你要去哪里？","emotion":1,"kind":"speak"},
+  {"text":"不过、现在看到你，就都好了。","emotion":1,"kind":"speak"}
 ]}`
 
 const REF_PARAGRAPH_PROMPT = `【节拍/分段规范（作用于上方 JSON 的 "text" 与 "kind" 字段）】
@@ -312,9 +315,9 @@ function main(): number {
   {
     const palette = {
       entries: [
-        { name: '傲娇', gloss: '嘴硬心软' },
-        { name: '得意', gloss: '炫耀的口吻' },
-        { name: '平静', gloss: '从容放松' },
+        { name: '傲娇' },
+        { name: '得意' },
+        { name: '平静' },
       ],
       defaultEmotion: '平静',
     }
@@ -325,11 +328,16 @@ function main(): number {
       failed++
     } else {
       const checks: Array<[boolean, string]> = [
-        [emotion.text.includes('傲娇(嘴硬心软)'), '缺词表值域行'],
-        [emotion.text.includes('使用 平静(从容放松)'), '缺默认情绪兜底行'],
-        [!emotion.text.includes('只能取下列 6 个之一'), '仍含旧 6 枚举值域块'],
-        [!emotion.text.includes('"emotion":"shy"'), '示例情绪未替换为词表词'],
-        [emotion.text.includes('"emotion":"傲娇"'), '示例情绪未用词表词'],
+        // 编号契约（2026-10-31）：值域是"编号 + 标签"的清单，1 基（gloss 已删除）
+        [emotion.text.includes('1. 傲娇'), '缺编号值域行'],
+        [emotion.text.includes('2. 得意'), '缺编号值域行（第 2 项）'],
+        [emotion.text.includes('3. 平静'), '缺编号值域行（默认项）'],
+        [emotion.text.includes('表示它们指向同一种状态'), '缺"一行多词同义"说明'],
+        [emotion.text.includes('也照样用平静那一项的编号（3）'), '缺默认编号兜底行'],
+        [emotion.text.includes('禁止写词'), '缺"禁止写词"负例'],
+        [!emotion.text.includes('"emotion":"标准情绪"'), '模板占位符仍在暗示可自由填词'],
+        [!emotion.text.includes('"emotion":"shy"'), '示例仍是旧枚举值'],
+        [emotion.text.includes('"emotion":1'), '示例情绪未用裸编号'],
         // P2a 契约强化（2026-10-03）：针对纯字符串数组变体与漏右括号两次线上事故的 prompt 端防线
         [emotion.text.includes('禁止把元素写成纯字符串'), '缺对象数组形态契约'],
         // kind 契约（2026-10-13）：多气泡渲染与语音门控的类型标记 + 括号双重标记兜底

@@ -73,6 +73,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   textSpeed: 80,
   // 剧情窗对话框文字显示速度（独立于通用 textSpeed，仅剧情系统读取）
   storyTextSpeed: 80,
+  petWindow: { width: 300, height: 480, x: null, y: null },
 }
 
 interface SettingsState {

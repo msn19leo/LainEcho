@@ -235,17 +235,6 @@ export function Loading({ text = '加载中…' }: { text?: string }) {
   return <div className="py-10 text-center text-sm text-text-muted">{text}</div>
 }
 
-// ---------------- Section 标题（设置面板） ----------------
-
-export function PanelHeader({ title, desc }: { title: string; desc?: string }) {
-  return (
-    <div className="mb-5">
-      <h2 className="text-xl font-semibold tracking-tight text-text">{title}</h2>
-      {desc && <p className="mt-1 text-[13px] text-text-2">{desc}</p>}
-    </div>
-  )
-}
-
 // ---------------- Slider（带数值显示 + 重置按钮） ----------------
 
 interface SliderProps {
@@ -259,25 +248,78 @@ interface SliderProps {
   onChange: (value: number) => void
   /** 值的格式化显示（如保留小数位） */
   format?: (v: number) => string
+  /** 标题右侧的小标记（如「物理」） */
+  badge?: React.ReactNode
   /** 禁用交互（置灰，保留数值显示） */
   disabled?: boolean
+  /**
+   * 数值可编辑：右侧数字变成输入框（回车/失焦提交，Esc 取消）。
+   * 用于取值范围很大、靠滑块点不准的场景（如桌宠窗口尺寸）。
+   */
+  editable?: boolean
 }
 
 /**
  * 滑块组件：青色 handle + 浅灰轨道，右侧显示数值，带重置按钮。
  * 样式参考 airi 的 Slider 控件。
  */
-export function Slider({ label, value, min, max, step = 0.01, defaultValue, onChange, format, disabled = false }: SliderProps) {
+export function Slider({
+  label,
+  value,
+  min,
+  max,
+  step = 0.01,
+  defaultValue,
+  onChange,
+  format,
+  badge,
+  disabled = false,
+  editable = false,
+}: SliderProps) {
   const displayValue = format ? format(value) : value.toFixed(2)
   const showReset = !disabled && defaultValue !== undefined && Math.abs(value - defaultValue) > 0.001
   const percent = ((value - min) / (max - min)) * 100
+  /** 输入框草稿：非 null = 正在编辑，不把中间态（如只敲了「3」）直接提交 */
+  const [draft, setDraft] = useState<string | null>(null)
+
+  /** 提交草稿：夹进 [min,max] 后交付；非法输入直接丢弃并回显原值 */
+  const commitDraft = () => {
+    if (draft === null) return
+    const n = Number.parseFloat(draft)
+    setDraft(null)
+    if (!Number.isFinite(n)) return
+    const clamped = Math.min(max, Math.max(min, n))
+    if (clamped !== value) onChange(clamped)
+  }
 
   return (
     <div className={cn('py-1.5', disabled && 'opacity-50')}>
       <div className="mb-1.5 flex items-center justify-between">
-        {label !== undefined && label !== '' && <span className="text-[13px] text-text-2">{label}</span>}
+        {label !== undefined && label !== '' && (
+          <span className="flex items-center gap-1.5 text-[13px] text-text-2">
+            {label}
+            {badge}
+          </span>
+        )}
         <div className={cn('flex items-center gap-2', label === undefined || label === '' ? 'ml-auto' : '')}>
-          <span className="text-xs font-medium tabular-nums text-text-muted">{displayValue}</span>
+          {editable && !disabled ? (
+            <input
+              type="number"
+              value={draft ?? String(Math.round(value * 100) / 100)}
+              min={min}
+              max={max}
+              step={step}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitDraft}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.currentTarget.blur()
+                if (e.key === 'Escape') setDraft(null)
+              }}
+              className="w-14 rounded-[var(--radius-sm)] border border-transparent bg-transparent px-1 py-0.5 text-right text-xs font-medium tabular-nums text-text-muted outline-none transition-colors hover:border-border focus:border-[var(--border-strong)] focus:text-text [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            />
+          ) : (
+            <span className="text-xs font-medium tabular-nums text-text-muted">{displayValue}</span>
+          )}
           {showReset && (
             <button
               onClick={() => onChange(defaultValue!)}
@@ -347,6 +389,8 @@ interface AccordionItemProps {
   title: string
   icon?: ReactNode
   defaultOpen?: boolean
+  /** 标题右侧的摘要（如"已改 2 项"），收起状态下也能看到状态 */
+  badge?: ReactNode
   children: ReactNode
 }
 
@@ -354,7 +398,7 @@ interface AccordionItemProps {
  * 折叠面板项：标题行带图标 + chevron 箭头，点击展开/收起。
  * 用于角色模型设置的分区展示。
  */
-export function AccordionItem({ title, icon, defaultOpen = true, children }: AccordionItemProps) {
+export function AccordionItem({ title, icon, defaultOpen = true, badge, children }: AccordionItemProps) {
   const [open, setOpen] = useState(defaultOpen)
 
   return (
@@ -363,14 +407,15 @@ export function AccordionItem({ title, icon, defaultOpen = true, children }: Acc
         onClick={() => setOpen(!open)}
         className="flex w-full items-center justify-between px-4 py-3 text-left transition-colors hover:bg-card-hover"
       >
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {icon && <span className="text-primary-400">{icon}</span>}
           <span className="text-sm font-semibold text-text">{title}</span>
+          {badge && <span className="truncate text-xs font-normal text-text-muted">{badge}</span>}
         </div>
         <ChevronDown
           size={16}
           strokeWidth={2}
-          className={cn('text-text-muted transition-transform duration-200', open && 'rotate-180')}
+          className={cn('shrink-0 text-text-muted transition-transform duration-200', open && 'rotate-180')}
         />
       </button>
       {open && (

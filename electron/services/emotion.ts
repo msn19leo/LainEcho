@@ -1,45 +1,10 @@
 /**
- * 结构化状态解析：把 AI 回复末尾的状态标签归一化到 8 标准状态。
+ * 结构化状态解析：把 AI 输出的状态值（编号）归一化到角色词表。
  *
- * prompt 承诺的标签格式：{#emotion:<standard>}，占回复最后一行。
- * 这里负责：
- *  1. extractEmotion —— 从完整回复剥离标签行，返回纯净文本 + 标准状态
- *  2. normalizeEmotion —— 把任意自由状态词（furious/委屈…）收窄到 8 标准状态
+ * 契约：prompt 要求 JSON dialogue 每项带 emotion，值为**编号**（1..N，对应词表顺序）。
+ * 这里负责 normalizeEmotion —— 编号 → 标签；标签整串/任一段命中仅作旧数据与手写剧本的容错。
  */
-import { BUILTIN_DEFAULT_EMOTION, builtinPalette, type DialogueChunk, type EmotionPaletteRef, type EmotionSegment } from '../../src/types'
-
-/** 状态标签正则：匹配回复末尾独占一行的 {#emotion:xxx}（值域含中英文字词表词） */
-const EMOTION_TAG = /\{#emotion:([\w\u4e00-\u9fff]+)\}\s*$/i
-/** 内嵌状态点正则：文本中任意位置的 {#emo:xxx}（表达状态转折；值域含中英文字词表词） */
-const EMBED_EMOTION_TAG = /\{#emo:([\w\u4e00-\u9fff]+)\}/gi
-
-/** 状态别名表：历史 6 枚举英文词/近义自由词 → 中文标准状态词。
- *  词表方案下不再是值域，仅作归一化第二跳（识别旧词/近义词后回词表查词）。
- *  语义分组与旧版一致（担心/紧张类→难过；亲近/撒娇类→开心）。 */
-const EMOTION_ALIASES: Record<string, string> = {
-  // 平静（旧 neutral）
-  neutral: '平静', calm: '平静', relaxed: '平静', plain: '平静',
-  淡定: '平静', 平和: '平静', 平常: '平静',
-  // 开心（旧 happy，含原「亲近/撒娇」回退）
-  happy: '开心', glad: '开心', joy: '开心', delighted: '开心', cheerful: '开心',
-  高兴: '开心', 快乐: '开心', 愉悦: '开心', 兴奋: '开心', 满意: '开心',
-  playful: '开心', teasing: '开心', coy: '开心', flirty: '开心', cutesy: '开心',
-  亲近: '开心', 撒娇: '开心', 俏皮: '开心', 打趣: '开心', 卖萌: '开心',
-  // 难过（旧 sad，含原「担心/紧张」回退）
-  sad: '难过', sorrow: '难过', heartbroken: '难过', upset: '难过', down: '难过',
-  悲伤: '难过', 伤心: '难过', 失落: '难过', 沮丧: '难过', 委屈: '难过', 想哭: '难过',
-  anxious: '难过', nervous: '难过', tense: '难过', worried: '难过', panic: '难过', uneasy: '难过',
-  担心: '难过', 紧张: '难过', 不安: '难过', 焦虑: '难过', 心慌: '难过', 害怕: '难过',
-  // 生气（旧 angry）
-  angry: '生气', anger: '生气', mad: '生气', annoyed: '生气', irritated: '生气', furious: '生气',
-  愤怒: '生气', 恼火: '生气', 烦: '生气', 火大: '生气',
-  // 惊讶（旧 surprised）
-  surprised: '惊讶', surprise: '惊讶', shocked: '惊讶', amazed: '惊讶', astonished: '惊讶',
-  吃惊: '惊讶', 震惊: '惊讶', 意外: '惊讶',
-  // 害羞（旧 shy）
-  shy: '害羞', embarrassed: '害羞', blushing: '害羞', bashful: '害羞', awkward: '害羞',
-  脸红: '害羞', 不好意思: '害羞', 羞涩: '害羞', 难为情: '害羞',
-}
+import { BUILTIN_DEFAULT_EMOTION, builtinPalette, labelMatches, type DialogueChunk, type EmotionPaletteRef, type EmotionSegment } from '../../src/types'
 
 /** 兜底词：词表默认状态；无词表时内置默认"平静" */
 function defWord(palette?: EmotionPaletteRef | null): string {
@@ -47,35 +12,74 @@ function defWord(palette?: EmotionPaletteRef | null): string {
 }
 
 /**
- * 把 AI 自由状态词归一化到当前词表（唯一一条归一化链）：
- *  1. 词表精确命中 → 原样返回（软链降级由渲染端查表时进行）；
- *  2. 别名表（旧 6 枚举英文词/近义中文词 → 中文标准词）命中且该词在词表内 → 返回标准词；
- *  3. 其余 → 词表默认状态。
- * @param raw AI 输出中的状态标签值
+ * 把 AI 输出的状态值归一化到当前词表（唯一一条归一化链）。
+ *
+ * 契约：prompt 要求模型输出**编号**（1..N，1 基），所以第一跳是"编号 → 词"。
+ * 第二跳保留"精确词名匹配"，只为兼容旧数据/旧脚本/模型偶尔漏改格式的情况；
+ * **没有近义/别名映射**——那套东西是词表时代的补丁，已被编号契约取代
+ * （别名表曾把「心动」这类好词判成表外词再降级成「平静」，反而放大误差）。
+ *
+ * @param raw AI 输出中的状态值（编号字符串，或历史数据里的词）
  * @param palette 角色绑定的状态词表（缺省 = 内置最小词表，仅"平静"）
  */
-export function normalizeEmotion(raw: string, palette?: EmotionPaletteRef | null): string {
+export function normalizeEmotion(raw: unknown, palette?: EmotionPaletteRef | null): string {
   const pal = palette ?? builtinPalette()
-  const key = raw.trim().toLowerCase()
+  // JSON 里编号可能写成裸数字（4）或字符串（"4"），统一转成字符串再判断
+  const key = String(raw ?? '').trim()
   if (!key) return pal.defaultEmotion
-  const hit = pal.entries.find((e) => e.name.toLowerCase() === key)
-  if (hit) return hit.name
-  // 别名第二跳：旧枚举英文词/近义词 → 中文标准词 → 若在词表内则命中
-  const aliased = EMOTION_ALIASES[key]
-  if (aliased && pal.entries.some((e) => e.name === aliased)) return aliased
+  // ① 编号（1 基）：prompt 规定的唯一合法形态
+  if (/^\d+$/.test(key)) {
+    const hit = pal.entries[Number.parseInt(key, 10) - 1]
+    if (hit) return hit.name
+  }
+  // ② 容错：整串命中（模型偶尔直接抄了标签）
+  const named = pal.entries.find((e) => e.name === key)
+  if (named) return named.name
+  // ③ 段匹配：旧会话里存的是单词（"不满"），标签合并成「不满，生气」后仍要能命中
+  const segHit = pal.entries.find((e) => labelMatches(key, e.name))
+  if (segHit) return segHit.name
   return pal.defaultEmotion
 }
 
-/** 单个原始 emotion 值的依从判定（词表微调观测用）：
- *  hit = 词表精确命中；alias = 别名表接住（旧枚举英文词/近义词映射进词表）；miss = 无效值回落默认词。 */
-export function emotionAdherence(raw: string, palette?: EmotionPaletteRef | null): 'hit' | 'alias' | 'miss' {
+/**
+ * 单个原始状态值的依从判定（词表观测用），**三态**：
+ *  - `number`：按契约输出的编号且在范围内（唯一正确形态）
+ *  - `label`：输出了标签文字（整串或其中一段）——能被归一，但不是契约形态
+ *  - `miss`：越界编号或表外词
+ *
+ * 为什么要区分 number / label：早先把两者都算 hit，于是"模型退回写词"这件事
+ * 在日志里完全看不出来（2026-10-31 实测一轮 4 项全是词，却记成 4/4 命中）。
+ */
+export type EmotionAdherence = 'number' | 'label' | 'miss'
+
+export function emotionAdherence(raw: unknown, palette?: EmotionPaletteRef | null): EmotionAdherence {
   const pal = palette ?? builtinPalette()
-  const key = raw.trim().toLowerCase()
+  const key = String(raw ?? '').trim()
   if (!key) return 'miss'
-  if (pal.entries.some((e) => e.name.toLowerCase() === key)) return 'hit'
-  const aliased = EMOTION_ALIASES[key]
-  if (aliased && pal.entries.some((e) => e.name === aliased)) return 'alias'
-  return 'miss'
+  if (/^\d+$/.test(key)) {
+    const idx = Number.parseInt(key, 10)
+    return idx >= 1 && idx <= pal.entries.length ? 'number' : 'miss'
+  }
+  return pal.entries.some((e) => e.name === key || labelMatches(key, e.name)) ? 'label' : 'miss'
+}
+
+/**
+ * 词 → 编号（1 基），**严格版**：词（整串或其中一段）不在当前词表时返回 null。
+ *
+ * 历史回填专用。早先找不到时落默认词编号——切换词表后，旧消息里的 `开心`、`平静`
+ * 全被映射成默认编号，模型看到"最近几轮全是同一个编号"，反而被带着整段输出同一个
+ * （2026-10-31 实测）。宁可这条历史不回填，也不能喂出错示范。
+ */
+export function emotionOrdinal(word: string | undefined | null, palette?: EmotionPaletteRef | null): number | null {
+  const pal = palette ?? builtinPalette()
+  const key = String(word ?? '').trim()
+  if (!key) return null
+  const idx = pal.entries.findIndex((e) => e.name === key)
+  if (idx >= 0) return idx + 1
+  // 旧消息存的是单词：命中它所属的那条标签
+  const segIdx = pal.entries.findIndex((e) => labelMatches(key, e.name))
+  if (segIdx >= 0) return segIdx + 1
+  return null
 }
 
 /** 按标点/换行把文本切成句子序列（trim 后保留非空句）。
@@ -111,92 +115,6 @@ export function splitSentences(text: string): string[] {
     .map((s) => s.replace(/\u0001(\d+)\u0001/g, (_m, id: string) => tokens[Number(id)] ?? ''))
     .map((s) => s.trim())
     .filter(Boolean)
-}
-
-/**
- * 从 AI 完整回复中解析状态与句子：
- * - 末尾 {#emotion:xxx} 作为兜底状态
- * - 文本内 {#emo:xxx} 作为状态转折点，落到对应句子索引生成 emotionSegments
- * @param palette 角色绑定的状态词表（null = 走旧 6 枚举链路）
- * 返回：
- *   text            剥离所有标签后的纯净文本（用于显示/落盘）
- *   emotion         末尾兜底状态（未命中落默认词）
- *   sentences       按标点切分的句子序列
- *   emotionSegments 句子级状态切换点（startSentence 0 基）
- */
-export function extractEmotion(content: string, palette?: EmotionPaletteRef | null): {
-  text: string
-  emotion: string
-  sentences: string[]
-  emotionSegments: EmotionSegment[]
-} {
-  const trimmed = content.trimEnd()
-  let text = trimmed
-  let emotion: string = defWord(palette)
-  // 1. 末尾兜底标签
-  const tail = EMOTION_TAG.exec(trimmed)
-  if (tail) {
-    text = trimmed.slice(0, tail.index).trimEnd()
-    emotion = normalizeEmotion(tail[1] ?? '', palette)
-  }
-  // 2. 内嵌状态点（位置在去掉末尾标签后的文本上计算）
-  const embeds: { offset: number; emotion: string }[] = []
-  EMBED_EMOTION_TAG.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = EMBED_EMOTION_TAG.exec(text))) {
-    embeds.push({ offset: m.index, emotion: normalizeEmotion(m[1] ?? '', palette) })
-  }
-  // 3. 移除所有标签，得到纯净文本；同时修正 embed offset（标签本身被删除会改变后续偏移）
-  let clean = ''
-  let removed = 0
-  EMBED_EMOTION_TAG.lastIndex = 0
-  const consumed: { offset: number; emotion: string }[] = []
-  let cm: RegExpExecArray | null
-  let cursor = 0
-  while ((cm = EMBED_EMOTION_TAG.exec(text))) {
-    clean += text.slice(cursor, cm.index) + ' '
-    removed += cm[0].length + 1 // 标签 + 代替空格
-    cursor = EMBED_EMOTION_TAG.lastIndex
-    consumed.push({ offset: cm.index - removed, emotion: normalizeEmotion(cm[1] ?? '', palette) })
-  }
-  clean += text.slice(cursor)
-  // 4. 切句并映射状态点到句子索引
-  const sentences = splitSentences(clean)
-  const emotionSegments: EmotionSegment[] = []
-  if (sentences.length > 0) {
-    for (const e of consumed) {
-      const sentenceIndex = locateSentenceIndex(clean, sentences, e.offset)
-      const prev = emotionSegments[emotionSegments.length - 1]
-      if (prev && prev.emotion === e.emotion) continue // 相邻相同合并
-      emotionSegments.push({ startSentence: sentenceIndex, emotion: e.emotion })
-    }
-    if (emotionSegments.length === 0) {
-      // 无内嵌状态点时，末尾兜底作为唯一状态段落起点
-      emotionSegments.push({ startSentence: 0, emotion })
-    }
-  }
-  return { text: clean, emotion, sentences, emotionSegments }
-}
-
-/** 依据字符偏移在句子序列中找到所属句索引（0 基） */
-function locateSentenceIndex(full: string, sentences: string[], offset: number): number {
-  // 重建每句的起始累积长度（近似，忽略 trim 差异，用首句在 full 中首次出现定位）
-  let cumulative = 0
-  let searchFrom = 0
-  for (let i = 0; i < sentences.length; i++) {
-    const s = sentences[i]!
-    const idx = full.indexOf(s, searchFrom)
-    if (idx === -1) {
-      // 无法精确匹配时退回累计推进
-      cumulative += s.length
-      searchFrom = cumulative
-    } else {
-      cumulative = idx + s.length
-      searchFrom = cumulative
-    }
-    if (offset <= cumulative) return i
-  }
-  return sentences.length - 1
 }
 
 /**
@@ -513,9 +431,7 @@ export function stripScriptTags(content: string): string {
  * 剧情导演指令联动（设计文档 7.3）：模型可在 JSON 顶层额外输出可选 "background" 键
  * （背景引用），由剧情引擎解析后走现有 background 事件通道；普通聊天不会出现该键。
  *
- * 当内容不是合法 JSON（模型漏标/降级）时：
- *   - 若仍含旧式 {#emo}/{#emotion} 标签，回退 extractEmotion；
- *   - 否则整段视为单一 neutral。
+ * 当内容不是合法 JSON（模型漏标/降级）时：剥离遗留标签后整段当正文，状态用默认词。
  * 返回：
  *   text            拼接后的纯净段落文本（各项以空行分隔）
  *   emotion         末尾（最后一项）状态，缺省 neutral
@@ -635,13 +551,24 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
       if (!stripParenGroups(scriptCleaned).trim() || isKeyEchoText(scriptCleaned)) {
         return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
       }
-      const fallback = extractEmotion(scriptCleaned, palette)
+      // 非 JSON 降级：原文当正文，状态用默认词。
+      // 只做一件事——把历史遗留的 {#emotion:…}/{#emo:…} 标签剥掉，避免被 TTS 朗读出来；
+      // 旧标签的"标签 → 情绪"映射已随词表时代一起删除。
+      const prose = scriptCleaned.replace(/\{#[^}]*\}/g, ' ').replace(/[ \t]+/g, ' ').trim()
       // 结构契约：键名回显正文（如整段只写了 "text"）按空回复处理
-      if (isKeyEchoText(fallback.text)) {
+      if (!prose || isKeyEchoText(prose)) {
         return { text: '', emotion: defWord(palette), sentences: [], emotionSegments: [], chunks: [], background, rawEmotions: [] }
       }
       // kind 显式 speak（理由同上：缺 kind + （ 开头会被渲染端整条判旁白）
-      return { ...fallback, chunks: [{ text: fallback.text, emotion: fallback.emotion, kind: 'speak' as const }], rawEmotions: [] }
+      return {
+        text: prose,
+        emotion: defWord(palette),
+        sentences: splitSentences(prose),
+        emotionSegments: [{ startSentence: 0, emotion: defWord(palette) }],
+        chunks: [{ text: prose, emotion: defWord(palette), kind: 'speak' as const }],
+        background,
+        rawEmotions: [],
+      }
     } catch {
       const single: DialogueChunk = { text: content, emotion: defWord(palette) }
       return { text: content, emotion: defWord(palette), sentences: splitSentences(content), emotionSegments: [{ startSentence: 0, emotion: defWord(palette) }], chunks: [single], background, rawEmotions: [] }
@@ -685,7 +612,7 @@ export function parseDialogueJson(content: string, palette?: EmotionPaletteRef |
   if (emotionSegments.length === 0) emotionSegments.push({ startSentence: 0, emotion: defWord(palette) })
   const emotion = normalizeEmotion(items[items.length - 1]?.emotion ?? '', palette)
 
-  return { text, emotion, sentences, emotionSegments, chunks, background, rawEmotions: items.map((it) => it.emotion ?? '') }
+  return { text, emotion, sentences, emotionSegments, chunks, background, rawEmotions: items.map((it) => String(it.emotion ?? '')) }
 }
 
 /**

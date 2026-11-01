@@ -14,7 +14,7 @@
  */
 import { desktopCapturer, screen } from 'electron'
 import { resolveProfile } from '../apiProfiles'
-import { normalizeBaseURL } from '../aiClient'
+import { normalizeBaseURL, thinkingPatch } from '../aiClient'
 import { getSettings } from '../repository'
 import { resolveTargetWindow } from '../perception/foreground'
 import type { ScreenRange } from '../../../src/types'
@@ -47,6 +47,8 @@ export interface VisionConfig {
   baseURL: string
   apiKey: string
   model: string
+  /** 档案的思考开关：视觉模型同样会把预算烧在推理上（GLM-4.6V 等） */
+  enableThinking?: boolean
 }
 
 /** 一次感知的结果 */
@@ -331,6 +333,7 @@ async function describeWithVLM(jpegBase64: string, cfg: VisionConfig, style: Scr
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
       body: JSON.stringify({
         model: cfg.model,
+        ...(thinkingPatch(cfg.model, cfg.enableThinking) ?? {}),
         messages: [
           {
             role: 'user',

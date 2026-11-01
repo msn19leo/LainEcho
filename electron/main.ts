@@ -4,7 +4,7 @@
 import { app } from 'electron'
 import { initLogger } from './services/logger'
 import { ensureDataDirs } from './services/storage'
-import { pruneEmptySessions, migrateSpriteEmotionMaps, dedupeFailedUserResends, getSettings } from './services/repository'
+import { pruneEmptySessions, migrateSpriteEmotionMaps, migratePaletteLabels, dedupeFailedUserResends, getSettings } from './services/repository'
 import { cleanupExpiredImages } from './services/chatImages'
 import { migrateApiProfiles } from './services/apiProfiles'
 import { compensateMissingVectors } from './services/memory/memoryVectors'
@@ -16,6 +16,7 @@ import { registerAllIpc } from './ipc'
 import { disposeSbv2Server } from './services/sbv2Tts'
 import { syncNativeTheme } from './services/nativeTheme'
 import { windowManager } from './windows/windowManager'
+import { applyPetWindowSettings } from './windows/petWindow'
 
 // pet-res:// 特权 scheme 必须在 app ready 之前注册
 registerPetSchemesPrivileged()
@@ -35,7 +36,10 @@ if (!gotLock) {
     await ensureDataDirs()
     // 原生主题跟随应用主题（必须早于建窗）：
     // 不同步时，系统深色 + 应用浅色会让文本输入光标被画成白色，落在浅色输入框上等于消失
-    syncNativeTheme((await getSettings()).theme)
+    const startupSettings = await getSettings()
+    syncNativeTheme(startupSettings.theme)
+    // 桌宠窗口尺寸/位置（必须早于建窗：createPetWindow 读的是模块内缓存的目标值）
+    applyPetWindowSettings(startupSettings.petWindow)
     // 清理历史遗留的空会话（无消息 = 从未使用）
     await pruneEmptySessions().catch((err) => console.error('清理空会话失败', err))
     // 聊天图片保留期清理（imageRetentionDays=0 时跳过；只删文件不改消息，失败不影响启动）
@@ -61,7 +65,10 @@ if (!gotLock) {
     void migrateMemoryPerspectives().then(() => compensateMissingVectors())
 
     // 立绘状态迁移（一次性，幂等）：旧 emotionMap（6 枚举→图）→ 状态词表条目并剥离旧字段
-    void migrateSpriteEmotionMaps().catch((err) => console.error('[migrate] 立绘状态迁移失败', err))
+    await migrateSpriteEmotionMaps().catch((err) => console.error('[migrate] 立绘状态迁移失败', err))
+
+    // 状态标签合并（一次性，幂等）：一图多词条 → 一条标签、剥 gloss、固化编号顺序
+    await migratePaletteLabels().catch((err) => console.error('[migrate] 状态标签合并失败', err))
 
     // 示例剧本：首次启动写入 data/stories/（已存在不覆盖）
     await ensureSampleStories().catch((err) => console.error('[story] 示例剧本写入失败', err))

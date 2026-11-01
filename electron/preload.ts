@@ -87,7 +87,7 @@ const api: WindowApi = {
       return () => ipcRenderer.removeListener('memory:changed', listener)
     },
     /** 语义搜索已确认记忆（向量检索；嵌入未配置返回空数组） */
-    semanticSearch: (query, topK) => ipcRenderer.invoke('memory:semantic-search', { query, topK }),
+    semanticSearch: (query, topK, filters) => ipcRenderer.invoke('memory:semantic-search', { query, topK, ...(filters ?? {}) }),
     /** 手动重嵌全部已确认记忆 */
     reembedAll: () => ipcRenderer.invoke('memory:reembed-all'),
     /** 测试嵌入配置连通性（独立地址/模型/Key） */
@@ -135,13 +135,28 @@ const api: WindowApi = {
     remove: (modelId) => ipcRenderer.invoke('model:remove', modelId),
     coreStatus: () => ipcRenderer.invoke('model:core-status'),
     importCore: () => ipcRenderer.invoke('model:import-core'),
+    playMotion: (group) => ipcRenderer.invoke('model:play-motion', group),
+    /** 取当前模型的参数能力表（未加载 = null） */
+    profile: (modelId) => ipcRenderer.invoke('model:profile', modelId),
+    /** 订阅能力表更新（桌宠窗加载完模型后推送） */
+    onProfile: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, profile: import('../src/types').ModelProfile) => cb(profile)
+      ipcRenderer.on('settings:model-profile', listener)
+      return () => ipcRenderer.removeListener('settings:model-profile', listener)
+    },
+    stateExpression: () => ipcRenderer.invoke('model:state-expression'),
+    onStateExpression: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, name: string | null) => cb(name)
+      ipcRenderer.on('settings:state-expression', listener)
+      return () => ipcRenderer.removeListener('settings:state-expression', listener)
+    },
   },
   sprite: {
     list: () => ipcRenderer.invoke('sprite:list'),
     importFromFolder: () => ipcRenderer.invoke('sprite:import-from-folder'),
     remove: (spriteId) => ipcRenderer.invoke('sprite:remove', spriteId),
     update: (spriteId, patch) => ipcRenderer.invoke('sprite:update', spriteId, patch),
-    annotate: (spriteId) => ipcRenderer.invoke('sprite:annotate', spriteId),
+    annotate: (spriteId, opts) => ipcRenderer.invoke('sprite:annotate', spriteId, opts),
     onChanged: (cb) => {
       const listener = () => cb()
       ipcRenderer.on('pet:sprites-changed', listener)
@@ -182,6 +197,7 @@ const api: WindowApi = {
     /** 打开聊天窗口，并可选指定要进入的会话 id（宠物窗点开时带当前会话） */
     openChatWithSession: (sessionId) => ipcRenderer.send('app:open-chat', sessionId),
     openSettings: () => ipcRenderer.send('app:open-settings'),
+    openExternal: (url) => ipcRenderer.invoke('app:open-external', url) as Promise<string>,
     setPetCard: (payload) => ipcRenderer.send('app:set-pet-card', payload),
     quit: () => ipcRenderer.send('app:quit'),
     /** 通知桌宠窗口播放语音（AI 回复后由聊天窗口调用，触发 TTS 合成+口型同步） */
@@ -233,6 +249,23 @@ const api: WindowApi = {
       const listener = (_e: Electron.IpcRendererEvent, settings: ModelSettings) => cb(settings)
       ipcRenderer.on('pet:model-settings-changed', listener)
       return () => ipcRenderer.removeListener('pet:model-settings-changed', listener)
+    },
+    /** 上报"当前状态表情"给主进程（设置窗用它标记外观项） */
+    reportStateExpression: (name) => ipcRenderer.send('pet:state-expression', name),
+    /** 上报当前模型的参数能力表（加载完成后调用一次） */
+    reportModelProfile: (profile) => ipcRenderer.send('pet:model-profile', profile),
+    /** 取消当前状态表情（设置窗外观点"·状态"项时触发） */
+    dismissStateExpression: () => ipcRenderer.invoke('model:dismiss-state-expression'),
+    onDismissStateExpression: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('pet:dismiss-state-expression', listener)
+      return () => ipcRenderer.removeListener('pet:dismiss-state-expression', listener)
+    },
+    /** 订阅「播放指定动作」指令（设置窗口一键动作） */
+    onPlayMotion: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, group: string) => cb(group)
+      ipcRenderer.on('pet:play-motion', listener)
+      return () => ipcRenderer.removeListener('pet:play-motion', listener)
     },
     /** 全局鼠标坐标变化回调（窗口相对坐标，由主进程 screen.getCursorScreenPoint 轮询） */
     onCursorMove: (cb) => {
@@ -363,6 +396,8 @@ const api: WindowApi = {
     export: (scriptId) => ipcRenderer.invoke('story:export', scriptId),
     remove: (scriptId) => ipcRenderer.invoke('story:remove', scriptId),
     listRuns: () => ipcRenderer.invoke('story:list-runs'),
+    /** 当前正在跑的那场演出（内存态）；未在演出时为 null */
+    getActiveRun: () => ipcRenderer.invoke('story:active-run'),
     deleteRun: (runId) => ipcRenderer.invoke('story:delete-run', runId),
     start: (params) => ipcRenderer.invoke('story:start', params),
     listBackgrounds: () => ipcRenderer.invoke('story:list-backgrounds'),
@@ -377,7 +412,19 @@ const api: WindowApi = {
     consolidateMemory: (runId) => ipcRenderer.invoke('story:consolidate-memory', runId) as Promise<{ ok: boolean; nothing?: boolean; written?: number; error?: string }>,
     setSpriteView: (runId, view) => ipcRenderer.invoke('story:set-sprite-view', { runId, view }),
     synthesize: (params) => ipcRenderer.invoke('story:tts-synthesize', params),
+    /** 语音缓存：统计 / 清理 / 打开文件夹 */
+    voiceCacheStats: () => ipcRenderer.invoke('story:voice-cache-stats'),
+    voiceCacheClean: (opts) => ipcRenderer.invoke('story:voice-cache-clean', opts),
+    voiceCacheOpen: () => ipcRenderer.invoke('story:voice-cache-open') as Promise<string>,
     openWindow: () => ipcRenderer.send('app:open-story-window'),
+    /** 打开剧情窗重看某场存档（只读：不启动引擎、不产生新消息） */
+    openReplay: (runId) => ipcRenderer.invoke('story:open-replay', runId),
+    /** 剧情窗收到回放启动指令（窗口被 openReplay 打开时下发） */
+    onReplayInit: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { runId: string }) => cb(payload)
+      ipcRenderer.on('story:replay-init', listener)
+      return () => ipcRenderer.removeListener('story:replay-init', listener)
+    },
     /** 打开/聚焦可视化编辑器窗口（7.6），并载入指定剧本 */
     openEditor: (scriptId) => ipcRenderer.invoke('story:open-editor', scriptId),
     /** 新增骨架剧本并直接进入编辑器 */

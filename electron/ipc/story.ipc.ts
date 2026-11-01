@@ -3,21 +3,22 @@
  * 演出控制（start/respond/stop）、状态查询（get-state）、剧情 TTS 合成、背景库（7.3）、
  * AI 辅助写剧本（7.4）、可视化编辑器读写（7.6）、剧情窗就绪补发。
  */
-import { dialog, ipcMain } from 'electron'
+import { dialog, ipcMain, shell } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { windowManager } from '../windows/windowManager'
 import { createEditorWindow, getEditorScriptId, getEditorWindow } from '../windows/editorWindow'
 import { exportScriptToZip, importFromDir, importFromZip, listScripts, loadBundleFromDir, removeScript } from '../services/storyEngine/loader'
-import { validateChapter, validateMeta, STANDARD_EMOTIONS } from '../services/storyEngine/schema'
+import { validateChapter, validateMeta } from '../services/storyEngine/schema'
 import { deleteRun, getRun, listRuns } from '../services/storyEngine/runs'
 import { listBackgrounds, removeBackground, uploadBackgrounds } from '../services/storyEngine/backgrounds'
 import { listMusics, removeMusic, uploadMusics } from '../services/storyEngine/musics'
 import { generateStoryDraft, importStoryDraft } from '../services/storyEngine/draft'
-import { getStorySnapshot, resendStoryState, respondStory, setRunSpriteView, startStory, stopStory } from '../services/storyEngine/engine'
+import { getActiveRun, getStorySnapshot, resendStoryState, respondStory, setRunSpriteView, startStory, stopStory } from '../services/storyEngine/engine'
 import { consolidateStoryMemory } from '../services/storyEngine/storyMemory'
-import { getGenieConfig, synthesizeGenie } from '../services/genieTts'
+import { cleanVoiceCache, getVoiceCacheStats, synthesizeStoryVoice } from '../services/storyVoiceCache'
+import { checkGenie, getGenieConfig, isGenieManuallyStopped, synthesizeGenie } from '../services/genieTts'
 import { getSbv2Status, synthesizeSbv2FromCard } from '../services/sbv2Tts'
 import { getSpritePalette, getTTSModel, genId, paletteHash } from '../services/repository'
 import { paths } from '../services/storage'
@@ -36,8 +37,8 @@ async function resolveStoryVoiceEngine(voice: StoryVoiceConfig | null): Promise<
 
 /**
  * 开始演出前的就绪检查。
- * SBV2 需要 sidecar 常驻，未启动时整场演出会静默无声——必须在启动前拦下并说明原因，
- * 否则用户只会看到「剧情没有语音」而不知道去哪修。
+ * 本地引擎都需要服务常驻：SBV2 sidecar / Genie-TTS 服务未启动时整场演出会静默无声，
+ * 必须在启动前拦下并说明原因，否则用户只会看到「剧情没有语音」而不知道去哪修。
  */
 async function assertStoryVoiceReady(voice: StoryVoiceConfig | null): Promise<void> {
   if (!voice?.ttsModelId) return
@@ -45,16 +46,29 @@ async function assertStoryVoiceReady(voice: StoryVoiceConfig | null): Promise<vo
   if (!model) throw new Error('语音模型卡不存在，请在「设置 → 剧情演出 → 语音」中重新选择')
 
   const engine = await resolveStoryVoiceEngine(voice)
-  if (engine !== 'sbv2') return
-
-  const st = getSbv2Status()
-  if (st.state === 'ready') return
-  if (st.state === 'starting') {
-    throw new Error('本地 SBV2 正在加载模型，请等几秒后再开始演出')
+  if (engine === 'sbv2') {
+    const st = getSbv2Status()
+    if (st.state === 'ready') return
+    if (st.state === 'starting') {
+      throw new Error('本地 SBV2 正在加载模型，请等几秒后再开始演出')
+    }
+    throw new Error(
+      '本地 SBV2 服务未启动：请先到「设置 → 语音合成 → 本地 SBV2」点击【启动服务】，再回到这里开始演出',
+    )
   }
-  throw new Error(
-    '本地 SBV2 服务未启动：请先到「设置 → 语音合成 → 本地 SBV2」点击【启动服务】，再回到这里开始演出',
-  )
+  if (engine === 'genie') {
+    const cfg = await getGenieConfig()
+    const health = await checkGenie(cfg.baseUrl)
+    if (health.ok) return
+    if (isGenieManuallyStopped()) {
+      throw new Error(
+        'Genie-TTS 服务已停止，请先到「设置 → 语音合成 → Genie-TTS」启动服务后再开始演出',
+      )
+    }
+    throw new Error(
+      'Genie-TTS 服务未启动或无法连接，请先到「设置 → 语音合成 → Genie-TTS」启动服务后再开始演出',
+    )
+  }
 }
 
 /** 校验 id 形态，防止路径穿越 */
@@ -127,6 +141,9 @@ export function registerStoryIpc(): void {
 
   // ---------------- run 存档 ----------------
 
+  /** 当前是否有一场演出在跑（内存态，非存档状态） */
+  ipcMain.handle('story:active-run', () => getActiveRun())
+
   ipcMain.handle('story:list-runs', () => listRuns())
 
   ipcMain.handle('story:delete-run', async (_e, runId: string) => {
@@ -149,7 +166,7 @@ export function registerStoryIpc(): void {
       if (p.mode !== 'resume' && p.mode !== 'start') throw new Error('缺少启动模式')
       if (p.mode === 'resume' && (typeof p.runId !== 'string' || !p.runId)) throw new Error('继续演出缺少 runId')
       if (p.backgroundOverride != null && (typeof p.backgroundOverride !== 'string' || !p.backgroundOverride)) throw new Error('非法覆盖背景')
-      // 本地引擎（尤其 SBV2）未就绪时直接拦下，避免"开场无声"这种无从排查的失败
+      // 本地引擎（SBV2 / Genie-TTS）未就绪时直接拦下，避免"开场无声"这种无从排查的失败
       await assertStoryVoiceReady(p.voice ?? null)
       const res = await startStory({
         scriptId: p.scriptId,
@@ -398,15 +415,15 @@ export function registerStoryIpc(): void {
         }
       }))
       const metaRaw = storyYaml ? (parseYaml(storyYaml) as Record<string, unknown> | null) : null
-      // 创作词表：绑定立绘集的词表词（状态下拉动态化）；未绑定/未启用词表时为 null（编辑器退回旧 6 枚举）
+      // 创作词表：绑定立绘集的词表词（状态下拉动态化）；未绑定 = 内置最小词表（仅默认词）
       const boundSpriteSetId = typeof metaRaw?.['spriteSetId'] === 'string' ? metaRaw['spriteSetId'] : null
       const palette = await getSpritePalette(boundSpriteSetId)
       // 词表变化检测：story.yaml 记录的 vocabHash 与当前词表指纹不一致 = 绑定后词表被编辑过
       const storedHash = typeof metaRaw?.['vocabHash'] === 'string' ? metaRaw['vocabHash'] : null
       const currentHash = paletteHash(palette)
       const paletteChanged = !!palette && !!storedHash && !!currentHash && currentHash !== storedHash
-      // 未知状态词盘点：事件引用但不在当前值域（绑定=词表词；未绑定=旧 6 枚举）的词，去重
-      const refWords = new Set<string>(palette ? palette.entries.map((e) => e.name) : (STANDARD_EMOTIONS as readonly string[]))
+      // 未知状态词盘点：事件引用但不在当前词表的词，去重（词表永不为 null，未绑定即内置最小词表）
+      const refWords = new Set<string>(palette.entries.map((e) => e.name))
       const staleWords = new Set<string>()
       for (const ch of bundle?.chapters ?? []) {
         for (const ev of ch.def.events) {
@@ -572,43 +589,61 @@ export function registerStoryIpc(): void {
 
   // ---------------- 剧情 TTS（本地 Genie 声库，与角色卡声音模块解耦） ----------------
 
-  ipcMain.handle('story:tts-synthesize', async (_e, params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2' }) => {
-    try {
-      const { ttsModelId, language, text, engine } = params ?? ({} as typeof params)
-      if (typeof ttsModelId !== 'string' || !ttsModelId) throw new Error('缺少声库模型')
-      const model = await getTTSModel(ttsModelId)
-      if (!model) throw new Error('声库模型卡不存在')
-      const cleaned = typeof text === 'string' ? text.trim() : ''
-      if (!cleaned) throw new Error('合成文本为空')
-
-      // 本地 SBV2：只读日文，取卡/翻译/规范化/随机度都在共用函数里（与角色卡语音同一份实现）
-      if ((engine ?? (model.engine === 'sbv2' ? 'sbv2' : 'genie')) === 'sbv2') {
-        const wav = await synthesizeSbv2FromCard({ ttsModelId, text: cleaned })
-        return { ok: true, audioBase64: Buffer.from(wav).toString('base64') }
+  /**
+   * 剧情语音合成：走落盘缓存（key = 引擎|声库|语言|文本）。
+   * 命中直接返回，未命中才真正调引擎 —— 同一句台词跨章节/跨 run 只合成一次。
+   */
+  ipcMain.handle(
+    'story:tts-synthesize',
+    async (_e, params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2'; allowSynthesize?: boolean }) => {
+      try {
+        const { ttsModelId, language, text, engine, allowSynthesize } = params ?? ({} as typeof params)
+        if (typeof ttsModelId !== 'string' || !ttsModelId) throw new Error('缺少声库模型')
+        const res = await synthesizeStoryVoice(
+          { ttsModelId, language: language === 'ja' ? 'ja' : 'zh', text: typeof text === 'string' ? text : '', engine },
+          allowSynthesize !== false,
+        )
+        if (!res.ok) {
+          // missing = 只查缓存未命中（重看时"不自动补充合成"的静默跳过路径）
+          return { ok: false, error: res.error, missing: 'missing' in res ? res.missing : undefined }
+        }
+        return { ok: true, audioBase64: Buffer.from(res.wav).toString('base64') }
+      } catch (err) {
+        console.warn('[story] TTS 合成失败：', err instanceof Error ? err.message : err)
+        return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }
+    },
+  )
 
-      const config = await getGenieConfig()
-      const wav = await synthesizeGenie({
-        config,
-        characterName: model.characterName,
-        onnxModelDir: model.onnxModelDir,
-        refAudioPath: model.refAudioPath || undefined,
-        refAudioText: model.refAudioText || undefined,
-        text: cleaned,
-        lang: language === 'ja' ? 'ja' : 'zh',
-      })
-      return { ok: true, audioBase64: Buffer.from(wav).toString('base64') }
-    } catch (err) {
-      console.warn('[story] TTS 合成失败：', err instanceof Error ? err.message : err)
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
-    }
+  // ---- 语音缓存管理（剧情设置页） ----
+  ipcMain.handle('story:voice-cache-stats', () => getVoiceCacheStats())
+  ipcMain.handle('story:voice-cache-clean', async (_e, opts: { olderThanDays?: number; all?: boolean } | undefined) => {
+    const removed = await cleanVoiceCache(opts ?? {})
+    return { removed, stats: await getVoiceCacheStats() }
+  })
+  ipcMain.handle('story:voice-cache-open', async () => {
+    await fs.mkdir(paths.storyVoiceCacheDir, { recursive: true })
+    return shell.openPath(paths.storyVoiceCacheDir)
   })
 
   // 剧情窗 renderer 就绪：直接向该窗口补发最新活跃 run 快照（迟到接入的恢复入口）
   ipcMain.on('story:renderer-ready', (e) => {
+    // 回放优先：窗口是被「重看」打开的，不要补发实时演出快照（否则会串进正在跑的另一场）
+    const replay = windowManager.consumePendingReplay()
+    if (replay) {
+      if (!e.sender.isDestroyed()) e.sender.send('story:replay-init', { runId: replay })
+      return
+    }
     const snapshot = resendStoryState()
     if (snapshot && !e.sender.isDestroyed()) {
       e.sender.send('story:state', snapshot)
     }
+  })
+
+  /** 打开剧情窗并以只读方式重看某场存档（不启动引擎、不产生新消息） */
+  ipcMain.handle('story:open-replay', (_e, runId: unknown) => {
+    if (typeof runId !== 'string' || !runId) return { ok: false, error: '缺少存档 id' }
+    windowManager.showStory(runId)
+    return { ok: true }
   })
 }

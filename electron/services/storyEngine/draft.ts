@@ -11,7 +11,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import type { CharacterCard, EmotionPaletteRef, StoryEvent, StoryImportReport } from '../../../src/types'
 import { builtinPalette } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { resolveProfile } from '../apiProfiles'
+import { llmRequest, resolveProfile } from '../apiProfiles'
 import { getCharacterCard, getSettings, getSpritePalette, paletteHash } from '../repository'
 import { paths } from '../storage'
 import { validateChapter, validateMeta, type SchemaIssue } from './schema'
@@ -207,8 +207,8 @@ function describeCard(card: CharacterCard): string {
 /** 组装生成提示词（事件 schema 全部以块状示例钉版——行内紧凑写法是非法 YAML，严禁模仿） */
 function buildGeneratePrompt(premise: string, card: CharacterCard | null, palette: EmotionPaletteRef): string {
   const cardBlock = card ? `\n【参考角色】\n剧本主角按下面的角色卡人设编写（台词风格与关系背景要贴合）：\n${describeCard(card)}\n` : ''
-  // 状态值域：按绑定立绘集词表生成（每词附释义；超 4 词分组换行）
-  const items = palette.entries.map((e) => (e.gloss.trim() ? `${e.name}(${e.gloss.trim()})` : e.name))
+  // 状态值域：按绑定立绘集词表生成（一行 = 一条标签；超 4 项分组换行）
+  const items = palette.entries.map((e) => e.name)
   const wordLines: string[] = []
   for (let i = 0; i < items.length; i += 4) wordLines.push('   ' + items.slice(i, i + 4).join(' / '))
   const defEntry = palette.entries.find((e) => e.name === palette.defaultEmotion)
@@ -332,15 +332,17 @@ export async function generateStoryDraft(params: { premise: string; cardId?: str
         { role: 'system', content: '你是资深的 galgame 剧本作者，严格按用户给出的格式契约输出 YAML 剧本，不输出任何多余内容。' },
         { role: 'user', content: buildGeneratePrompt(premise, card, palette) },
       ],
-      {
-        model: mainCfg.model,
-        baseURL: mainCfg.baseURL,
-        apiKey: mainCfg.apiKey,
-        temperature: 0.8,
-        stream: false,
-        // 整部剧本 YAML 一次产出：给足输出预算（思考型模型的 reasoning 同样计入）
-        maxTokensOverride: Math.max(settings.maxTokens ?? 0, 8192),
-      },
+      llmRequest(
+        mainCfg,
+        {
+          temperature: 0.8,
+          stream: false,
+          // 整部剧本 YAML 一次产出：给足输出预算（思考型模型的 reasoning 同样计入）
+          maxTokensOverride: Math.max(settings.maxTokens ?? 0, 8192),
+        },
+        // 输出必须是 YAML：不能让档案里的 response_format / tools 把格式带跑
+        { aux: true },
+      ),
     )
     let draft = normalizeDraftYaml(stripToFenceFreeYaml(raw), palette)
     if (!draft) return { ok: false, errors: [], error: '模型返回为空，请调整梗概后重试' }

@@ -458,3 +458,17 @@ textarea {
   box-shadow: 0 0 8px var(--primary-glow);
   cursor: pointer;
 }
+
+/* ---- 剧情窗背景处理 ----
+ * 蒙版颜色不能直接用 --bg-base：浅色主题下它是白色，会把插画洗成雾面（泛白光）。
+ * 深色需要压暗背景以突出亮色文字；浅色主题的文字本身是深色，不需要压暗，去掉蒙版保留插画原色。
+ * 底部渐变仍按主题给，因为对话框区域需要一层底来承载文字。 */
+:root {
+  --story-scrim: rgba(0, 0, 0, 0.42);
+  --story-fade: rgba(10, 10, 10, 0.92);
+}
+
+:root[data-theme='light'] {
+  --story-scrim: transparent;
+  --story-fade: rgba(255, 255, 255, 0.82);
+}

@@ -17,7 +17,7 @@
 import { powerMonitor } from 'electron'
 import { sendChatCompletion } from './aiClient'
 import { resolveAuxLlmConfig } from './auxModel'
-import type { ResolvedLlmConfig } from './apiProfiles'
+import { llmRequest, type ResolvedLlmConfig } from './apiProfiles'
 import { updateSessionSceneDigest } from './repository'
 import type { AppSettings, CharacterPersona, ChatMessage } from '../../src/types'
 
@@ -136,11 +136,12 @@ export async function updateSceneDigestAfterTurn(params: {
   if (!settings.enableSceneDigest) return
   const prev = prevDigest?.trim() ?? ''
   try {
-    // 辅助模型（未激活档案回落主模型档案）：机械型小任务，快速小模型足够
-    const aux = await resolveAuxLlmConfig()
-    const model = (aux?.model ?? mainCfg.model).trim()
-    const baseURL = (aux?.baseURL ?? mainCfg.baseURL).trim()
-    const key = aux?.apiKey || mainCfg.apiKey
+    // 辅助模型（未激活档案回落主模型）：机械型小任务，快速小模型足够。
+    // 档案上的思考开关/额外参数同样生效（此前手写三件套，开关从未被带进请求）
+    const cfg = (await resolveAuxLlmConfig()) ?? mainCfg
+    const baseURL = cfg.baseURL.trim()
+    const model = cfg.model.trim()
+    const key = cfg.apiKey
     if (!baseURL || !model || !key) return
     const system = [
       '你是场景状态记录员。根据"旧摘要"和"本轮对话"，输出更新后的当前情景摘要。',
@@ -168,18 +169,26 @@ export async function updateSceneDigestAfterTurn(params: {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      {
-        model,
-        baseURL,
-        apiKey: key,
-        stream: false,
-        maxTokensOverride: 300,
-        temperature: 0.2,
-        signal: AbortSignal.timeout(45000),
-      },
+      llmRequest(
+        cfg,
+        {
+          stream: false,
+          // 输出约 200 token，其余留给思考：思考长度不可预测，若仍被截断
+          // aiClient 会自动把预算翻倍重试一次（并打日志）
+          maxTokensOverride: 1024,
+          temperature: 0.2,
+          signal: AbortSignal.timeout(45000),
+        },
+        { aux: true },
+      ),
     )
     const text = (out ?? '').trim()
-    if (!text || text === prev) return
+    if (!text) {
+      // 空输出 = 最需要被看见的一种失败：此前静默 return，排查时完全无迹可寻
+      console.warn('[scene] 摘要返回为空（model=%s，预算 1024）—— 检查辅助模型的思考模式是否把预算吃光', model)
+      return
+    }
+    if (text === prev) return
     if (/^UNCHANGED$/i.test(text)) return
     await updateSessionSceneDigest(sessionId, text.slice(0, DIGEST_MAX_CHARS), {
       expectedSceneEpoch,
@@ -248,10 +257,10 @@ export async function rebuildSceneDigestAfterRewind(params: {
   if (!dialogue.trim()) return null
 
   const prev = previousDigest?.trim() ?? ''
-  const aux = await resolveAuxLlmConfig()
-  const model = (aux?.model ?? mainCfg.model).trim()
-  const baseURL = (aux?.baseURL ?? mainCfg.baseURL).trim()
-  const key = aux?.apiKey || mainCfg.apiKey
+  const cfg = (await resolveAuxLlmConfig()) ?? mainCfg
+  const baseURL = cfg.baseURL.trim()
+  const model = cfg.model.trim()
+  const key = cfg.apiKey
   if (!baseURL || !model || !key) return null
 
   const controller = new AbortController()
@@ -285,15 +294,11 @@ export async function rebuildSceneDigestAfterRewind(params: {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      {
-        model,
-        baseURL,
-        apiKey: key,
-        temperature: 0.2,
-        stream: false,
-        maxTokensOverride: 300,
-        signal: controller.signal,
-      },
+      llmRequest(
+        cfg,
+        { temperature: 0.2, stream: false, maxTokensOverride: 1024, signal: controller.signal },
+        { aux: true },
+      ),
     )
     const text = (out ?? '').trim()
     if (!text || /^UNCHANGED$/i.test(text)) {

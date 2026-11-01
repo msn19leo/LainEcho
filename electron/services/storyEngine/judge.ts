@@ -9,7 +9,7 @@
  */
 import type { ChatMessage, StoryAiJudge } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { resolveProfile } from '../apiProfiles'
+import { llmRequest, resolveProfile } from '../apiProfiles'
 import { getSettings } from '../repository'
 import type { RunRuntime } from './engine'
 
@@ -89,15 +89,17 @@ export async function judgeEnding(rt: RunRuntime, judge: StoryAiJudge): Promise<
         { role: 'system', content: JUDGE_SYSTEM_PROMPT },
         { role: 'user', content: userContent },
       ],
-      {
-        model: mainCfg.model,
-        baseURL: mainCfg.baseURL,
-        apiKey: mainCfg.apiKey,
-        temperature: 0.3,
-        stream: false,
-        // 思考型模型的 reasoning 计入 max_tokens：给足余量避免思考耗尽预算、content 为空
-        maxTokensOverride: Math.max(settings.maxTokens ?? 0, 2048),
-      },
+      llmRequest(
+        mainCfg,
+        {
+          temperature: 0.3,
+          stream: false,
+          // 思考型模型的 reasoning 计入 max_tokens：给足余量避免思考耗尽预算、content 为空
+          maxTokensOverride: Math.max(settings.maxTokens ?? 0, 2048),
+        },
+        // 输出必须是一个裸 id：档案里的 response_format 会把结果包成 JSON → 解析失败
+        { aux: true },
+      ),
     )
     const hit = matchOption(output, judge.options)
     if (!hit) {

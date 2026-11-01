@@ -12,12 +12,12 @@
  */
 import type { ChatImage, ChatMessage, ChatMessageMeta, TTSEngine, VisionReadMode } from '../../src/types'
 import { sendChatCompletion, type ApiContentPart, type ApiMessage } from './aiClient'
-import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, consumeLeadingNarration, stripParenGroups, emotionAdherence, splitLeadingNarrGroups, extractScriptChunkDelta, prepareScriptPartial, stripStreamWrappers } from './emotion'
+import { parseDialogueJson, extractStreamingJsonText, extractDialogueChunkDelta, salvageDialogueFromText, consumeLeadingNarration, stripParenGroups, emotionAdherence, emotionOrdinal, splitLeadingNarrGroups, extractScriptChunkDelta, prepareScriptPartial, stripStreamWrappers } from './emotion'
 import { buildModelContext, SUMMARY_MAX_TOKENS, toModelMessage, type ModelMessage } from './context'
 import { readImageAsBase64 } from './chatImages'
 import { describeChatImage } from './chatImageCaption'
 import { estimateMessagesTokens } from './token'
-import { resolveProfile, type ResolvedLlmConfig } from './apiProfiles'
+import { llmRequest, resolveProfile, type ResolvedLlmConfig } from './apiProfiles'
 import { resolveAuxLlmConfig } from './auxModel'
 import { buildSceneSection, buildCharacterBrief, updateSceneDigestAfterTurn } from './sceneContext'
 import { getForegroundTitle, summarizeWindowTitle } from './perception/foreground'
@@ -33,6 +33,7 @@ import {
   getSettings,
   updateSessionSummary,
 } from './repository'
+import { resolvePerformanceTarget } from '../../src/types'
 import type { EmotionPaletteRef } from '../../src/types'
 import { retrieveMemories } from './memory/retriever'
 import { windowManager } from '../windows/windowManager'
@@ -56,7 +57,7 @@ const HISTORY_JSON_TURNS = 6
  * 仅组装层动态注入：不进落盘历史、不影响记忆检索（与时间戳前缀同一策略）。
  */
 const TAIL_FORMAT_REMINDER =
-  '【格式提醒】你的整条回复必须且只能是一个 JSON 对象：{"dialogue":[{"text":"台词或旁白","emotion":"状态词","kind":"speak 或 narr"}]}——"emotion" 只能从角色状态词表中选取，kind="narr" 的 "text" 必须用圆括号（）完整包裹；除该 JSON 外一个字都不要输出（禁止 markdown 围栏、解释、开场白与后记）。'
+  '【格式提醒】你的整条回复必须且只能是一个 JSON 对象：{"dialogue":[{"text":"台词或旁白","emotion":1,"kind":"speak 或 narr"}]}——"emotion" 填状态清单里的**编号**（裸数字，不是词；写清单外的词会被丢弃并降级），相邻台词的情绪有变化就换编号，不要整段都用同一个；kind="narr" 的 "text" 必须用圆括号（）完整包裹；除该 JSON 外一个字都不要输出（禁止 markdown 围栏、解释、开场白与后记）。'
 
 /**
  * ① 历史格式示范：把最近 N 条含 chunks 的 assistant 消息改写为紧凑 dialogue JSON 内容。
@@ -65,15 +66,67 @@ const TAIL_FORMAT_REMINDER =
  * 落在 history 最开头——会话变长后离生成点数千字符，最近几十条全是纯文本 few-shot，诱导力
  * 反转压过契约（2026-10-20 00:46 轮实锤：msgs 47 起连续 8 轮漂移直通，msgs<45 时全 JSON）。
  */
-function backfillHistoryJson(history: ChatMessage[]): ChatMessage[] {
+function backfillHistoryJson(history: ChatMessage[], palette?: EmotionPaletteRef | null): ChatMessage[] {
   /** 命中索引 → JSON 内容（先收集再改写，遍历顺序不影响配额归属） */
   const rewrite = new Map<number, string>()
+  /** 诊断：回填了几条、各原因跳过了几条 */
+  const stats = { backfilled: 0, unknownLabel: 0, uniform: 0 }
+  /** 全同消息最多保留 1 条：它会被当成"合法示例"，但连续出现就成了自我强化的示范 */
+  let uniformKept = 0
   for (let i = history.length - 1; i >= 0 && rewrite.size < HISTORY_JSON_TURNS; i--) {
     const m = history[i]!
     if (m.role !== 'assistant' || m.meta?.proactive) continue
     const chunks = (m.chunks ?? []).filter((c) => typeof c.text === 'string' && c.text.trim())
     if (chunks.length === 0) continue
-    rewrite.set(i, JSON.stringify({ dialogue: chunks.map((c) => ({ text: c.text, emotion: c.emotion, kind: c.kind ?? 'speak' })) }))
+
+    // ① 情绪必须全部能在**当前词表**里找到，否则整条保持纯文本。
+    //    早先找不到就落默认编号：切换词表后，旧消息的 `开心`、`平静` 全变成同一个
+    //    默认编号，模型看到"最近几轮全是它"，下一轮整段照抄（2026-10-31 实锤）。
+    const ordinals: number[] = []
+    let unknown = false
+    for (const c of chunks) {
+      const n = emotionOrdinal(c.emotion, palette)
+      if (n === null) {
+        unknown = true
+        break
+      }
+      ordinals.push(n)
+    }
+    if (unknown) {
+      stats.unknownLabel++
+      continue
+    }
+
+    // ② 全同消息（≥3 项且编号相同）最多保留最近 1 条。
+    //    模型自己偷懒输出的"6 项同一个编号"会被原样喂回，下一轮继续抄——自我强化回路。
+    const uniform = ordinals.length >= 3 && ordinals.every((n) => n === ordinals[0]!)
+    if (uniform) {
+      if (uniformKept >= 1) {
+        stats.uniform++
+        continue
+      }
+      uniformKept++
+    }
+
+    rewrite.set(
+      i,
+      JSON.stringify({
+        dialogue: chunks.map((c, j) => ({
+          text: c.text,
+          emotion: ordinals[j]!,
+          kind: c.kind ?? 'speak',
+        })),
+      }),
+    )
+    stats.backfilled++
+  }
+  if (stats.backfilled + stats.unknownLabel + stats.uniform > 0) {
+    console.log(
+      '[chat] 历史回填 %d 条（跳过：未知标签 %d、全同 %d）',
+      stats.backfilled,
+      stats.unknownLabel,
+      stats.uniform,
+    )
   }
   if (rewrite.size === 0) return history
   return history.map((m, i) => {
@@ -255,15 +308,11 @@ export function createSummarizer(cfg: ResolvedLlmConfig, signal?: AbortSignal) {
         { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
         { role: 'user', content: `以下是对话历史：\n${olderText}\n\n请输出总结：` },
       ],
-      {
-        model: cfg.model,
-        baseURL: cfg.baseURL,
-        apiKey: cfg.apiKey,
-        temperature: 0.3,
-        stream: false,
-        maxTokensOverride: SUMMARY_MAX_TOKENS,
-        signal,
-      },
+      llmRequest(
+        cfg,
+        { temperature: 0.3, stream: false, maxTokensOverride: SUMMARY_MAX_TOKENS, signal },
+        { aux: true },
+      ),
     )
     const trimmed = (summary ?? '').trim()
     if (!trimmed) throw new Error('摘要为空')
@@ -540,31 +589,34 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       history = session.messages
       prevSceneDigest = session.sceneDigest
     }
-    // 状态词表分轨（演出词表双轨对等）：演出形象二选一，词表跟着形象走——
-    // sprite 模式 → 立绘集词表（剧情轮恒 sprite：run.spriteId > 角色卡绑定 > 全局选中）；
-    // live2d 模式 → Live2D 模型词表（角色卡绑定模型 > 全局选中模型）。
-    // 模式判定与渲染端同口径：角色卡显式 renderMode > 全局形象（selectedSpriteId 非空 = sprite）。
+    // 状态词表分轨（演出词表双轨对等）：演出形象二选一，词表跟着形象走。
+    // **解析规则与渲染端共用 resolvePerformanceTarget**——此前这里写成
+    // `card?.spriteId ?? 全局`，不看 renderMode，导致卡片在「跟随全局」时仍用旧绑定：
+    // 画面跟着全局切换，词表却停留在卡片绑定的那一套（2026-10-31 定位）。
     // 两轨词表为空都落内置最小词表（仅"平静"），永不返回 null。
     const modelSettings = await getModelSettings()
-    const paletteMode: 'live2d' | 'sprite' = store
-      ? 'sprite'
-      : (card?.renderMode ?? (modelSettings.selectedSpriteId ? 'sprite' : 'live2d'))
+    const performance = resolvePerformanceTarget({
+      card,
+      selectedSpriteId: modelSettings.selectedSpriteId ?? null,
+      selectedModelId: modelSettings.selectedModelId ?? null,
+      spriteIdOverride,
+      // 剧情轮恒 sprite（run.spriteId 已由 override 传入）
+      forceMode: store ? 'sprite' : null,
+    })
     let emotionPalette: EmotionPaletteRef
-    if (paletteMode === 'live2d') {
-      const modelId = card?.modelId ?? modelSettings.selectedModelId ?? null
-      emotionPalette = await getModelPalette(modelId)
+    if (performance.mode === 'live2d') {
+      emotionPalette = await getModelPalette(performance.modelId)
       console.log(
         '[chat] 状态词表 mode=live2d model=%s（%d 词，默认「%s」）',
-        modelId ?? '无',
+        performance.modelId ?? '无',
         emotionPalette.entries.length,
         emotionPalette.defaultEmotion,
       )
     } else {
-      const emotionSpriteId = spriteIdOverride ?? card?.spriteId ?? modelSettings.selectedSpriteId ?? null
-      emotionPalette = await getSpritePalette(emotionSpriteId)
+      emotionPalette = await getSpritePalette(performance.spriteId)
       console.log(
         '[chat] 状态词表 mode=sprite sprite=%s（%d 词，默认「%s」）',
-        emotionSpriteId ?? '无',
+        performance.spriteId ?? '无',
         emotionPalette.entries.length,
         emotionPalette.defaultEmotion,
       )
@@ -601,7 +653,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       ),
     }
     if (!store) {
-      console.log('[memory] 注入条数=%d 画像=%s 模式=%s（分层：约定≤10 事实≤5 经历≤8）', retrievalItems.length, profileDigest ? 'yes' : 'no', memoryRetrievalMode)
+      console.log('[memory] 注入条数=%d 画像=%s 模式=%s（分层：约定承诺≤10 用户信息≤5 长期经历≤8）', retrievalItems.length, profileDigest ? 'yes' : 'no', memoryRetrievalMode)
     }
 
     // A1+A2 上下文组装：历史（剧情 = run.messages）+ 本轮 user 消息 → 净化 → 预算装填/自动摘要
@@ -609,7 +661,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     // ① 历史格式示范：最近 N 条 assistant 以紧凑 dialogue JSON 回传（见 backfillHistoryJson 注释）
     // 时间感知（逐条绝对时间）：user 消息按自身 timestamp 注入时刻前缀（剧情轮豁免，
     // 见 annotateUserTimestamps 注释）；userMsg 带当前时间戳，本轮"现在几点"由此锚定
-    const timeAwareMessages = annotateUserTimestamps([...backfillHistoryJson(history), userMsg], settings.timeAwarenessEnabled, !!store)
+    const timeAwareMessages = annotateUserTimestamps([...backfillHistoryJson(history, emotionPalette), userMsg], settings.timeAwarenessEnabled, !!store)
     const modelMessages = prepareVisionMessages(
       timeAwareMessages.map(toModelMessageWithNarration),
       settings.vision.readMode,
@@ -825,7 +877,11 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
               { role: 'system', content: repairPrompt(attempt > 1) },
               { role: 'user', content: raw },
             ],
-            { model: aux?.model ?? mainCfg.model, baseURL: aux?.baseURL ?? mainCfg.baseURL, apiKey: aux?.apiKey ?? mainCfg.apiKey, temperature: 0.2, stream: false, maxTokensOverride: effectiveMaxTokens, signal: abort.signal },
+            llmRequest(
+              aux ?? mainCfg,
+              { temperature: 0.2, stream: false, maxTokensOverride: effectiveMaxTokens, signal: abort.signal },
+              { aux: true },
+            ),
           )
           const trimmed = (out ?? '').trim()
           if (!trimmed) {
@@ -871,10 +927,8 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
       let reasoningText = ''
       // 带图轮次：在发送前一刻才把图片读成 data URL（重试轮也会重新转，保证图片始终有效）
       const requestMessages = await toRequestMessages(attemptMessages, transientImage)
-      rawOutput = await sendChatCompletion(requestMessages, {
-        model: mainCfg.model,
-        baseURL: mainCfg.baseURL,
-        apiKey: mainCfg.apiKey,
+      // 档案级思考开关 + 额外参数统一经 llmRequest 注入（主任务不过滤 extraBody）
+      rawOutput = await sendChatCompletion(requestMessages, llmRequest(mainCfg, {
         temperature: settings.temperature,
         maxTokens: effectiveMaxTokens,
         stream: settings.stream,
@@ -889,7 +943,7 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         onReasoning: (chunk) => {
           reasoningText += chunk
         },
-      })
+      }))
       parsed = parseDialogueJson(maybeStrip(stripThink(rawOutput)), emotionPalette)
       // ④ 流式耗时观测：首块延迟（网络+思考）与总耗时，漂移直通标记一并打出
       console.log(
@@ -905,12 +959,12 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
         if (salvaged) {
           console.log('[chat] content 为空，已从思考通道提取到回复（免重试）')
           parsed = salvaged
-          // 文档补段（2026-10-28 主动识屏轮实锤）：这条路径下 content 通道全程为空，
-          // 流式期间 syncFromPartial 拿到空串 → 回合文档 segments 恒空；而语音在收尾时
-          // 按 parsed.chunks 一次性投放。桌宠直播气泡会挂载一个空文档、同时把落盘的定型
-          // 消息隐藏掉 → 表现为"语音期间气泡全空、播完才一次性出现"。此处用救回的 chunks
-          // 整体建段（startIdx=0，与语音槽位同源同序），气泡与门控即有内容可跟读。
-          turnCoordinator.appendRepairedSegments(salvaged.chunks, 0)
+          // 产物已替换 → 走与"结构修复"同一条增量续投链（2026-10-28 主动识屏轮、2026-10-29 下午轮实锤）：
+          // 流式期间 content 为空，若末尾已投出过旁白槽位（speechEmitted=true），收尾兜底的
+          // `!speechEmitted` 判定会整块跳过 → 剩余台词段全部无声；而补文档又只补文本不补语音。
+          // 置位后：startIdx 按 speechSegIdx 对齐（已投段不重播），appendRepairedSegments 从
+          // 该起点续接文档段，兜底块据此续投剩余语音。
+          repairAppended = true
         }
       }
       // ① LLM 结构修复：触发条件 = 解析为空、走了非 JSON 降级（rawEmotions
@@ -1064,20 +1118,29 @@ async function runChatTurnInner(params: ChatTurnParams): Promise<ChatMessage> {
     // 持久化：user 消息 + assistant 完整回复（剧情轮次写 run 文件，普通聊天写会话）
     const now = Date.now()
     // 状态依从统计（词表微调 P2a 观测）：模型输出的原始 emotion 命中词表/别名接住的比例，
-    // 无效值回落默认词单独计数——回落率持续偏高说明词表需要精简或释义不清（纯日志，零行为影响）
+    // 无效值回落默认词单独计数——回落率持续偏高说明词表覆盖不足（纯日志，零行为影响）
     const rawEmotions = parsed!.rawEmotions
     if (rawEmotions.length > 0) {
-      // miss 原始值一并打印：词表外的自由词（英文枚举/近义词/幻觉词）是词表精简与释义调优的输入；
-      // 全部原始值随行打印：观测模型是否过度使用默认词「平静」（词表/提示词调优的依据）
-      const missList = rawEmotions.filter((r) => emotionAdherence(r, emotionPalette) === 'miss')
+      // 三态统计：number=合规编号，label=模型退回写词（能归一但违约），miss=越界/表外
+      const verdicts = rawEmotions.map((r) => emotionAdherence(r, emotionPalette))
+      const numCount = verdicts.filter((v) => v === 'number').length
+      const labelCount = verdicts.filter((v) => v === 'label').length
+      const missList = rawEmotions.filter((_, i) => verdicts[i] === 'miss')
       console.log(
-        '[chat] 状态依从：%d/%d 命中词表 原始值=[%s]%s',
-        rawEmotions.length - missList.length,
+        '[chat] 状态依从：%d/%d 命中（编号 %d / 词 %d）原始值=[%s]%s',
+        numCount + labelCount,
         rawEmotions.length,
+        numCount,
+        labelCount,
         rawEmotions.join('、'),
         missList.length > 0 ? `（回落默认词 ${missList.length} 次，原始值见下一行）` : '',
       )
-      if (missList.length > 0) console.log('[chat] 状态依从 miss 原始值：%j', missList)
+      // 词命中 = 模型没按编号契约输出。行为上已被标签归一兜住，但这是提示词调优的信号
+      if (labelCount > 0) {
+        console.warn('[chat] 有 %d 项输出的是词而不是编号（模型漂移，已按标签归一）', labelCount)
+      }
+      // 表外值：越界编号或词表外的自由词，两种都说明契约被破坏
+      if (missList.length > 0) console.log('[chat] 状态依从 miss 原始值（应为 1..N 的编号）：%j', missList)
     }
     if (!store && needExitThinking && !voiceActive) {
       needExitThinking = false

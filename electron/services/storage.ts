@@ -155,6 +155,10 @@ export const paths = {
   get storyBackgroundsDir() {
     return path.join(getRootDir(), 'data', 'story-backgrounds')
   },
+  /** 剧情语音缓存（合成结果落盘，按内容哈希去重；可在剧情设置里清理） */
+  get storyVoiceCacheDir() {
+    return path.join(getRootDir(), 'data', 'voice-cache')
+  },
   /** 剧情音乐库目录（用户上传的音频；剧本 music 事件以 user:文件名 引用） */
   get storyMusicsDir() {
     return path.join(getRootDir(), 'data', 'story-music')

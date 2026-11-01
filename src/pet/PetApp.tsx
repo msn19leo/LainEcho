@@ -29,13 +29,16 @@ import { usePetReadingStore } from './petReadingStore'
 import { BUILTIN_DEFAULT_EMOTION, type ContextStats, type TTSEngine } from '../types'
 import { stripBrackets } from '../lib/utils'
 
-/** 桌宠窗口宽度固定（与主进程 PET_WIDTH 保持一致）。
- *  用固定像素而非 h-full/w-full：Windows 透明窗口拖动时 CSS 布局尺寸会被报告失真，
- *  百分比尺寸会跟着变大。钉死像素则完全不受影响。
- *  高度不固定：由"内容框高度 + 模型区 440 + 输入框高度"联动（主进程 setSize），模型区恒定。 */
-const PET_W = 300
-/** 模型区恒定高度：内容框收放/拖高不改变模型与立绘显示大小 */
-const MODEL_H = 440
+/** 窗口默认尺寸（与主进程 PET_DEFAULT_* 一致）；实际值来自设置 settings.petWindow */
+const DEFAULT_PET_W = 300
+const DEFAULT_PET_H = 480
+/**
+ * 尺寸用固定像素而非 h-full/w-full：Windows 透明窗口拖动时 CSS 布局尺寸会被报告失真，
+ * 百分比尺寸会跟着变大。像素值 + 设置驱动，既钉死又可调。
+ *
+ * 注意两者正交：窗口尺寸**只决定画布大小**，不缩放角色。Live2D/立绘按 PetStage 内的
+ * 常量基准（FIT_REF_*）适配，角色大小归「角色模型 → 缩放」管。
+ */
 /** 底部迷你输入框占用的固定高度 */
 const INPUT_H = 40
 /** 内容框展开时的默认高度（左上角角标可拖高） */
@@ -48,6 +51,21 @@ export default function PetApp() {
   const stageRef = useRef<PetStageHandle>(null)
   /** 方案A：当前回合文档 turnId（快照订阅更新；语音进度上行用） */
   const turnCoordinatorIdRef = useRef<string | null>(null)
+  /** 桌宠窗口尺寸（来自设置；只决定画布大小，不改变角色大小） */
+  const petWindow = useSettingsStore((s) => s.settings.petWindow)
+  const petW = petWindow?.width ?? DEFAULT_PET_W
+  const totalH = petWindow?.height ?? DEFAULT_PET_H
+  /** 模型区高度 = 整窗高 - 底部输入条 */
+  const modelH = Math.max(240, totalH - INPUT_H)
+
+  // 窗口尺寸变了 → 重建画布并重新适配。
+  // 显式传尺寸（设置值）而不是让 PetStage 去量 DOM：透明窗口拖动期间 clientWidth/Height
+  // 会报失真值，用它决定画布尺寸会被持续拉长。放到下一帧是为了等 CSS 应用完。
+  useEffect(() => {
+    const id = requestAnimationFrame(() => stageRef.current?.resize(petW, modelH))
+    return () => cancelAnimationFrame(id)
+  }, [petW, modelH])
+
   const [scalePct, setScalePct] = useState<number | null>(null)
   /** 迷你会话内容框：初始收起；展开高度可拖调（左上角角标）。高度持久化，重启恢复；展开态每次启动默认收起 */
   const [contentOpen, setContentOpen] = useState<boolean>(false)
@@ -741,14 +759,14 @@ export default function PetApp() {
 
   return (
     <div
-      style={{ width: PET_W, height: MODEL_H + INPUT_H }}
+      style={{ width: petW, height: totalH }}
       className="app-drag relative overflow-hidden"
       onWheel={onWheel}
     >
       {/* 模型区：始终满高（模型/立绘大小恒定）。根容器已是 app-drag（拖动窗口），这里不再标 drag，
           避免子级 drag 命中区覆盖交互按钮 */}
       <div
-        style={{ position: 'absolute', left: 0, right: 0, top: 0, height: MODEL_H, zIndex: 0 }}
+        style={{ position: 'absolute', left: 0, right: 0, top: 0, height: modelH, zIndex: 0 }}
       >
         <PetStage stageRef={stageRef} onStatus={() => {}} />
       </div>

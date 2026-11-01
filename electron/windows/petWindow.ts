@@ -5,17 +5,42 @@ import { BrowserWindow, screen } from 'electron'
 import path from 'path'
 import { loadWindowPage } from './base'
 
-const PET_WIDTH = 300
-/** 模型区基础高度（内容框作为半透明浮层叠加在模型上，不占用布局，模型区恒定）
- *  窗口总高 = 模型区 + 底部输入框；不随内容框变化 */
-const PET_MODEL_H = 440
-/** 底部输入框固定占高（与渲染层 INPUT_H 一致） */
-const PET_INPUT_H = 40
-/** 窗口目标高度：固定不变 */
-const currentPetHeight = PET_MODEL_H + PET_INPUT_H
+/** 默认整窗尺寸（DIP）。默认高度 = 模型区 440 + 底部输入条 40 */
+export const PET_DEFAULT_WIDTH = 300
+export const PET_DEFAULT_HEIGHT = 480
+/**
+ * 尺寸下限（有实际依据：再窄底部输入框与右侧按钮会挤在一起，再矮会裁到角色）。
+ * 上限只做"明显不合理值"的兜底 —— 真正的上限是显示器工作区，见 clampToWorkArea。
+ */
+const PET_MIN_WIDTH = 240
+const PET_MAX_WIDTH = 900
+const PET_MIN_HEIGHT = 380
+const PET_MAX_HEIGHT = 1000
+/** 未记录位置时的默认落点 */
+const PET_DEFAULT_X = 200
+const PET_DEFAULT_Y = 160
+
+/**
+ * 当前目标尺寸（来自设置，见 applyPetWindowSettings）。
+ *
+ * 尺寸**只决定画布大小**：角色适配基准是常量（PetStage 的 FIT_REF_*），
+ * 所以放大窗口得到的是更多留白，而不是一个更大的角色 —— 角色大小归「角色模型」的缩放管。
+ */
+let targetWidth = PET_DEFAULT_WIDTH
+let targetHeight = PET_DEFAULT_HEIGHT
+/** 期望位置（null = 尚未记录，用默认落点） */
+let targetPos: { x: number; y: number } | null = null
+
+const clampInt = (v: unknown, min: number, max: number, fallback: number): number => {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, Math.round(n)))
+}
 
 /** 当前宠物窗口引用（保留字段） */
 let petWin: BrowserWindow | null = null
+/** 位置落盘防抖计时器 */
+let boundsSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 /** 历史 IPC：内容框已改为浮层，不再调整窗口高度；保留导出避免破坏调用方 */
 export function setPetPanelHeight(_panelH: number): void {}
@@ -26,6 +51,79 @@ export function markPetWindowQuitting(): void {
   quitting = true
 }
 
+/** 夹进窗口所在显示器的可用区域（多显示器取重叠最多的那块） */
+function clampToWorkArea(bounds: Electron.Rectangle): Electron.Rectangle {
+  const area = screen.getDisplayMatching(bounds).workArea
+  const width = Math.min(bounds.width, area.width)
+  const height = Math.min(bounds.height, area.height)
+  return {
+    width,
+    height,
+    x: Math.min(Math.max(bounds.x, area.x), area.x + area.width - width),
+    y: Math.min(Math.max(bounds.y, area.y), area.y + area.height - height),
+  }
+}
+
+/**
+ * 应用桌宠窗口配置（启动时与设置保存后各调一次）。
+ *
+ * 调整现有窗口时以**底边中点**为锚：窗口长高时角色脚底不动、只是上方多出空间，
+ * 比默认的"左上角不动"自然得多。
+ */
+export function applyPetWindowSettings(cfg: {
+  width: number
+  height: number
+  /** 缺省 = 不改位置（改尺寸时不要动用户已经拖好的落点） */
+  x?: number | null
+  y?: number | null
+}): void {
+  targetWidth = clampInt(cfg.width, PET_MIN_WIDTH, PET_MAX_WIDTH, PET_DEFAULT_WIDTH)
+  targetHeight = clampInt(cfg.height, PET_MIN_HEIGHT, PET_MAX_HEIGHT, PET_DEFAULT_HEIGHT)
+  // 只改尺寸时不动 targetPos：渲染端手里的 x/y 可能是旧值，写进来会把刚拖好的落点顶掉。
+  // 显式传 null（而非缺省）才视为"清空位置，回到默认落点"。
+  if (cfg.x !== undefined || cfg.y !== undefined) {
+    targetPos =
+      typeof cfg.x === 'number' && typeof cfg.y === 'number' && Number.isFinite(cfg.x) && Number.isFinite(cfg.y)
+        ? { x: Math.round(cfg.x), y: Math.round(cfg.y) }
+        : null
+  }
+
+  const win = petWin
+  if (!win || win.isDestroyed()) return
+  const b = win.getBounds()
+  if (b.width === targetWidth && b.height === targetHeight) return
+  win.setBounds(
+    clampToWorkArea({
+      x: Math.round(b.x + (b.width - targetWidth) / 2),
+      y: Math.round(b.y + (b.height - targetHeight)),
+      width: targetWidth,
+      height: targetHeight,
+    }),
+  )
+  reassertTopmost(win)
+}
+
+/**
+ * 位置落盘：拖动结束后写一次 settings.petWindow.x/y。
+ * 只写文件、**不广播** settings:changed —— 否则每拖动一次，设置窗就要重读一遍全部设置。
+ */
+function persistBounds(win: BrowserWindow): void {
+  if (win.isDestroyed()) return
+  const b = win.getBounds()
+  if (boundsSaveTimer) clearTimeout(boundsSaveTimer)
+  boundsSaveTimer = setTimeout(() => {
+    boundsSaveTimer = null
+    if (win.isDestroyed()) return
+    void import('../services/repository')
+      .then(async ({ getSettings, saveSettings }) => {
+        const cur = await getSettings()
+        if (cur.petWindow.x === b.x && cur.petWindow.y === b.y) return
+        await saveSettings({ petWindow: { ...cur.petWindow, x: b.x, y: b.y } })
+      })
+      .catch((err) => console.warn('[petwin] 保存窗口位置失败:', err instanceof Error ? err.message : err))
+  }, 400)
+}
+
 /** 补置顶（幂等）：窗口存在且未销毁时重新写一次 HWND_TOPMOST，不抢焦点 */
 export function reassertTopmost(win: BrowserWindow): void {
   if (win.isDestroyed()) return
@@ -33,11 +131,14 @@ export function reassertTopmost(win: BrowserWindow): void {
 }
 
 export function createPetWindow(): BrowserWindow {
+  const bounds = clampToWorkArea({
+    x: targetPos?.x ?? PET_DEFAULT_X,
+    y: targetPos?.y ?? PET_DEFAULT_Y,
+    width: targetWidth,
+    height: targetHeight,
+  })
   const win = new BrowserWindow({
-    width: PET_WIDTH,
-    height: currentPetHeight,
-    x: 200,
-    y: 160,
+    ...bounds,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -90,12 +191,12 @@ export function createPetWindow(): BrowserWindow {
   })
 
   // 保险：Windows 上透明无边框窗口在拖动时尺寸可能被 DWM 漂移（即使 resizable:false），
-  // 一旦检测到尺寸偏离当前目标（宽固定 300、高随面板联动）立即钉回，保证拖动不会让窗口漂移变大。
+  // 一旦检测到尺寸偏离**当前目标**立即钉回。目标来自设置，所以调整尺寸不会和守卫打架。
   win.on('resize', () => {
     if (win.isDestroyed()) return
     const [w, h] = win.getSize()
-    if (w !== PET_WIDTH || h !== currentPetHeight) {
-      win.setSize(PET_WIDTH, currentPetHeight)
+    if (w !== targetWidth || h !== targetHeight) {
+      win.setSize(targetWidth, targetHeight)
       // 这次尺寸回正是拖动过程中唯一由我们发起的第二次窗口写入：它会把窗口插回普通层，
       // 置顶属性随之被清掉（表现为桌宠被其它窗口盖住、且点不到、无法自愈）。写完立刻补回置顶。
       reassertTopmost(win)
@@ -110,6 +211,8 @@ export function createPetWindow(): BrowserWindow {
     moveTimer = setTimeout(() => {
       moveTimer = null
       reassertTopmost(win)
+      // 拖动/程序化调整结束后记录位置（防抖在 persistBounds 内部）
+      persistBounds(win)
     }, 200)
   })
 
@@ -158,6 +261,10 @@ export function createPetWindow(): BrowserWindow {
       moveTimer = null
     }
     clearInterval(heartTimer)
+    if (boundsSaveTimer) {
+      clearTimeout(boundsSaveTimer)
+      boundsSaveTimer = null
+    }
     if (petWin === win) petWin = null
   })
 
@@ -166,5 +273,5 @@ export function createPetWindow(): BrowserWindow {
   return win
 }
 
-/** 窗口基础尺寸（宽度固定；高度随面板联动，见 currentPetHeight） */
-export const PET_WINDOW_SIZE = { width: PET_WIDTH, height: PET_MODEL_H }
+/** 窗口默认尺寸（历史导出：调用方若需要"当前尺寸"请读 settings.petWindow） */
+export const PET_WINDOW_SIZE = { width: PET_DEFAULT_WIDTH, height: PET_DEFAULT_HEIGHT }

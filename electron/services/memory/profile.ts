@@ -10,7 +10,7 @@
  */
 import type { MemoryProfile } from '../../../src/types'
 import { sendChatCompletion } from '../aiClient'
-import { resolveProfile } from '../apiProfiles'
+import { llmRequest, resolveProfile, type ResolvedLlmConfig } from '../apiProfiles'
 import { getCharacterCard, listMemories } from '../repository'
 import { normalizePerspective } from '../memoryExtraction'
 import { paths, readJson, mutateJson } from '../storage'
@@ -221,14 +221,14 @@ export interface ConsolidateLlm {
 }
 
 /** 组装 LLM 整理回调（走主 API 的 chat/completions，独立上下文） */
-export function createConsolidator(cfg: { model: string; baseURL: string; apiKey: string }): ConsolidateLlm {
+export function createConsolidator(cfg: ResolvedLlmConfig): ConsolidateLlm {
   const run = async (system: string, user: string): Promise<string> => {
     const raw = await sendChatCompletion(
       [
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { model: cfg.model, baseURL: cfg.baseURL, apiKey: cfg.apiKey, temperature: 0.3, stream: false, maxTokensOverride: CONSOLIDATE_MAX_TOKENS },
+      llmRequest(cfg, { temperature: 0.3, stream: false, maxTokensOverride: CONSOLIDATE_MAX_TOKENS }, { aux: true }),
     )
     return raw ?? ''
   }

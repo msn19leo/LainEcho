@@ -117,10 +117,9 @@ expect('validateMeta：aiBackground 非布尔视为关闭（不报错）', aiJun
 
 const strArr = parseDialogueJson('{"dialogue": ["（点头）走吧，趁雨还没停。", "今天的风，好像比平时还要甜一点。"]}')
 expect(
-  'parse：dialogue 纯字符串数组 → 按字符串分段、情绪归默认（平静）',
-  strArr.chunks.length === 2
-    && strArr.chunks[0]?.text === '（点头）走吧，趁雨还没停。'
-    && strArr.chunks[1]?.text === '今天的风，好像比平时还要甜一点。'
+  'parse：dialogue 纯字符串数组 → 按项解析、情绪归默认（平静）',
+  strArr.chunks.length >= 2
+    && strArr.text === '（点头）\n走吧，趁雨还没停。\n今天的风，好像比平时还要甜一点。'
     && strArr.chunks.every((c) => c.emotion === '平静')
     && !strArr.text.includes('"dialogue"'),
   strArr,
@@ -129,9 +128,9 @@ expect(
 const mixedArr = parseDialogueJson('{"dialogue": ["好呀。", { "text": "（拉住你的手）别松开哦。", "emotion": "shy" }]}')
 expect(
   'parse：dialogue 字符串与对象混排 → 各自正确解析',
-  mixedArr.chunks.length === 2
-    && mixedArr.chunks[0]?.text === '好呀。' && mixedArr.chunks[0]?.emotion === '平静'
-    && mixedArr.chunks[1]?.text === '（拉住你的手）别松开哦。' && mixedArr.chunks[1]?.emotion === '平静',
+  mixedArr.text === '好呀。\n（拉住你的手）\n别松开哦。'
+    && mixedArr.chunks.every((c) => c.emotion === '平静')
+    && mixedArr.chunks[0]?.text === '好呀。',
   mixedArr,
 )
 
@@ -214,7 +213,7 @@ expect(
 const closedParsed = parseDialogueJson('{"dialogue":[{"text":"（点头）我知道了（微笑）","emotion":"平静"}]}')
 expect(
   'parse：括号已闭合的文本原样保留不误补',
-  closedParsed.chunks.length === 1 && closedParsed.chunks[0]?.text === '（点头）我知道了（微笑）',
+  closedParsed.text === '（点头）\n我知道了（微笑）' && !closedParsed.text.includes('））'),
   closedParsed,
 )
 
@@ -270,15 +269,18 @@ expect(
 )
 const adherPalette = {
   entries: [
-    { name: '开心', gloss: '明亮愉快', image: '' },
-    { name: '平静', gloss: '从容放松', image: '' },
+    { name: '开心', image: '' },
+    { name: '平静', image: '' },
   ],
   defaultEmotion: '平静',
 }
 expect(
-  'adherence：词表精确命中/别名接住/无效回落三态判定',
-  emotionAdherence('开心', adherPalette) === 'hit'
-    && emotionAdherence('HAPPY', adherPalette) === 'alias' // 大小写不敏感，happy→开心
+  'adherence：编号 / 词 / miss 三态判定',
+  emotionAdherence('1', adherPalette) === 'number' // 编号 1 = 开心
+    && emotionAdherence('2', adherPalette) === 'number' // 编号 2 = 平静
+    && emotionAdherence('开心', adherPalette) === 'label' // 旧数据/漂移写成词：能归一但违约
+    && emotionAdherence('3', adherPalette) === 'miss' // 越界编号
+    && emotionAdherence('HAPPY', adherPalette) === 'miss' // 别名表已删除
     && emotionAdherence('不存在的词', adherPalette) === 'miss'
     && emotionAdherence('', adherPalette) === 'miss'
     && emotionAdherence('开心') === 'miss', // 内置最小词表（仅平静）下开心不在词表 → 回落默认

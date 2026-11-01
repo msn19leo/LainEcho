@@ -506,6 +506,13 @@ export interface ApiProfile {
    * 渲染端回传/落盘时忽略此字段）
    */
   hasKey?: boolean
+  /**
+   * 思考模式：undefined = 不注入（交给服务商默认）；false = 显式关闭；true = 显式开启。
+   * 关闭后首字延迟显著降低；DeepSeek Reasoner 等模型在字段缺失时会默认思考。
+   */
+  enableThinking?: boolean
+  /** 额外请求参数（JSON 对象字符串）：原样并入请求体，同名覆盖；解析失败则忽略 */
+  extraBody?: string
 }
 
 /**
@@ -674,6 +681,23 @@ export interface AppSettings {
   textSpeed: number
   /** 剧情窗对话框文字显示速度（0-100，独立于通用 textSpeed，仅剧情系统读取） */
   storyTextSpeed: number
+  /**
+   * 桌宠窗口尺寸与位置（整窗尺寸，高度含底部输入条）。
+   * 只决定窗口画布大小，**不影响** Live2D/立绘的显示大小 —— 后者由「角色模型」的缩放设置决定。
+   * x/y 为 null 表示尚未记录，启动时落在默认位置。
+   */
+  petWindow: PetWindowSettings
+}
+
+/** 桌宠窗口配置（见 AppSettings.petWindow） */
+export interface PetWindowSettings {
+  /** 窗口宽（DIP，240~520） */
+  width: number
+  /** 窗口高（DIP，380~820；模型区 = 高 - 40 输入条） */
+  height: number
+  /** 上次位置；null = 未记录。保存时缺省 = 保留磁盘上已有值（拖窗由主进程静默写入） */
+  x?: number | null
+  y?: number | null
 }
 
 /** Live2D 模型元信息（models/index.json） */
@@ -695,24 +719,123 @@ export interface Live2DModelMeta {
  */
 export const BUILTIN_DEFAULT_EMOTION = '平静'
 
-/** 内置默认状态的释义（prompt 与最小词表共用） */
-export const BUILTIN_DEFAULT_GLOSS = '从容放松'
-
 /**
  * 内置最小词表（每次返回新对象，调用方可自由改写）：
  * 单词条。立绘侧：解析落首图/说话图，等价旧的"无映射"行为；模型侧：无表情联动，回落静态表情。
  */
 export function builtinPalette(): EmotionPaletteRef {
   return {
-    entries: [{ name: BUILTIN_DEFAULT_EMOTION, gloss: BUILTIN_DEFAULT_GLOSS }],
+    entries: [{ name: BUILTIN_DEFAULT_EMOTION }],
     defaultEmotion: BUILTIN_DEFAULT_EMOTION,
   }
+}
+
+// ---------------- 状态标签（编号的唯一取值单位） ----------------
+
+/**
+ * 标签分隔符：中英文逗号、顿号、分号、换行。
+ * 用户输入 `开心, 高兴、快乐` 与 `开心，高兴，快乐` 等价。
+ */
+const LABEL_SEPARATORS = /[，,、;；\n\r]+/
+
+/**
+ * 把用户输入归一化成一条标签串：拆段 → 去空白 → 丢空段 → 去重 → 用「，」重连。
+ *
+ * 标签是**一个整体**（例如「开心，高兴，快乐」），不是三个独立状态：
+ * prompt 里它占一行、对应一个编号；解析时整串命中，任一段也能命中（见 labelMatches）。
+ */
+export function normalizeLabel(raw: string): string {
+  const parts = String(raw ?? '')
+    .split(LABEL_SEPARATORS)
+    .map((x) => x.trim())
+    .filter(Boolean)
+  const seen = new Set<string>()
+  const uniq: string[] = []
+  for (const part of parts) {
+    if (seen.has(part)) continue
+    seen.add(part)
+    uniq.push(part)
+  }
+  return uniq.join('，')
+}
+
+/** 把标签拆成段（用于段匹配与冲突校验） */
+export function splitLabel(label: string): string[] {
+  return String(label ?? '')
+    .split(LABEL_SEPARATORS)
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
+
+/**
+ * 标签匹配：整串相等，或任一段相等。
+ *
+ * 段匹配的两个用途：
+ *  1. 旧数据兼容——历史消息里存的是单段词（"不满"），合并成「不满，生气」后仍能命中；
+ *  2. 手工书写——剧本 YAML 写 "高兴" 等价于写 "开心，高兴，快乐"。
+ */
+export function labelMatches(query: string, label: string): boolean {
+  const q = String(query ?? '').trim()
+  const l = String(label ?? '').trim()
+  if (!q || !l) return false
+  if (q === l) return true
+  const qs = new Set(splitLabel(q))
+  if (qs.size === 0) return false
+  return splitLabel(l).some((seg) => qs.has(seg))
 }
 
 // ---------------- 2D 立绘 ----------------
 
 /** 立绘渲染模式：Live2D 动画 或 2D 静态切图（并行切换，统一形象层分发） */
 export type RenderMode = 'live2d' | 'sprite'
+
+/** 角色卡上的形象绑定（null = 未绑定 / 未指定，跟随全局） */
+export interface PerformanceBinding {
+  /** 卡片显式设定的形象模式；null = 跟随全局 */
+  renderMode?: RenderMode | null
+  /** 2D 立绘集绑定（仅在 renderMode='sprite' 时生效） */
+  spriteId?: string | null
+  /** Live2D 模型绑定（仅在 renderMode='live2d' 时生效） */
+  modelId?: string | null
+}
+
+/** 本轮的演出目标：用哪个模式、哪张立绘、哪个模型 */
+export interface PerformanceTarget {
+  mode: RenderMode
+  spriteId: string | null
+  modelId: string | null
+}
+
+/**
+ * 解析本轮实际使用的演出形象（**系统内唯一入口**）。
+ *
+ * 规则（渲染与词表必须共用，否则会出现"画面换了、词表没换"）：
+ *  1. 模式：强制模式 > 卡片显式模式 > 全局（有选中立绘集就立绘，否则 Live2D）
+ *  2. 卡片绑定**只在自己的固定模式下参与**：renderMode='sprite' 才认 spriteId，
+ *     'live2d' 才认 modelId；「跟随全局」时卡片里的绑定被忽略（它只是留着备用的值）
+ *  3. 绑定为空 → 落全局选中；再为空 → null（调用方按内置最小词表/默认形象处理）
+ *
+ * @param opts.spriteIdOverride 剧情 run 指定的立绘集（覆盖一切绑定）
+ * @param opts.forceMode 强制模式（剧情轮恒 sprite）
+ */
+export function resolvePerformanceTarget(opts: {
+  card?: PerformanceBinding | null
+  selectedSpriteId?: string | null
+  selectedModelId?: string | null
+  spriteIdOverride?: string | null
+  forceMode?: RenderMode | null
+}): PerformanceTarget {
+  const cardMode = opts.card?.renderMode ?? null
+  const mode: RenderMode = opts.forceMode ?? cardMode ?? (opts.selectedSpriteId ? 'sprite' : 'live2d')
+  const override = opts.spriteIdOverride?.trim() || null
+  const cardSprite = cardMode === 'sprite' ? (opts.card?.spriteId?.trim() || null) : null
+  const cardModel = cardMode === 'live2d' ? (opts.card?.modelId?.trim() || null) : null
+  return {
+    mode,
+    spriteId: override ?? cardSprite ?? (opts.selectedSpriteId?.trim() || null),
+    modelId: cardModel ?? (opts.selectedModelId?.trim() || null),
+  }
+}
 
 /** 立绘集内单张图片：按状态映射的目标文件（相对 sprites/{id}/） */
 export interface CharacterSpriteImage {
@@ -725,11 +848,13 @@ export interface CharacterSpriteImage {
  * prompt 的 emotion 值域 = 词表全部 name；解析链 = 精确命中 → 默认状态。
  */
 export interface SpritePaletteEntry {
-  /** 状态词（唯一，2-4 个中文字为宜，如"傲娇"） */
+  /**
+   * 状态标签（一张图一条，整串唯一）。
+   * 可含「，」分隔的多段同义/近义描述，如「害羞，心动，脸红」——**这是一个整体**，
+   * prompt 里占一个编号；不是三个独立状态。
+   */
   name: string
-  /** 中文释义（注入 prompt，帮助模型选词） */
-  gloss: string
-  /** 对应立绘文件（相对 sprites/{id}/；编辑器保存时必填校验） */
+  /** 对应立绘文件（相对 sprites/{id}/；编辑器保存时必填校验，且一张图只能有一条） */
   image: string
 }
 
@@ -738,11 +863,12 @@ export interface SpritePaletteEntry {
  * Live2D 模型与立绘集是二选一的演出形象，各自拥有独立的状态词表。
  */
 export interface ModelPaletteEntry {
-  /** 状态词（唯一，2-4 个中文字为宜） */
+  /**
+   * 状态标签（一条对一个表情，整串唯一）。可含「，」分隔的多段，如「害羞，心动」——
+   * 与立绘侧同构：一个编号 = 一条标签 = 一个视觉单元。
+   */
   name: string
-  /** 中文释义（注入 prompt，帮助模型选词） */
-  gloss: string
-  /** 联动的 Live2D 表情名（model3.json Expressions 的 Name；缺省 = 不联动表情） */
+  /** 联动的 Live2D 表情名（model3.json Expressions 的 Name；缺省 = 默认表情，编号恒为 1） */
   expression?: string
 }
 
@@ -759,7 +885,7 @@ export interface ModelPalette {
  * 任一词表为空时由 builtinPalette 返回内置最小词表（仅"平静"），系统内永远只有词表一条链。
  */
 export interface EmotionPaletteRef {
-  entries: Array<{ name: string; gloss: string }>
+  entries: Array<{ name: string }>
   /** 默认状态：必须是 entries 中某词的 name；兜底终点（系统唯一保留字） */
   defaultEmotion: string
 }
@@ -777,8 +903,13 @@ export interface CharacterSprite {
   images: CharacterSpriteImage[]
   /** 状态词表（唯一事实源；空数组 = 未打标，运行时按内置最小词表处理） */
   emotions: SpritePaletteEntry[]
-  /** 默认状态词（词表非空时必为 emotions 中某词；空串 = 未设置） */
-  defaultEmotion: string
+  /**
+   * 默认状态 = **哪一张图**（相对 sprites/{id}/ 的文件名；空串 = 未设置，落第一条标签的图）。
+   *
+   * 为什么不存标签文字：标签可能被两张图共用（视觉相似），用文字定位会同时点亮多个默认；
+   * 编号又不能存——编号只是每次渲染算出来的下标，增删图片就漂了。图文件名是稳定且唯一的。
+   */
+  defaultImage: string
   /** 说话立绘图（相对文件路径，空 = 未配置）：解析图等于默认图且正在说话时使用 */
   speakingImage: string | null
   /** 思考立绘图（相对文件路径，空 = 未配置）：AI 开始准备回答到输出文本前使用 */
@@ -798,12 +929,12 @@ export interface CharacterSprite {
  * 主进程归一化、prompt 注入、渲染端查表统一经此入口，永远不返回 null。
  */
 export function paletteFromSprite(
-  spr: Pick<CharacterSprite, 'emotions' | 'defaultEmotion'> | null | undefined,
+  spr: Pick<CharacterSprite, 'emotions' | 'defaultImage'> | null | undefined,
 ): EmotionPaletteRef {
   if (!spr || !Array.isArray(spr.emotions) || spr.emotions.length === 0) return builtinPalette()
-  const names = new Set(spr.emotions.map((e) => e.name))
-  const def = spr.defaultEmotion && names.has(spr.defaultEmotion) ? spr.defaultEmotion : spr.emotions[0]!.name
-  return { entries: spr.emotions, defaultEmotion: def }
+  // 默认按图定位；图没有标签（被删/被清空）时退回第一条
+  const def = spr.emotions.find((e) => e.image === spr.defaultImage) ?? spr.emotions[0]!
+  return { entries: spr.emotions, defaultEmotion: def.name }
 }
 
 /**
@@ -813,7 +944,7 @@ export function paletteFromSprite(
  * @returns 命中的立绘文件名；词条图缺失且非内置最小词表时返回 null（由调用方按 说话图 兜底）
  */
 export function resolvePaletteImage(
-  spr: Pick<CharacterSprite, 'emotions' | 'defaultEmotion' | 'images'>,
+  spr: Pick<CharacterSprite, 'emotions' | 'defaultImage' | 'images'>,
   emotion: string,
 ): string | null {
   const has = (f: string) => !!f && spr.images.some((i) => i.filePath === f)
@@ -823,13 +954,16 @@ export function resolvePaletteImage(
   if (entries.length === 0) {
     return spr.images[0]?.filePath ?? null
   }
-  const defName = byName.has(spr.defaultEmotion) ? spr.defaultEmotion : entries[0]!.name
-  // 1) 精确命中词条的图
+  // 默认兜底：按图定位（标签可能不唯一），图没有标签时落首条
+  const defEntry = entries.find((e) => e.image === spr.defaultImage) ?? entries[0]!
+  // 1) 整串精确命中
   const direct = byName.get(emotion.trim())
   if (direct && has(direct.image)) return direct.image
-  // 2) 未命中：默认状态词条的图（词表图必填，正常恒有；异常配置返回 null 由调用方按说话图兜底）
-  const defEntry = byName.get(defName)
-  return defEntry && has(defEntry.image) ? defEntry.image : null
+  // 1b) 段匹配：旧消息里的单词、剧本手写的单词都能命中「不满，生气」这类标签
+  const segHit = entries.find((e) => labelMatches(emotion, e.name))
+  if (segHit && has(segHit.image)) return segHit.image
+  // 2) 未命中：默认图的图（词表图必填，正常恒有；异常配置返回 null 由调用方按说话图兜底）
+  return has(defEntry.image) ? defEntry.image : null
 }
 
 // ---------------- Live2D 模型设置 ----------------
@@ -927,8 +1061,70 @@ export interface ModelViewSettings {
 }
 
 /** 完整的模型设置（持久化到 model-settings.json） */
+/**
+ * 某个模型的外观分组自定义。
+ * 目录本身只按"互斥关系"做结构分组（开关 / 单选 N），不做语义猜测，
+ * 所以标题的命名权交给用户：重命名 / 整组隐藏 / 单项隐藏。
+ */
+export interface ModelAppearanceLayout {
+  /** 分组标题自定义：key = 目录里的 group id（单选组按组内表达式名排序拼成，稳定不随参数顺序漂移） */
+  groups?: Record<string, { title?: string }>
+  /** 整组隐藏的 group id */
+  hiddenGroups?: string[]
+  /** 单项隐藏的表达式名 */
+  hiddenItems?: string[]
+}
+
+/**
+ * 单个 Cubism 参数在某个模型里的真实量程（来自 core 的 parameters 表）。
+ * 滑杆的 min/max/default 一律以它为准，避免写死的 -30~30 在半数模型上撞墙。
+ */
+export interface ModelParamRange {
+  min: number
+  max: number
+  def: number
+}
+
+/**
+ * 模型能力表：由桌宠窗在模型加载后现场采集（core 参数表 + model3.json + physics3.json），
+ * 主进程缓存并转发给设置窗。设置面板据此决定滑杆是否显示、量程、以及是否要改写驱动参数。
+ *
+ * 为什么需要它：同一套标准参数在不同模型里"归谁管"完全不同——
+ * 有的不存在，有的是物理输出（每帧被重算），有的是 SDK 眨眼目标。盲目写进去就是拖了没反应。
+ */
+export interface ModelProfile {
+  modelId: string
+  /** 存在的参数 → 量程（键为 Cubism 参数 id） */
+  params: Record<string, ModelParamRange>
+  /** 物理输出参数 → 建议写入的驱动参数（如 ParamAngleX → AngleX） */
+  drivers: Record<string, string>
+  /** 物理输出的参数集合（含无法确定唯一驱动的） */
+  physicsOutputs: string[]
+  /** SDK 眨眼组参数（非空表示引擎每帧会写这些参数） */
+  eyeBlink: string[]
+  /** SDK 口型组参数 */
+  lipSync: string[]
+  createdAt: number
+}
+
 export interface ModelSettings {
+  /** 全局姿态参数（缺省兜底：模型没有单独保存时用它） */
   parameters: ModelParameters
+  /**
+   * 按模型保存的姿态参数覆盖。
+   * 姿态（头部/眼/嘴/呼吸…）本来就该跟着模型走：同一套数值换到另一只模型上毫无意义，
+   * 而且不是每个模型都有 ParamCheek / ParamBrowLForm 这类参数。
+   * 键 = 模型 id，缺省 = 回落到全局 parameters。
+   */
+  parametersByModel: Record<string, ModelParameters>
+  /**
+   * 按模型保存的「外观」选中项（exp3 表情名，按应用顺序）。
+   * 这些表情是常驻装扮/表情（黑框眼镜、长短裙、体型…），与"状态词表按情绪切换"是两层：
+   * 有情绪表情时词表优先，空闲时回落到这里。
+   */
+  appearancesByModel: Record<string, string[]>
+  /** 按模型保存的外观分组自定义（自动分类猜错时由用户改正，见 ModelAppearanceLayout） */
+  appearanceLayoutByModel: Record<string, ModelAppearanceLayout>
   animation: ModelAnimationSettings
   view: ModelViewSettings
   /** 2D 立绘集的缩放与位置（与 Live2D view 独立） */
@@ -948,6 +1144,8 @@ export interface TestConnectionResult {
   ok: boolean
   error?: string
   data?: string
+  /** 实际被测的模型名（回落后可能与「主模型」不同，展示出来避免误判） */
+  model?: string
 }
 
 /** 上下文 token 用量（主进程每次 AI 组装 / 手动压缩后广播，供桌宠窗显示） */
@@ -1272,6 +1470,8 @@ export interface StoryRun {
   createdAt: number
   updatedAt: number
   storyState: StoryState
+  /** 事件日志（完整重看的唯一依据；旧存档可能为空数组，回放时退化为只播 messages） */
+  eventLog?: StoryEventLogEntry[]
   /** 演出对话记录（backlog 与 AI 上下文来源） */
   messages: ChatMessage[]
   /** 剧情记忆沉淀游标：已沉淀为记忆的 run.messages 位置（下次从此切片；缺省 0 = 未沉淀）。
@@ -1305,6 +1505,25 @@ export interface StoryRunIndexItem {
   updatedAt: number
 }
 
+/**
+ * 剧情事件日志：每执行完一个事件记一条，供「完整重看」按当时顺序重演。
+ *
+ * 只存"执行后的场景状态"而不是事件参数 —— 回放时直接套用即可，
+ * 不必按事件类型再算一遍（背景优先级、素材缺失回退等规则都在执行时结算过了）。
+ */
+export interface StoryEventLogEntry {
+  chapterIndex: number
+  eventIndex: number
+  type: string
+  /** 该事件产生的消息在 run.messages 里的下标范围；背景/音乐这类不产消息的事件为空 */
+  messageFrom?: number
+  messageTo?: number
+  /** 执行后的背景（null = 无背景） */
+  background?: string | null
+  /** 执行后的 BGM（null = 无音乐） */
+  music?: string | null
+}
+
 /** 剧情运行时状态（run 文件的 storyState 字段） */
 export interface StoryState {
   scriptId: string
@@ -1315,11 +1534,14 @@ export interface StoryState {
   status: 'running' | 'ended'
   /** 当前背景（随 background 事件与 AI 联动持久化；续玩时恢复演出画面，覆盖背景优先） */
   background?: string | null
+  /** 当前 BGM（随 music 事件持久化；续玩时恢复，null = 无音乐） */
+  music?: string | null
 }
 
 /** 渲染端等待提交的交互（挂起中的 choices/input/free_dialogue） */
 export interface StoryPendingInteraction {
-  kind: 'choices' | 'input' | 'free'
+  /** advance = 叙事已播完、等玩家点击推进（游标与界面同步的挂起点） */
+  kind: 'choices' | 'input' | 'free' | 'advance'
   /** choices：完整选项定义；input/free：附加说明 */
   choices?: Array<{ text: string }>
   allowFree?: boolean
@@ -1375,12 +1597,16 @@ export type StoryResponse =
   | { kind: 'input'; text: string }
   | { kind: 'free'; text?: string; end?: boolean }
   | { kind: 'retry' }
+  /** 叙事挂起点推进：界面播完当前条、玩家点击时发送 */
+  | { kind: 'advance' }
 
 /** 剧情 TTS 合成结果（story:tts-synthesize；WAV int16 单声道 → base64；采样率随引擎：Genie 32kHz / SBV2 44.1kHz） */
 export interface StoryTtsResult {
   ok: boolean
   audioBase64?: string
   error?: string
+  /** true = 仅查缓存未命中（未产生合成，重看时静默跳过用） */
+  missing?: boolean
 }
 
 // ---------------- 可视化编辑器（7.6） ----------------
@@ -1563,7 +1789,11 @@ export interface WindowApi {
     /** 订阅记忆变更（自动沉淀 / 其它窗口修改后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
     /** 语义搜索已确认记忆（向量检索；嵌入未配置时返回空数组，前端回退本地过滤） */
-    semanticSearch: (query: string, topK?: number) => Promise<Array<{ item: MemoryItem; score: number }>>
+    semanticSearch: (
+      query: string,
+      topK?: number,
+      filters?: { category?: MemoryCategory | 'all'; owner?: string },
+    ) => Promise<Array<{ item: MemoryItem; score: number }>>
     /** 手动重嵌全部已确认记忆（换嵌入模型/大量缺失时用） */
     reembedAll: () => Promise<{ embedded: number; failed: number; unavailable?: boolean }>
     /** 测试嵌入配置连通性（独立地址/模型/Key），成功返回向量维度 */
@@ -1606,7 +1836,7 @@ export interface WindowApi {
     expressionList: (modelId: string) => Promise<ExpressionMeta[]>
     /** 读取 Live2D 模型演出词表（data/model-palettes.json；未配置 = null，运行时按内置最小词表兜底） */
     getPalette: (modelId: string) => Promise<ModelPalette | null>
-    /** 保存 Live2D 模型演出词表（词 + 释义 + 表情联动 + 默认状态，全量写回） */
+    /** 保存 Live2D 模型演出词表（标签 + 表情联动，全量写回；数组顺序即编号） */
     updatePalette: (modelId: string, palette: ModelPalette) => Promise<void>
     /**
      * 扫描模型文件夹自动识别表情（*.exp3.json）/动作（*.motion3.json）文件，
@@ -1623,6 +1853,16 @@ export interface WindowApi {
     coreStatus: () => Promise<{ present: boolean; path: string | null }>
     /** 弹原生文件选择框导入 live2dcubismcore.min.js */
     importCore: () => Promise<{ present: boolean; path: string | null }>
+    /** 让桌宠立即播放指定动作组（外观面板的「一键动作」；不改变设置的待机动作） */
+    playMotion: (group: string) => Promise<void>
+    /** 取当前由状态词表驱动的表情名（null = 无，外观面板据此标记/锁定该项） */
+    stateExpression: () => Promise<string | null>
+    /** 取当前模型的参数能力表（存在性/量程/物理驱动；未加载 = null） */
+    profile: (modelId: string) => Promise<ModelProfile | null>
+    /** 订阅能力表更新（桌宠窗加载完模型后推送） */
+    onProfile: (cb: (profile: ModelProfile) => void) => () => void
+    /** 订阅状态表情变化 */
+    onStateExpression: (cb: (name: string | null) => void) => () => void
   }
   sprite: {
     /** 列出所有已导入的立绘集 */
@@ -1632,9 +1872,23 @@ export interface WindowApi {
     /** 删除指定立绘集（同时删除资源目录与索引条目） */
     remove: (spriteId: string) => Promise<void>
     /** 更新立绘集展示资产：名称 / 状态词表 / 说话立绘 / 思考立绘 */
-    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>) => Promise<void>
-    /** 视觉打标：对指定立绘集逐张生成状态词建议（产物不落库，回填编辑器确认）；未配置视觉模型时返回 ok:false */
-    annotate: (spriteId: string) => Promise<{ ok: boolean; suggestions?: Array<{ filePath: string; name: string; desc: string }>; failed?: number; error?: string }>
+    update: (spriteId: string, patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultImage' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>) => Promise<void>
+    /**
+     * 视觉打标：每张图建议一条标签串（2-4 个词用「，」拼接）。
+     * @param opts.skipImages 已有状态词的图片（"仅补未标注"开关），这些图不再请求模型
+     */
+    annotate: (
+      spriteId: string,
+      opts?: { skipImages?: string[] },
+    ) => Promise<{
+      ok: boolean
+      suggestions?: Array<{ filePath: string; name: string }>
+      failed?: number
+      skipped?: number
+      /** 同批标签重复而被丢弃的张数（只保留第一张） */
+      duplicated?: number
+      error?: string
+    }>
     /** 订阅立绘集列表变化（导入/删除后刷新），返回取消订阅函数 */
     onChanged: (cb: () => void) => () => void
   }
@@ -1646,7 +1900,15 @@ export interface WindowApi {
      * 新建/更新服务商档案（upsert，按 id 缺省新建）：key 非空时保存该档案的 API Key
      * （safeStorage 加密落盘）；key 为 undefined = 保持原 Key 不变
      */
-    saveProfile: (profile: { id?: string; name: string; baseURL: string; model: string; key?: string }) => Promise<ApiProfile>
+    saveProfile: (profile: {
+      id?: string
+      name: string
+      baseURL: string
+      model: string
+      key?: string
+      enableThinking?: boolean
+      extraBody?: string
+    }) => Promise<ApiProfile>
     /** 删除档案（正在被某类模型引用时抛错；连同其 Key 密文一并清除） */
     deleteProfile: (id: string) => Promise<void>
     /**
@@ -1683,6 +1945,8 @@ export interface WindowApi {
     /** 打开聊天窗口，并可指定要进入的会话 id（宠物窗点开时带当前会话） */
     openChatWithSession: (sessionId: string) => void
     openSettings: () => void
+    /** 用系统默认浏览器打开外部链接（只接受 http/https）。返回空串=成功，否则为错误信息 */
+    openExternal: (url: string) => Promise<string>
     /** 通知桌宠窗口切换角色卡（模型 + 表情/待机动作覆盖 + 立绘/渲染模式 + 状态映射） */
     setPetCard: (payload: PetCardPayload) => void
     quit: () => void
@@ -1714,6 +1978,16 @@ export interface WindowApi {
     spriteUrl: (spriteId: string, filePath: string) => string
     /** 订阅模型设置变化（设置窗口修改后广播到桌宠窗口） */
     onModelSettingsChanged: (cb: (settings: ModelSettings) => void) => () => void
+    /** 订阅「播放指定动作」指令（设置窗口点一键动作时触发） */
+    onPlayMotion: (cb: (group: string) => void) => () => void
+    /** 上报当前状态表情（由桌宠窗在状态变化时调用） */
+    reportStateExpression: (name: string | null) => void
+    /** 上报当前模型的参数能力表（模型加载完成后上报一次） */
+    reportModelProfile: (profile: ModelProfile) => void
+    /** 取消当前状态表情（外观面板点击"·状态"项时调用；直到状态变化前不再生效） */
+    dismissStateExpression: () => Promise<void>
+    /** 订阅「取消状态表情」指令（设置窗 → 桌宠窗） */
+    onDismissStateExpression: (cb: () => void) => () => void
     /** 订阅全局鼠标坐标变化（窗口相对坐标，由主进程轮询 screen.getCursorScreenPoint） */
     onCursorMove: (cb: (pos: { x: number; y: number }) => void) => () => void
     /** 订阅"说话"事件（聊天窗口 AI 回复后触发，桌宠窗口合成并播放语音+口型同步），
@@ -1849,12 +2123,23 @@ export interface WindowApi {
     remove: (scriptId: string) => Promise<{ ok: boolean; error?: string }>
     /** 存档列表（多周目；含剧本名/进度） */
     listRuns: () => Promise<StoryRunIndexItem[]>
+    /** 当前正在跑的那场演出（主进程内存态，非存档的 status）；未在演出时 null */
+    getActiveRun: () => Promise<{ runId: string; scriptId: string; chapterIndex: number; chapterCount: number } | null>
     /** 删除 run 存档 */
     deleteRun: (runId: string) => Promise<{ ok: boolean }>
     /** 开始/继续演出：mode=start 新建 run 从头演，resume=按 runId 从游标续玩；backgroundOverride=本次演出强制背景 */
     start: (params: { scriptId: string; cardId: string; spriteId: string; voice: StoryVoiceConfig | null; mode: 'start' | 'resume'; runId?: string; backgroundOverride?: string | null }) => Promise<{ ok: boolean; runId?: string; error?: string }>
     /** 提交交互结果（选项索引/自由文本/自由对话轮/重试） */
     respond: (params: { runId: string; response: StoryResponse }) => Promise<{ ok: boolean; error?: string }>
+    /** 语音缓存统计（占用 / 条数 / 上限 / 目录） */
+    voiceCacheStats: () => Promise<{ count: number; bytes: number; maxBytes: number; dir: string }>
+    /** 清理语音缓存：all=true 全清；否则按 olderThanDays（默认 30） */
+    voiceCacheClean: (opts?: { olderThanDays?: number; all?: boolean }) => Promise<{
+      removed: number
+      stats: { count: number; bytes: number; maxBytes: number; dir: string }
+    }>
+    /** 用系统文件管理器打开语音缓存目录（返回空串=成功） */
+    voiceCacheOpen: () => Promise<string>
     /** 暂停演出（保留 run 存档） */
     stop: (runId: string) => Promise<{ ok: boolean }>
     /** 读取剧情快照（null = 无进行中的演出） */
@@ -1866,7 +2151,7 @@ export interface WindowApi {
     /** 调整立绘视图（大小/位置；随 run 存档并广播快照） */
     setSpriteView: (runId: string, view: StorySpriteView) => Promise<{ ok: boolean }>
     /** 剧情 TTS 合成（本地 Genie 声库 + 语言）→ WAV base64 */
-    synthesize: (params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2' }) => Promise<StoryTtsResult>
+    synthesize: (params: { ttsModelId: string; language: 'zh' | 'ja'; text: string; engine?: 'genie' | 'sbv2'; allowSynthesize?: boolean }) => Promise<StoryTtsResult>
     /** 背景库文件名列表（data/story-backgrounds/；背景事件 user: 前缀引用） */
     listBackgrounds: () => Promise<string[]>
     /** 打开文件对话框选择图片并导入背景库（返回新增文件名） */
@@ -1879,6 +2164,10 @@ export interface WindowApi {
     importDraft: (draft: string) => Promise<{ ok: boolean; scriptId?: string; errors: Array<{ file: string; message: string }>; error?: string }>
     /** 打开/聚焦剧情窗（演出不中断，按快照恢复） */
     openWindow: () => void
+    /** 打开剧情窗重看某场存档（只读回放） */
+    openReplay: (runId: string) => Promise<{ ok: boolean; error?: string }>
+    /** 订阅回放启动指令（窗口被 openReplay 打开时由主进程下发） */
+    onReplayInit: (cb: (payload: { runId: string }) => void) => () => void
     /** 订阅演出事件流（background/music/narration/player/dialogue/…，带 runId） */
     onEvent: (cb: (payload: StoryEventPayload) => void) => () => void
     /** 订阅剧情状态变更（章节切换/结束/挂起交互/thinking 变化） */

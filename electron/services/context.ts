@@ -21,7 +21,7 @@ const RECENT_MESSAGE_LIMIT = 20
 /** 摘要消息的识别标记（下次压缩可据此替换旧摘要） */
 export const SUMMARY_MARKER = '【历史对话总结】'
 /** 摘要输出 token 上限（摘要走非流式独立请求） */
-export const SUMMARY_MAX_TOKENS = 1024
+export const SUMMARY_MAX_TOKENS = 2048
 
 /** 摘要时间线的行首时刻格式：M-D HH:mm（相对轻量，无年份——跨年对话极罕见且摘要本就是模糊产物） */
 function formatSummaryTs(ts: number): string {

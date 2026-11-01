@@ -9,7 +9,7 @@
  *   系统性挤占事实名额；user_info（事实底座）不做 MIN_COSINE 硬过滤（同约定类逻辑），
  *   long_term（叙事噪声多）保持阈值滤噪。
  * - 降级模式（开关关闭 / 未配置 / 嵌入失败）：与向量模式同构的「分层最近注入」——
- *   约定 10 + 事实 5 + 经历 8，各层按 createdAt 降序（不再依赖存储顺序写入习惯）。
+ *   约定承诺 10 + 用户信息 5 + 长期经历 8，各层按 createdAt 降序（不再依赖存储顺序写入习惯）。
  *
  * 注入的文本格式仍由 buildSystemPrompt 的三分段结构保证，本模块只负责"选哪些条"。
  */
@@ -148,7 +148,7 @@ export async function retrieveMemories(cardId: string, query: string): Promise<R
       return { items, profileDigest: profile?.personaDigest ?? null, mode: 'recent' }
     }
 
-    console.log('[memory-retrieval] 向量检索：约定=%d 事实=%d 经历=%d', promises.length, facts.length, stories.length)
+    console.log('[memory-retrieval] 向量检索：约定承诺=%d 用户信息=%d 长期经历=%d', promises.length, facts.length, stories.length)
     return {
       items: [...promises, ...facts, ...stories],
       profileDigest: profile?.personaDigest ?? null,

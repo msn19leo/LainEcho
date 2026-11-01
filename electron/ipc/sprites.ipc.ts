@@ -71,7 +71,7 @@ export function registerSpritesIpc(): void {
       name: path.basename(srcDir) || spriteId,
       images: copiedImages,
       emotions: [],
-      defaultEmotion: '',
+      defaultImage: '',
       speakingImage: null,
       thinkingImage: null,
       observingImage: null,
@@ -90,14 +90,14 @@ export function registerSpritesIpc(): void {
   ipcMain.handle('sprite:update', async (
     _e,
     spriteId: string,
-    patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage'>>,
+    patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultImage' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>,
   ) => {
     await updateSprite(spriteId, patch)
     windowManager.notifySpritesChanged()
   })
 
   /** 视觉打标：逐张生成状态词建议（产物不落库，渲染端回填词表编辑器确认后经 sprite:update 保存） */
-  ipcMain.handle('sprite:annotate', async (_e, spriteId: string) => {
-    return annotateSpriteSet(spriteId)
+  ipcMain.handle('sprite:annotate', async (_e, spriteId: string, opts?: { skipImages?: string[] }) => {
+    return annotateSpriteSet(spriteId, opts)
   })
 }

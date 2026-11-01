@@ -14,6 +14,7 @@ import { Button, Modal } from '../components/ui'
 import { SelectMenu } from '../components/DropdownMenu'
 import { WindowTitlebar } from '../components/WindowTitlebar'
 import { toast } from 'sonner'
+import { paletteFromSprite } from '../types'
 import type { CharacterSprite, EditorReadResult, StoryCondition, StoryEvent } from '../types'
 import { EVENT_DESCRIPTORS, descriptorOf, type FieldDesc } from './eventDescriptors'
 import { cn } from '../lib/utils'
@@ -71,14 +72,12 @@ export function EditorApp() {
   const [staleWords, setStaleWords] = useState<string[]>([])
 
   /** 按立绘集 id 取词表视图（永不 null：未绑定/未打标 → 内置最小词表，仅"平静"） */
-  const paletteOf = useCallback((id: string | null): { entries: Array<{ name: string; gloss?: string }>; defaultEmotion: string } => {
+  const paletteOf = useCallback((id: string | null): { entries: Array<{ name: string }>; defaultEmotion: string } => {
     if (id) {
       const spr = spriteListFull.find((s) => s.id === id)
-      if (spr && spr.emotions.length > 0) {
-        return { entries: spr.emotions, defaultEmotion: spr.defaultEmotion || spr.emotions[0]?.name || '' }
-      }
+      if (spr && spr.emotions.length > 0) return paletteFromSprite(spr)
     }
-    return { entries: [{ name: '平静', gloss: '从容放松' }], defaultEmotion: '平静' }
+    return { entries: [{ name: '平静' }], defaultEmotion: '平静' }
   }, [spriteListFull])
 
   /**
@@ -139,6 +138,8 @@ export function EditorApp() {
     if (plan.affected > 0) {
       toast.success(`已改写 ${plan.affected} 处状态引用（自动映射 ${plan.affected - plan.toDefault}、落默认 ${plan.toDefault}）；保存后生效`)
     }
+    // 改写完成即收起向导：此前只 toast 不关闭，弹窗会一直压在上面
+    setRebindConfirm(null)
   }
 
   /** 一键修复未知词（词表变化/导入剧本后）：不在当前值域的状态引用 → 默认状态 */

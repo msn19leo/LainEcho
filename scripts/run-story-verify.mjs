@@ -16,7 +16,7 @@ const outFile = join(tmpDir, 'verify.mjs')
 // safeStorage 等其余 API 仅被被测代码惰性引用，校验路径不会实际调用
 writeFileSync(
   join(tmpDir, 'electron-stub.mjs'),
-  `export const app = { getPath: () => ${JSON.stringify(tmpDir)} }\nexport const safeStorage = {}\nexport default {}\n`,
+  `export const app = { getPath: () => ${JSON.stringify(tmpDir)} }\nexport const safeStorage = {}\nexport const nativeImage = { createFromBuffer: () => ({ isEmpty: () => true }) }\nexport default {}\n`,
   'utf-8',
 )
 

@@ -27,10 +27,11 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import { getCharacterCard, listSprites } from '../repository'
 import { paths } from '../storage'
+import { synthesizeStoryVoice } from '../storyVoiceCache'
 import { runChatTurn } from '../chatTurn'
 import { windowManager } from '../../windows/windowManager'
 import { loadScript } from './loader'
-import { appendRunMessages, createRun, getRun, updateRunSpriteView, updateRunState } from './runs'
+import { appendRunEventLog, appendRunMessages, createRun, getRun, updateRunSpriteView, updateRunState } from './runs'
 import { consolidateStoryMemory } from './storyMemory'
 import { judgeEnding } from './judge'
 import { evalCondition } from './conditions'
@@ -47,6 +48,8 @@ export interface RunRuntime {
   music: string | null
   /** 挂起中的交互（null = 无；挂起时游标不推进） */
   pending: StoryPendingInteraction | null
+  /** 事件内部已推进游标（叙事类在挂起前提交），runLoop 据此跳过重复推进 */
+  cursorAdvanced?: boolean
   /** 挂起交互的 resolve（respond 时触发） */
   resolver: ((r: StoryResponse) => void) | null
   /** 主循环是否正在执行（防并发：retry respond 时避免双重推进） */
@@ -218,7 +221,8 @@ export async function startStory(params: {
       // 背景恢复优先级：本次演出覆盖背景 > 存档的背景状态（background 事件/AI 联动持久化）
       background: run.backgroundOverride ?? run.storyState.background ?? null,
       backgroundChoices: await collectBackgroundChoices(path.join(paths.storiesDir, run.scriptId)),
-      music: null,
+      // 续玩恢复 BGM（旧存档没有该字段 → null，静音但不再是"被停止"）
+      music: run.storyState.music ?? null,
       pending: null,
       resolver: null,
       loopRunning: false,
@@ -236,6 +240,9 @@ export async function startStory(params: {
     return { runId: run.runId }
   }
 
+  // 开新演出：清掉待回放标记，避免下次打开剧情窗误入只读回放
+  windowManager.clearPendingReplay()
+
   // mode='start'：校验角色卡与立绘集存在（立绘必选）
   const card = await getCharacterCard(cardId)
   if (!card) throw new Error('角色卡不存在')
@@ -247,6 +254,19 @@ export async function startStory(params: {
 
   const startIdx = Math.max(0, bundle.chapters.findIndex((c) => c.file === bundle.meta.startChapter))
   const run = await createRun({ scriptId, cardId, spriteId, voice, backgroundOverride: params.backgroundOverride ?? null, startChapterIndex: startIdx })
+
+  // 新开一场前，清掉同一剧本残留的运行时。
+  // 典型来源：上次是关窗离开（按设计不中断演出），运行时留在内存里；
+  // 不清的话 tab 栏「演出中」会继续指向前一场，续玩的进度也会串。
+  for (const [oldId, oldRt] of [...runtimes]) {
+    if (oldId !== run.runId && oldRt.run.scriptId === scriptId) {
+      oldRt.resolver = null
+      oldRt.pending = null
+      oldRt.loopRunning = false
+      runtimes.delete(oldId)
+      console.log('[story] 新开演出，清理同剧本残留运行时：%s', oldId)
+    }
+  }
   const rt: RunRuntime = {
     run,
     bundle,
@@ -282,6 +302,27 @@ export async function stopStory(runId: string): Promise<void> {
 }
 
 /** 读取 run 快照（无运行时 → null） */
+/**
+ * 当前活跃的演出（正在主进程引擎里跑的那一场）。
+ *
+ * 注意与存档的 `status === 'running'` 区分：后者只表示「这场演出还没完结」，
+ * 应用重启、或在旧存档上停留过都会留下它为 true 的条目 —— 不能拿来判断「此刻在演出」。
+ * 真正的运行态只存在于本模块的 runtimes（内存），进程重启即清空。
+ */
+export function getActiveRun(): { runId: string; scriptId: string; chapterIndex: number; chapterCount: number } | null {
+  // 取"最近创建"的那场：Map 按插入序迭代，next() 拿到的是最旧的。
+  // 同时存在多个运行时（旧存档关窗未退出 + 新开一场）时，状态点必须指向新开的这场。
+  let latest: RunRuntime | undefined
+  for (const rt of runtimes.values()) latest = rt
+  if (!latest) return null
+  return {
+    runId: latest.run.runId,
+    scriptId: latest.run.scriptId,
+    chapterIndex: latest.run.storyState.chapterIndex,
+    chapterCount: latest.bundle.chapters.length,
+  }
+}
+
 export function getStorySnapshot(runId: string): StorySnapshot | null {
   const rt = runtimes.get(runId)
   return rt ? snapshotOf(rt) : null
@@ -318,6 +359,17 @@ export async function respondStory(runId: string, response: StoryResponse): Prom
   if (rt.run.storyState.status !== 'running') throw new Error('剧情已结束')
   const resolve = rt.resolver
   if (resolve) {
+    // 类型校验：挂起在 advance 时收到 choice / input 之类直接忽略，
+    // 否则会 resolve 掉等待、让游标在不该前进的时候前进。
+    const expected = rt.pending?.kind
+    const okKind =
+      response.kind === 'retry' ||
+      !expected ||
+      (expected === 'choices' ? response.kind === 'choice' : expected === response.kind)
+    if (!okKind) {
+      console.warn('[story] 忽略与挂起类型不匹配的响应：pending=%s resp=%s', expected, response.kind)
+      return
+    }
     rt.resolver = null
     rt.pending = null
     resolve(response)
@@ -391,8 +443,13 @@ async function runLoop(rt: RunRuntime): Promise<void> {
       if (suspended) return // 挂起：游标停在当前事件，respond 后重新进入循环
       if (rt.run.storyState.status !== 'running') return // 事件内显式结束（chapter_end 完结）
 
-      rt.run.storyState.eventIndex++
-      await updateRunState(rt.run.runId, rt.run.storyState)
+      if (rt.cursorAdvanced) {
+        // 叙事类在挂起前已提交（写日志 + 推进游标），这里只清标记
+        rt.cursorAdvanced = false
+      } else {
+        rt.run.storyState.eventIndex++
+        await updateRunState(rt.run.runId, rt.run.storyState)
+      }
     }
   } catch (err) {
     // AI 轮次失败等：游标停在当前事件（存档未推进），剧情窗可「重试」
@@ -433,6 +490,8 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
     }
     case 'music':
       rt.music = event.stop ? null : (event.file ?? null)
+      // 随游标持久化（同 background）：否则停止/继续后 BGM 丢失
+      rt.run.storyState.music = rt.music
       broadcastEvent(rt, event)
       return false
     case 'modify_character':
@@ -440,22 +499,35 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
       return false
 
     // ---- 叙事类：入史（run 文件）+ 广播（语音由剧情窗播放器按事件文本处理；旁白无语音） ----
-    case 'narration':
+    case 'narration': {
       broadcastEvent(rt, event)
+      const before = rt.run.messages.length
       await appendStoryMessage(rt, { role: 'user', content: event.text, timestamp: Date.now(), meta: { ...meta, storyKind: 'narration' } })
+      await commitEvent(rt, event, before)
+      await waitAdvance(rt)
       return false
-    case 'player':
+    }
+    case 'player': {
       broadcastEvent(rt, event)
+      const before = rt.run.messages.length
       await appendStoryMessage(rt, { role: 'user', content: event.text, timestamp: Date.now(), meta: { ...meta, storyKind: 'player' } })
+      await commitEvent(rt, event, before)
+      await waitAdvance(rt)
       return false
-    case 'dialogue':
+    }
+    case 'dialogue': {
       broadcastEvent(rt, event)
+      const before = rt.run.messages.length
       await appendStoryMessage(rt, { role: 'assistant', content: event.text, emotion: event.emotion ?? 'neutral', timestamp: Date.now(), meta })
+      await commitEvent(rt, event, before)
+      await waitAdvance(rt)
       return false
+    }
 
     // ---- AI 类：完整聊天管线（store 覆盖 → run 文件），回复完成才推进（串行保证） ----
     case 'ai_dialogue': {
       broadcastEvent(rt, event)
+      const before = rt.run.messages.length
       rt.thinking = true
       broadcastState(rt)
       try {
@@ -476,10 +548,13 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
         rt.thinking = false
         broadcastState(rt)
       }
+      await commitEvent(rt, event, before)
+      await waitAdvance(rt)
       return false
     }
     case 'free_dialogue': {
       broadcastEvent(rt, event)
+      const before = rt.run.messages.length
       const maxRounds = Math.max(1, event.maxRounds ?? 3)
       let used = 0
       while (used < maxRounds) {
@@ -519,6 +594,8 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
         broadcastEvent(rt, { type: 'narration', text: event.endHint })
         await appendStoryMessage(rt, { role: 'user', content: event.endHint, timestamp: Date.now(), meta: { ...meta, storyKind: 'narration' } })
       }
+      await commitEvent(rt, event, before)
+      await waitAdvance(rt)
       return false
     }
 
@@ -626,6 +703,90 @@ async function executeEvent(rt: RunRuntime, event: StoryEvent): Promise<boolean>
 // ---------------- 挂起交互 ----------------
 
 /** 挂起等待渲染端提交交互结果 */
+/**
+ * 叙事事件的挂起点：入史并广播后停住，等界面播完这一条、玩家点击发 advance 才返回。
+ *
+ * 这是"游标与界面同步"的关键。加这一步之前，主进程会一口气执行完所有不需要玩家输入的事件
+ * （叙事 / 背景 / 音乐），导致：对话历史里出现还没播到的台词、音乐在上一句还没读完时就停了、
+ * 退出续玩时从远超前于所见进度的位置恢复（2026-10-29 定位）。
+ */
+/** 预读窗口：往后看几条静态台词（足以覆盖玩家读完当前这句的时间） */
+const PREFETCH_AHEAD = 3
+
+/**
+ * 预读后续静态台词并预合成语音 —— **只读不执行**。
+ *
+ * 不改背景、不入史、不推进游标，所以不会重现"事件提前生效"的老问题；
+ * 收益是把语音合成的等待挪到"玩家正在阅读当前这句"的空档里。
+ * 遇到 ai_dialogue / choices / input / free_dialogue / chapter_end 立即停：
+ * 那之后的上下文不可预知（AI 会现写，或玩家可能选到别的分支）。
+ */
+function prefetchVoiceAhead(rt: RunRuntime): void {
+  const voice = rt.run.voice
+  if (!voice?.ttsModelId) return
+  const chapter = rt.bundle.chapters[rt.run.storyState.chapterIndex]
+  if (!chapter) return
+  const events = chapter.def.events
+  let picked = 0
+  for (let i = rt.run.storyState.eventIndex; i < events.length && picked < PREFETCH_AHEAD; i++) {
+    const e = events[i]
+    if (!e) break
+    if (
+      e.type === 'ai_dialogue' ||
+      e.type === 'choices' ||
+      e.type === 'input' ||
+      e.type === 'free_dialogue' ||
+      e.type === 'chapter_end'
+    ) {
+      break
+    }
+    const text =
+      e.type === 'narration' || e.type === 'player' || e.type === 'dialogue' ? (e.text ?? '').trim() : ''
+    if (!text) continue
+    picked++
+    // fire-and-forget：合成结果落进 voice-cache，玩家点到这句时直接命中
+    void synthesizeStoryVoice({
+      ttsModelId: voice.ttsModelId,
+      language: voice.language,
+      text,
+      engine: voice.engine,
+    }).catch(() => {})
+  }
+}
+
+/**
+ * 事件完成提交：写事件日志 + 推进游标并落盘。
+ *
+ * 必须在「入史之后、挂起等待之前」调用。挂起期间用户可能直接退出（stop 会销毁 runtime），
+ * 若游标还停在当前事件，点「继续」时 runLoop 会从该事件重新执行 ——
+ * 表现就是 AI 台词被重新生成一遍、历史里出现两条一样的话。
+ */
+async function commitEvent(rt: RunRuntime, event: StoryEvent, msgBefore: number): Promise<void> {
+  await appendRunEventLog(rt.run.runId, {
+    chapterIndex: rt.run.storyState.chapterIndex,
+    eventIndex: rt.run.storyState.eventIndex,
+    type: event.type,
+    ...(rt.run.messages.length > msgBefore
+      ? { messageFrom: msgBefore, messageTo: rt.run.messages.length }
+      : {}),
+    background: rt.background,
+    music: rt.music,
+  })
+  rt.run.storyState.eventIndex++
+  await updateRunState(rt.run.runId, rt.run.storyState)
+  rt.cursorAdvanced = true
+}
+
+async function waitAdvance(rt: RunRuntime): Promise<void> {
+  rt.pending = { kind: 'advance' }
+  broadcastState(rt)
+  // 等待点击的空档里预合成后面几句（只读剧本，不执行事件）
+  prefetchVoiceAhead(rt)
+  await waitRespond(rt)
+  rt.pending = null
+  broadcastState(rt)
+}
+
 function waitRespond(rt: RunRuntime): Promise<StoryResponse> {
   return new Promise<StoryResponse>((resolve) => {
     rt.resolver = resolve

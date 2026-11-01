@@ -4,7 +4,7 @@
  */
 import { create } from 'zustand'
 import { api } from '../api'
-import type { ModelSettings, ModelParameters, ModelAnimationSettings, ModelViewSettings } from '../types'
+import type { ModelSettings, ModelParameters, ModelAnimationSettings, ModelViewSettings, ModelAppearanceLayout } from '../types'
 
 /** 模型参数默认值（对应 airi 的 defaultModelParameters） */
 export const DEFAULT_PARAMETERS: ModelParameters = {
@@ -57,6 +57,9 @@ export const DEFAULT_VIEW: ModelViewSettings = {
 /** 完整默认设置 */
 export const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   parameters: { ...DEFAULT_PARAMETERS },
+  parametersByModel: {},
+  appearancesByModel: {},
+  appearanceLayoutByModel: {},
   animation: { ...DEFAULT_ANIMATION },
   view: { ...DEFAULT_VIEW },
   spriteView: { ...DEFAULT_VIEW },
@@ -91,6 +94,9 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
       set({
         settings: {
           parameters: { ...DEFAULT_PARAMETERS, ...data.parameters },
+          parametersByModel: data.parametersByModel ?? {},
+          appearancesByModel: data.appearancesByModel ?? {},
+          appearanceLayoutByModel: data.appearanceLayoutByModel ?? {},
           animation: { ...DEFAULT_ANIMATION, ...data.animation },
           view: { ...DEFAULT_VIEW, ...data.view },
           spriteView: { ...DEFAULT_VIEW, ...data.spriteView },
@@ -106,9 +112,13 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
   },
 
   save: async (patch) => {
+    const cur = get().settings
     const next = {
-      parameters: { ...get().settings.parameters, ...(patch.parameters ?? {}) },
-      animation: { ...get().settings.animation, ...(patch.animation ?? {}) },
+      parameters: { ...cur.parameters, ...(patch.parameters ?? {}) },
+      parametersByModel: { ...cur.parametersByModel, ...(patch.parametersByModel ?? {}) },
+      appearancesByModel: { ...cur.appearancesByModel, ...(patch.appearancesByModel ?? {}) },
+      appearanceLayoutByModel: { ...cur.appearanceLayoutByModel, ...(patch.appearanceLayoutByModel ?? {}) },
+      animation: { ...cur.animation, ...(patch.animation ?? {}) },
       view: { ...get().settings.view, ...(patch.view ?? {}) },
       spriteView: { ...get().settings.spriteView, ...(patch.spriteView ?? {}) },
       selectedModelId: patch.selectedModelId !== undefined ? patch.selectedModelId : get().settings.selectedModelId,
@@ -123,6 +133,9 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
     set({
       settings: {
         parameters: { ...cur.parameters, ...(patch.parameters ?? {}) },
+        parametersByModel: { ...cur.parametersByModel, ...(patch.parametersByModel ?? {}) },
+        appearancesByModel: { ...cur.appearancesByModel, ...(patch.appearancesByModel ?? {}) },
+        appearanceLayoutByModel: { ...cur.appearanceLayoutByModel, ...(patch.appearanceLayoutByModel ?? {}) },
         animation: { ...cur.animation, ...(patch.animation ?? {}) },
         view: { ...cur.view, ...(patch.view ?? {}) },
         spriteView: { ...cur.spriteView, ...(patch.spriteView ?? {}) },
@@ -140,6 +153,9 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
     set({
       settings: {
         parameters: { ...DEFAULT_PARAMETERS, ...settings.parameters },
+        parametersByModel: settings.parametersByModel ?? {},
+        appearancesByModel: settings.appearancesByModel ?? {},
+        appearanceLayoutByModel: settings.appearanceLayoutByModel ?? {},
         animation: { ...DEFAULT_ANIMATION, ...settings.animation },
         view: { ...DEFAULT_VIEW, ...settings.view },
         spriteView: { ...DEFAULT_VIEW, ...settings.spriteView },
@@ -153,3 +169,23 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
     await get().save({ parameters: { ...DEFAULT_PARAMETERS } })
   },
 }))
+
+// ---------------- 按模型取值（UI 与桌宠窗共用） ----------------
+
+/** 取指定模型生效的姿态参数：有专属值用专属值，否则回落到全局 parameters */
+export function resolveModelParameters(settings: ModelSettings, modelId: string | null | undefined): ModelParameters {
+  if (!modelId) return settings.parameters
+  return settings.parametersByModel?.[modelId] ?? settings.parameters
+}
+
+/** 取指定模型的外观分组自定义（猜错时用户改过的结果） */
+export function resolveModelAppearanceLayout(settings: ModelSettings, modelId: string | null | undefined): ModelAppearanceLayout {
+  if (!modelId) return {}
+  return settings.appearanceLayoutByModel?.[modelId] ?? {}
+}
+
+/** 取指定模型的外观选中项（exp3 表情名数组，按应用顺序） */
+export function resolveModelAppearance(settings: ModelSettings, modelId: string | null | undefined): string[] {
+  if (!modelId) return []
+  return settings.appearancesByModel?.[modelId] ?? []
+}

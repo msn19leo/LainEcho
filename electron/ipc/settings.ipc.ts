@@ -9,6 +9,7 @@ import { getSettings, saveSettings } from '../services/repository'
 import { syncNativeTheme } from '../services/nativeTheme'
 import { getDataDirInfo, migrateDataDir, resetDataDir } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
+import { applyPetWindowSettings } from '../windows/petWindow'
 
 /** 读取设置并给每个档案附加传输态 hasKey（掩码回显用，不返回明文） */
 async function getSettingsWithProfileKeyState(): Promise<AppSettings> {
@@ -26,6 +27,8 @@ export function registerSettingsIpc(): void {
     await saveSettings(patch)
     // 主题变更立即同步给原生层（影响输入光标 / 滚动条 / 原生菜单配色）
     if (patch.theme) syncNativeTheme(patch.theme)
+    // 桌宠窗口尺寸/位置：改动即时生效（左下锚点已在 applyPetWindowSettings 内处理）
+    if (patch.petWindow) applyPetWindowSettings((await getSettings()).petWindow)
     // 「截图时隐藏本应用窗口」是窗口级属性：改动后立即对所有已开窗口生效
     if (patch.vision?.hideFromCapture !== undefined) {
       windowManager.applyContentProtection((await getSettings()).vision.hideFromCapture)
@@ -38,11 +41,17 @@ export function registerSettingsIpc(): void {
   })
 
   /** 新建/更新服务商档案（upsert；key 非空时保存该档案的 API Key），变更后广播同步各窗口 */
-  ipcMain.handle('settings:save-profile', async (_e, input: { id?: string; name: string; baseURL: string; model: string; key?: string }) => {
-    const profile = await upsertProfile(input)
-    windowManager.broadcastAI('settings:changed', await getSettingsWithProfileKeyState())
-    return profile
-  })
+  ipcMain.handle(
+    'settings:save-profile',
+    async (
+      _e,
+      input: { id?: string; name: string; baseURL: string; model: string; key?: string; enableThinking?: boolean; extraBody?: string },
+    ) => {
+      const profile = await upsertProfile(input)
+      windowManager.broadcastAI('settings:changed', await getSettingsWithProfileKeyState())
+      return profile
+    },
+  )
 
   /** 删除服务商档案（被引用时抛错由渲染端 toast 展示），变更后广播同步各窗口 */
   ipcMain.handle('settings:delete-profile', async (_e, id: string) => {

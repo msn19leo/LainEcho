@@ -12,13 +12,16 @@
  * - 可疑标签词（用户/角色/AI）：输入时黄色弱提示，引导改用标准人称「对方/你」，不强制拦截。
  *   注意「对方」「你」是合法人称（自动沉淀记忆即用这套），不在警告范围内。
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { BrainCircuit, Check, Clock, RefreshCw, Search, Trash2 } from 'lucide-react'
 import { api } from '../../api'
 import { useMemoryStore } from '../../store/memoryStore'
 import { useCharacterStore } from '../../store/characterStore'
 import { useSettingsStore } from '../../store/settingsStore'
-import { Button, Card, Empty, Input, Loading, Switch, Textarea } from '../../components/ui'
+import { Button, Empty, Input, Loading, Switch, Textarea } from '../../components/ui'
+import { Section, SettingRow } from '../components/PanelShell'
+import { TabBar, type TabItem } from '../components/TabBar'
+import { usePersistedTab } from '../components/usePersistedTab'
 import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import type { MemoryCategory, MemoryItem, MemoryProfile } from '../../types'
@@ -74,6 +77,10 @@ function isDuplicateMemory(content: string, existing: MemoryItem[]): boolean {
   })
 }
 
+/** 二级 tab：已确认 / 待确认 / 用户画像 */
+const MEMORY_TAB_IDS = ['confirmed', 'pending', 'profile'] as const
+type MemoryTab = (typeof MEMORY_TAB_IDS)[number]
+
 export function MemoryPanel() {
   const {
     items, pendingItems, loading, pendingLoading,
@@ -86,7 +93,8 @@ export function MemoryPanel() {
   const loadSettings = useSettingsStore((s) => s.load)
   const saveSettings = useSettingsStore((s) => s.save)
 
-  const [tab, setTab] = useState<'confirmed' | 'pending' | 'profile'>('confirmed')
+  /** 二级 tab：记在 localStorage，切面板/重启后回到原处 */
+  const [tab, setTab] = usePersistedTab<MemoryTab>('memory-tab', MEMORY_TAB_IDS, 'confirmed')
   // 分类/归属下拉：'all' = 不筛选（新增时回退默认 long_term / 全局）
   const [filterCat, setFilterCat] = useState<MemoryCategory | 'all'>('all')
   const [filterOwner, setFilterOwner] = useState<string>('all') // 'all' | 'global' | cardId
@@ -104,6 +112,8 @@ export function MemoryPanel() {
   /** 搜索结果（null = 未在搜索态）；每项附带语义相似度分（本地过滤回退时无分） */
   const [searchResults, setSearchResults] = useState<Array<MemoryItem & { score?: number }> | null>(null)
   const [searching, setSearching] = useState(false)
+  /** 搜索请求序号：筛选快速变化时丢弃过期结果 */
+  const searchSeqRef = useRef(0)
   /** 画像 tab 当前归属的档案（档案归属选择器决定：global = 全局） */
   const [profile, setProfile] = useState<MemoryProfile | null>(null)
   /** 画像总览（全局查看态）：所有角色的生效画像（key = 角色卡 id 或 '_global'） */
@@ -162,34 +172,53 @@ export function MemoryPanel() {
     void api.memory.getProfileOverview().then(setProfileOverview).catch(() => setProfileOverview([]))
   }, [profileOwner, cards])
 
-  // 切记忆归属筛选后清掉搜索态，避免跨角色残留
-  useEffect(() => {
-    setSearchResults(null)
-    setSearchQuery('')
-  }, [filterOwner])
+  /** 当前分类/归属筛选是否命中（普通列表与搜索结果共用同一口径） */
+  const inScope = (m: MemoryItem) =>
+    (filterCat === 'all' || m.category === filterCat) &&
+    (filterOwner === 'all' || (filterOwner === 'global' ? m.characterCardId == null : m.characterCardId === filterOwner))
 
-  /** 语义搜索：向量命中按相似度排序展示；嵌入不可用/无命中时回退本地包含过滤 */
+  /** 当前筛选范围内的已确认记忆：普通列表与搜索回退都基于它 */
+  const scopedItems = items.filter(inScope)
+
+  /** 语义搜索：只在当前分类/归属范围内检索；嵌入不可用/无命中时回退本地包含过滤 */
   const handleSearch = async () => {
     const q = searchQuery.trim()
+    const seq = ++searchSeqRef.current
     if (!q) {
       setSearchResults(null)
+      setSearching(false)
       return
     }
     setSearching(true)
     try {
-      const hits = await api.memory.semanticSearch(q, 20)
+      const hits = await api.memory.semanticSearch(q, 20, { category: filterCat, owner: filterOwner })
+      if (seq !== searchSeqRef.current) return
       if (hits.length > 0) {
         setSearchResults(hits.map((h) => ({ ...h.item, score: h.score })))
       } else {
-        // 回退本地过滤（嵌入未配置或低置信无命中）
-        setSearchResults(items.filter((m) => m.content.includes(q)))
+        // 回退本地过滤：只搜当前筛选范围，避免跨分类/跨角色
+        setSearchResults(scopedItems.filter((m) => m.content.includes(q)))
       }
     } catch {
-      setSearchResults(items.filter((m) => m.content.includes(q)))
+      if (seq !== searchSeqRef.current) return
+      setSearchResults(scopedItems.filter((m) => m.content.includes(q)))
     } finally {
-      setSearching(false)
+      if (seq === searchSeqRef.current) setSearching(false)
     }
   }
+
+  // 分类/归属任一变化：有搜索词时按新范围重搜；无搜索词时回到普通筛选列表。
+  // 只监听筛选，不监听 searchQuery：输入过程中不自动请求，仍由回车/搜索按钮触发。
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      searchSeqRef.current++
+      setSearchResults(null)
+      setSearching(false)
+      return
+    }
+    void handleSearch()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterCat, filterOwner])
 
   /** 触发画像整理：聚合「用户信息」类记忆为画像草稿（采纳后才常驻注入） */
   const handleConsolidate = async () => {
@@ -267,14 +296,10 @@ export function MemoryPanel() {
     }
   }
 
-  /** 按当前筛选过滤已确认记忆；搜索态下改用搜索结果（语义排序或本地过滤） */
+  /** 普通列表用当前筛选范围；搜索态再用同一范围兜底过滤，防止越界结果 */
   const filteredItems: Array<MemoryItem & { score?: number }> = searchResults
-    ? searchResults
-    : items.filter(
-        (m) =>
-          (filterCat === 'all' || m.category === filterCat) &&
-          (filterOwner === 'all' || (filterOwner === 'global' ? m.characterCardId == null : m.characterCardId === filterOwner)),
-      )
+    ? searchResults.filter(inScope)
+    : scopedItems
 
   /** 新增已确认记忆（分类/归属取下拉当前值，'all' 回退默认）：提交前做轻量引导校验 */
   const handleAdd = async () => {
@@ -355,12 +380,6 @@ export function MemoryPanel() {
   }
 
   const pendingCount = pendingItems.length
-  const tabBtn = (active: boolean) =>
-    `inline-flex items-center gap-1 rounded-[var(--radius-md)] border px-3 py-1.5 text-xs font-medium transition-colors ${
-      active
-        ? 'border-[var(--border-strong)] bg-surface-2 text-text'
-        : 'border-border text-text-2 hover:border-border-strong hover:text-text'
-    }`
   const metaTag = 'rounded-full border border-[var(--border-strong)] bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-text-muted'
 
   // 新增输入的实时引导状态（仅展示，不阻断输入）
@@ -371,52 +390,55 @@ export function MemoryPanel() {
 
   return (
     <div className="space-y-3">
-      {/* 自动沉淀记忆开关 */}
-      <div className="flex items-center justify-between rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
-        <div>
-          <div className="text-sm text-text">自动沉淀记忆</div>
-          <div className="text-xs text-text-muted">
-            会话结束后自动从对话中提取候选记忆（在下方「待确认候选」审核后生效），会额外消耗一次模型调用
-          </div>
-        </div>
-        <Switch
-          checked={settings.enableMemoryExtraction}
-          onChange={(v) => void saveSettings({ enableMemoryExtraction: v })}
-        />
-      </div>
+      <Section title="记忆机制">
+        <SettingRow
+          title="自动沉淀记忆"
+          desc="会话结束后自动从对话中提取候选记忆（在「待确认候选」审核后生效），会额外消耗一次模型调用"
+          onClick={() => void saveSettings({ enableMemoryExtraction: !settings.enableMemoryExtraction })}
+        >
+          <Switch
+            checked={settings.enableMemoryExtraction}
+            onChange={(v) => void saveSettings({ enableMemoryExtraction: v })}
+          />
+        </SettingRow>
 
-      {/* 记忆向量检索（档案制：激活的嵌入档案提供 地址/模型/Key） */}
-      <div className="space-y-3 rounded-[var(--radius-md)] bg-surface-2 px-4 py-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm text-text">记忆向量检索</div>
-            <div className="text-xs text-text-muted">
-              按当前对话内容检索最相关的记忆注入（不再固定取最近几条）；关闭或未启用嵌入档案时回退旧行为
-            </div>
-          </div>
+        <SettingRow
+          title="记忆向量检索"
+          desc="按当前对话内容检索最相关的记忆注入，不再固定取最近几条；关闭或未启用嵌入档案时回退旧行为"
+          onClick={() => void saveSettings({ memoryRetrievalEnabled: !settings.memoryRetrievalEnabled })}
+        >
           <Switch
             checked={settings.memoryRetrievalEnabled}
             onChange={(v) => void saveSettings({ memoryRetrievalEnabled: v })}
           />
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="shrink-0 text-xs text-text-muted">嵌入档案</span>
-          <SelectMenu
-            value={settings.activeEmbeddingProfileId ?? ''}
-            onChange={(v) => void saveSettings({ activeEmbeddingProfileId: v || null })}
-            options={[{ value: '', label: '未启用' }, ...(settings.profiles ?? []).map((p) => ({ value: p.id, label: `${p.name} · ${p.model || '未填模型'}${p.hasKey ? '' : '（未配 Key）'}` }))]}
-            placeholder="未启用（选择一个档案）"
-            className="min-w-0 flex-1"
-          />
-          <Button variant="outline" onClick={() => void handleTestEmbedding()} disabled={testingEmbed}>
-            {testingEmbed ? '测试中…' : '测试连接'}
-          </Button>
-        </div>
-        <div className="text-xs text-text-muted">
-          档案的地址/模型/Key 在「AI API 配置 → 服务商档案库」中维护；嵌入需选择支持 /embeddings 端点的服务（如 text-embedding-3-small / bge-m3）
-        </div>
-        <div className="flex items-center gap-2 text-xs text-text-muted">
-          <span className="shrink-0">语义去重阈值</span>
+        </SettingRow>
+
+        <SettingRow
+          title="嵌入档案"
+          desc="地址 / 模型 / Key 在「AI 模型接入 → 服务商档案库」维护；需支持 /embeddings 端点（如 text-embedding-3-small、bge-m3）"
+          stacked
+        >
+          <div className="flex items-center gap-2">
+            <SelectMenu
+              value={settings.activeEmbeddingProfileId ?? ''}
+              onChange={(v) => void saveSettings({ activeEmbeddingProfileId: v || null })}
+              options={[
+                { value: '', label: '未启用' },
+                ...(settings.profiles ?? []).map((p) => ({
+                  value: p.id,
+                  label: `${p.name} · ${p.model || '未填模型'}${p.hasKey ? '' : '（未配 Key）'}`,
+                })),
+              ]}
+              placeholder="未启用（选择一个档案）"
+              className="min-w-0 flex-1"
+            />
+            <Button variant="outline" size="sm" onClick={() => void handleTestEmbedding()} disabled={testingEmbed}>
+              {testingEmbed ? '测试中…' : '测试连接'}
+            </Button>
+          </div>
+        </SettingRow>
+
+        <SettingRow title="语义去重阈值" desc="cos ≥ 该值的候选记忆视为重复；默认 0.92">
           <input
             type="number"
             min={0.5}
@@ -427,55 +449,73 @@ export function MemoryPanel() {
               const v = Number(e.target.value)
               if (!Number.isNaN(v)) void saveSettings({ memoryDedupThreshold: Math.min(0.99, Math.max(0.5, v)) })
             }}
-            className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-xs text-text"
+            className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-right text-xs tabular-nums text-text"
           />
-          <span>（cos ≥ 该值的候选记忆视为重复；默认 0.92）</span>
-          <span className="flex-1" />
+        </SettingRow>
+
+        <SettingRow title="重建向量索引" desc="切换嵌入档案或更换嵌入模型后，需要重新计算全部记忆的向量">
           <Button
             variant="outline"
             size="sm"
             onClick={() => void handleReembed()}
-            disabled={reembedding || !(settings.activeEmbeddingProfileId && (settings.profiles ?? []).some((p) => p.id === settings.activeEmbeddingProfileId))}
+            disabled={
+              reembedding ||
+              !(settings.activeEmbeddingProfileId && (settings.profiles ?? []).some((p) => p.id === settings.activeEmbeddingProfileId))
+            }
           >
             <RefreshCw size={13} strokeWidth={2} className={reembedding ? 'animate-spin' : ''} />
             重新嵌入
           </Button>
-        </div>
-      </div>
+        </SettingRow>
+      </Section>
 
       {/* Tab：已确认 / 待确认 / 用户画像 */}
-      <div className="flex flex-wrap gap-2">
-        <button type="button" className={tabBtn(tab === 'confirmed')} onClick={() => setTab('confirmed')}>
-          已确认记忆
-        </button>
-        <button type="button" className={tabBtn(tab === 'pending')} onClick={() => setTab('pending')}>
-          待确认候选
-          {pendingCount > 0 && (
-            <span className="rounded-full bg-[var(--accent-500)] px-1.5 text-[10px] font-semibold text-white">{pendingCount}</span>
-          )}
-        </button>
-        <button type="button" className={tabBtn(tab === 'profile')} onClick={() => setTab('profile')}>
-          用户画像
-          {profile?.pendingDigest?.trim() && (
-            <span className="h-2 w-2 rounded-full bg-[var(--warning)]" title="有待采纳的画像草稿" />
-          )}
-        </button>
-      </div>
+      <TabBar
+        tabs={
+          [
+            { id: 'confirmed', label: '已确认记忆' },
+            {
+              id: 'pending',
+              label: '待确认候选',
+              badge:
+                pendingCount > 0 ? (
+                  <span className="rounded-full bg-[var(--accent-500)] px-1.5 text-[10px] font-semibold text-white">
+                    {pendingCount}
+                  </span>
+                ) : undefined,
+            },
+            {
+              id: 'profile',
+              label: '用户画像',
+              badge: profile?.pendingDigest?.trim() ? (
+                <span className="h-2 w-2 rounded-full bg-[var(--warning)]" title="有待采纳的画像草稿" />
+              ) : undefined,
+            },
+          ] satisfies readonly TabItem<MemoryTab>[]
+        }
+        value={tab}
+        onChange={setTab}
+      />
 
       {tab === 'confirmed' ? (
         <>
-          {/* 语义搜索：向量检索命中按相似度排序；嵌入不可用时回退本地包含过滤 */}
+          {/* 语义搜索：在当前分类/归属范围内向量检索；嵌入不可用时回退本地包含过滤 */}
           <div className="flex items-center gap-2">
             <Input
               value={searchQuery}
               onChange={(e) => {
                 setSearchQuery(e.target.value)
-                if (!e.target.value.trim()) setSearchResults(null)
+                if (!e.target.value.trim()) {
+                  // 清空即退出搜索态，同时作废在途请求，避免旧结果回填
+                  searchSeqRef.current++
+                  setSearchResults(null)
+                  setSearching(false)
+                }
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void handleSearch()
               }}
-              placeholder="语义搜索记忆（回车搜索，清空恢复列表）"
+              placeholder="在当前筛选范围内语义搜索（回车搜索，清空恢复列表）"
               className="min-w-0 flex-1"
             />
             <Button variant="outline" onClick={() => void handleSearch()} disabled={searching || !searchQuery.trim()}>
@@ -488,7 +528,7 @@ export function MemoryPanel() {
             <Input
               value={newContent}
               onChange={(e) => setNewContent(e.target.value)}
-              placeholder="输入一条长期记忆，如：对方喜欢的称呼是「亲爱的」"
+              placeholder="输入一条长期记忆，如：用户喜欢的称呼是「亲爱的」"
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void handleAdd()
               }}
@@ -542,9 +582,9 @@ export function MemoryPanel() {
           ) : filteredItems.length === 0 ? (
             <Empty text={items.length === 0 ? '还没有已确认的记忆' : '当前筛选条件下没有记忆'} />
           ) : (
-            <div className="space-y-2">
+            <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-lg)] border border-border bg-card/70">
               {filteredItems.map((item) => (
-                <Card key={item.id} className="flex items-center gap-3 py-3">
+                <div key={item.id} className="flex items-center gap-3 px-4 py-2.5">
                   <span
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
                     style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}
@@ -615,7 +655,7 @@ export function MemoryPanel() {
                       </Button>
                     </div>
                   )}
-                </Card>
+                </div>
               ))}
             </div>
           )}
@@ -631,9 +671,9 @@ export function MemoryPanel() {
           ) : pendingItems.length === 0 ? (
             <Empty text="暂无待确认候选" />
           ) : (
-            <div className="space-y-2">
+            <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-lg)] border border-border bg-card/70">
               {pendingItems.map((item) => (
-                <Card key={item.id} className="flex items-center gap-3 py-3">
+                <div key={item.id} className="flex items-center gap-3 px-4 py-2.5">
                   <span
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
                     style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}
@@ -694,7 +734,7 @@ export function MemoryPanel() {
                       </Button>
                     </div>
                   )}
-                </Card>
+                </div>
               ))}
             </div>
           )}
@@ -723,12 +763,12 @@ export function MemoryPanel() {
           {profileOwner === 'global' ? (
             /* 全局查看态：所有角色的生效画像总览（整理/编辑请切到对应角色；注入开关可直接切） */
             profileOverview.length > 0 ? (
-              <div className="space-y-2">
+              <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-lg)] border border-border bg-card/70">
                 {profileOverview.map((item) => {
                   const name = item.key === '_global' ? '全局' : (cards.find((c) => c.id === item.key)?.name ?? '已删除角色')
                   const enabled = item.personaEnabled !== false
                   return (
-                    <Card key={item.key} className="flex items-center gap-3 py-3">
+                    <div key={item.key} className="flex items-center gap-3 px-4 py-2.5">
                       <div className="min-w-0 flex-1">
                         <div className="mb-1 flex items-center gap-1.5">
                           <span className={metaTag}>{name}</span>
@@ -742,7 +782,7 @@ export function MemoryPanel() {
                       </div>
                       {/* 注入开关：关 = 暂停该画像的常驻注入（画像保留） */}
                       <Switch checked={enabled} onChange={() => void handleToggleProfile(item.key, enabled)} />
-                    </Card>
+                    </div>
                   )
                 })}
               </div>
@@ -764,7 +804,7 @@ export function MemoryPanel() {
                 </div>
               )}
               {profile?.personaDigest?.trim() && !editingProfile && (
-                <Card className="flex items-center gap-3 py-3">
+                <div className="flex items-center gap-3 px-4 py-2.5">
                   <div className="min-w-0 flex-1">
                     <div className="mb-1 flex items-center gap-1.5">
                       <span className={metaTag}>{profileOwnerName}</span>
@@ -796,7 +836,7 @@ export function MemoryPanel() {
                       </Button>
                     </div>
                   </div>
-                </Card>
+                </div>
               )}
               {editingProfile && (
                 <div className="space-y-2 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-surface-2 p-3">

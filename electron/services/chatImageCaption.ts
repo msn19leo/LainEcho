@@ -10,10 +10,10 @@
  * 若 chatImages 直接引档案解析，会形成 repository → chatImages → apiProfiles → repository。
  */
 import { resolveProfile } from './apiProfiles'
-import { normalizeBaseURL } from './aiClient'
+import { normalizeBaseURL, thinkingPatch } from './aiClient'
 
 /** 转述输出 token 上限（思考型模型的 reasoning 也会占用，留足余量） */
-const CAPTION_MAX_TOKENS = 800
+const CAPTION_MAX_TOKENS = 1024
 /** 转述文本字符上限（落盘与回填上下文都按此截断） */
 const CAPTION_MAX_CHARS = 600
 /** 单次转述超时：视觉模型卡住时不能拖住整轮对话 */
@@ -43,6 +43,9 @@ export async function describeChatImage(jpegBase64: string): Promise<string> {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
       body: JSON.stringify({
         model: cfg.model,
+        // 视觉模型同样受档案的思考开关约束：思考 token 计入 max_tokens，
+        // 不注入时 GLM-4.6V 之类的模型会先把预算烧在推理上、转述文本为空
+        ...(thinkingPatch(cfg.model, cfg.enableThinking) ?? {}),
         messages: [
           {
             role: 'user',

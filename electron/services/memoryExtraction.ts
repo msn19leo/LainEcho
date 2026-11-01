@@ -9,6 +9,7 @@
  */
 import type { ChatMessage, MemoryCategory, MemoryItem } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
+import { llmRequest, type ResolvedLlmConfig } from './apiProfiles'
 import { embedTexts, type EmbeddingConfig } from './memory/embeddingService'
 import { resolveEmbeddingConfig, syncMemoryVectors } from './memory/memoryVectors'
 import { addPendingMemory, getCharacterCard, getSettings, listMemories, updateMemory } from './repository'
@@ -196,7 +197,8 @@ export async function extractMemoriesFromSession(params: {
   sessionId: string
   cardId: string
   messages: ChatMessage[]
-  settings: { model: string; baseURL: string; apiKey: string }
+  /** 主模型档案解析结果（含思考开关与额外参数，统一经 llmRequest 注入） */
+  settings: ResolvedLlmConfig
 }): Promise<void> {
   const { sessionId, cardId, messages, settings } = params
   if (!cardId || !settings.apiKey) return
@@ -228,14 +230,11 @@ export async function extractMemoriesFromSession(params: {
         { role: 'system', content: buildExtractSystemPrompt(cardName) },
         { role: 'user', content: `以下是对话：\n${dialogueText}\n\n请提取记忆：` },
       ],
-      {
-        model: settings.model,
-        baseURL: settings.baseURL,
-        apiKey: settings.apiKey,
-        temperature: 0.2,
-        stream: false,
-        maxTokensOverride: EXTRACT_MAX_TOKENS,
-      },
+      llmRequest(
+        settings,
+        { temperature: 0.2, stream: false, maxTokensOverride: EXTRACT_MAX_TOKENS },
+        { aux: true },
+      ),
     )
     const parsed = parseExtractionJson(raw)
     if (!parsed || parsed.length === 0) {

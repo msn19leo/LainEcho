@@ -79,6 +79,17 @@ export async function updateRunState(runId: string, state: StoryState): Promise<
   })
 }
 
+/** 追加一条事件日志（完整重看用）。一个事件写一次，文件很小，不做批量攒写。 */
+export async function appendRunEventLog(runId: string, entry: import('../../../src/types').StoryEventLogEntry): Promise<void> {
+  assertValidRunId(runId)
+  await mutateJson<StoryRun | null>(runFile(runId), null, (cur) => {
+    if (!cur) return cur
+    const log = cur.eventLog ?? []
+    log.push(entry)
+    return { ...cur, eventLog: log, updatedAt: Date.now() }
+  })
+}
+
 /** 更新立绘视图（大小/位置；随 run 存档） */
 export async function updateRunSpriteView(runId: string, view: StoryRun['spriteView']): Promise<void> {
   assertValidRunId(runId)

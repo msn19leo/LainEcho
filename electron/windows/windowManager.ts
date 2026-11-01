@@ -8,7 +8,7 @@ import { createPetWindow, markPetWindowQuitting, PET_WINDOW_SIZE, reassertTopmos
 import { createChatWindow } from './chatWindow'
 import { createSettingsWindow } from './settingsWindow'
 import { createStoryWindow } from './storyWindow'
-import type { ModelSettings, PetCardPayload, TTSEngine, TTSLanguage } from '../../src/types'
+import type { ModelSettings, ModelProfile, PetCardPayload, TTSEngine, TTSLanguage } from '../../src/types'
 
 class WindowManager {
   pet: BrowserWindow | null = null
@@ -180,6 +180,52 @@ class WindowManager {
   notifyModelSettingsChanged(settings: ModelSettings): void {
     if (this.pet && !this.pet.isDestroyed()) {
       this.pet.webContents.send('pet:model-settings-changed', settings)
+    }
+  }
+
+  /** 当前模型的参数能力表（桌宠窗加载模型后上报；设置窗据此渲染滑杆） */
+  private modelProfile: ModelProfile | null = null
+
+  /** 桌宠窗上报能力表 → 缓存 + 转发设置窗 */
+  notifyModelProfile(profile: ModelProfile): void {
+    this.modelProfile = profile
+    if (this.settings && !this.settings.isDestroyed()) {
+      this.settings.webContents.send('settings:model-profile', profile)
+    }
+  }
+
+  /** 设置窗按模型取能力表（只缓存当前加载的那一个） */
+  getModelProfile(modelId: string): ModelProfile | null {
+    return this.modelProfile?.modelId === modelId ? this.modelProfile : null
+  }
+
+  /** 当前由状态词表驱动的表情名（null = 无），供设置窗标记"该项由状态控制" */
+  private activeStateExpression: string | null = null
+
+  /** 桌宠窗算出状态表情后上报；缓存一份并转发设置窗（设置窗可能还没打开） */
+  notifyStateExpression(name: string | null): void {
+    this.activeStateExpression = name
+    if (this.settings && !this.settings.isDestroyed()) {
+      this.settings.webContents.send('settings:state-expression', name)
+    }
+  }
+
+  /** 设置窗挂载时主动取一次当前值 */
+  getStateExpression(): string | null {
+    return this.activeStateExpression
+  }
+
+  /** 让桌宠取消当前状态表情（外观面板点了"·状态"项） */
+  dismissStateExpression(): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:dismiss-state-expression')
+    }
+  }
+
+  /** 让桌宠立即播放指定动作组（设置面板「一键动作」，只播一次、不落盘） */
+  playMotion(group: string): void {
+    if (this.pet && !this.pet.isDestroyed()) {
+      this.pet.webContents.send('pet:play-motion', group)
     }
   }
 
@@ -437,14 +483,30 @@ class WindowManager {
 
   // ---------------- 剧情 ----------------
 
+  /** 待进入的回放 runId（打开剧情窗时一次性消费；正常演出为 null） */
+  private pendingReplayRunId: string | null = null
+
   /** 打开/聚焦剧情窗（演出在主进程进行，窗口关闭不中断；重开按快照恢复） */
-  showStory(): void {
+  showStory(replayRunId?: string | null): void {
+    if (replayRunId !== undefined) this.pendingReplayRunId = replayRunId
     if (!this.story || this.story.isDestroyed()) {
       this.story = createStoryWindow()
       return
     }
     if (!this.story.isVisible()) this.story.show()
     this.story.focus()
+  }
+
+  /** 取走待回放 runId（renderer-ready 时调用，取一次即清） */
+  consumePendingReplay(): string | null {
+    const id = this.pendingReplayRunId
+    this.pendingReplayRunId = null
+    return id
+  }
+
+  /** 放弃待回放（用户改主意去开新演出时调用，避免下次开窗误入回放） */
+  clearPendingReplay(): void {
+    this.pendingReplayRunId = null
   }
 
   /** 向剧情窗发送事件（快照补发等；窗口未开则静默忽略） */

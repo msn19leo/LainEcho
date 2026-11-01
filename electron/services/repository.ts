@@ -23,8 +23,8 @@ import type {
   TTSModelCardInput,
   VisionSettings,
 } from '../../src/types'
-import { CHARACTER_CARD_VERSION, BUILTIN_DEFAULT_EMOTION, BUILTIN_DEFAULT_GLOSS, builtinPalette, paletteFromSprite } from '../../src/types'
-import type { CharacterSprite, SpritePaletteEntry } from '../../src/types'
+import { CHARACTER_CARD_VERSION, BUILTIN_DEFAULT_EMOTION, builtinPalette, paletteFromSprite, normalizeLabel, labelMatches } from '../../src/types'
+import type { CharacterSprite, CharacterSpriteImage, ModelPaletteEntry, SpritePaletteEntry } from '../../src/types'
 import { removeSessionImages } from './chatImages'
 import { paths, readJson, writeJson, mutateJson, deleteFile, fileExists } from './storage'
 import { buildSystemParts } from './prompt/sections'
@@ -377,7 +377,7 @@ function formatMemoryAge(createdAt: number, now = Date.now()): string {
  * @param proactiveHint 是否注入主动搭话常驻说明（enableProactive 开启时为 true）
  * @param storyDirective 剧情导演指令段（仅剧情演出轮次注入；缺省不注入）
  * @param stripParenNarration 台词模式（「回答仅含台词」开启时为 true）：旁白规范段替换为禁括号版本
- * @param emotionPalette 角色绑定的状态词表（null = 未启用词表，输出格式段维持旧 6 枚举金样原文）
+ * @param emotionPalette 角色绑定的状态词表（编号契约：输出格式段按词表生成 1..N 编号清单）
  * @param timeAwareness 时间感知总开关（缺省/undefined = 开启，向后兼容）：开启 → 当前时间锚点 +
  *   记忆年龄标注；关闭 → 防时间幻觉条款。记忆检索打分的 recency 因子属于排序逻辑，不受此开关影响
  */
@@ -846,11 +846,20 @@ export async function removeSprite(spriteId: string): Promise<void> {
 /** 更新立绘集的展示资产：状态词表 / 经典状态映射 / 说话立绘 / 思考立绘 / 名称 */
 export async function updateSprite(
   spriteId: string,
-  patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultEmotion' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>,
+  patch: Partial<Pick<CharacterSprite, 'name' | 'emotions' | 'defaultImage' | 'speakingImage' | 'thinkingImage' | 'observingImage'>>,
 ): Promise<void> {
   assertValidResourceId(spriteId, 'sprite')
   await mutateJson(paths.spritesIndexFile, DEFAULT_SPRITES, (list) =>
-    list.map((s) => (s.id === spriteId ? { ...s, ...patch } : s)),
+    list.map((s) => {
+      if (s.id !== spriteId) return s
+      const next = { ...s, ...patch }
+      if (!patch.emotions) return next
+      // 一张图一条标签 + 按图片顺序固化编号；默认图必须落在合并后仍有标签的图里
+      const emotions = normalizeSpriteEntries(patch.emotions, s.images ?? [])
+      const wanted = patch.defaultImage ?? s.defaultImage ?? ''
+      const defImage = emotions.some((e) => e.image === wanted) ? wanted : (emotions[0]?.image ?? '')
+      return { ...next, emotions, defaultImage: defImage }
+    }),
   )
 }
 
@@ -876,6 +885,125 @@ export async function getSpritePalette(spriteId: string | null | undefined): Pro
 type ModelPaletteStore = Record<string, ModelPalette>
 
 /**
+ * 立绘词表归一化：**一张图一条标签**。
+ *
+ * 多个词条指向同一张图时合并成一条（`不满` + `生气` → `不满，生气`），
+ * 并按 `images` 顺序重排——编号只由数组顺序决定，保存时就固化，
+ * 避免"渲染时排一次、解析时再算一次"两套口径。
+ */
+export function normalizeSpriteEntries(
+  entries: SpritePaletteEntry[],
+  images: CharacterSpriteImage[],
+): SpritePaletteEntry[] {
+  const groups = new Map<string, string[]>()
+  for (const e of entries) {
+    const image = String(e?.image ?? '').trim()
+    const label = normalizeLabel(e?.name ?? '')
+    if (!image || !label) continue
+    groups.set(image, [...(groups.get(image) ?? []), label])
+  }
+  const order = new Map(images.map((img, i) => [img.filePath, i]))
+  return [...groups.entries()]
+    .map(([image, labels]) => ({ name: normalizeLabel(labels.join('，')), image }))
+    .sort((a, b) => (order.get(a.image) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.image) ?? Number.MAX_SAFE_INTEGER))
+}
+
+/**
+ * 模型词表归一化：**一个表情一条标签**，默认表情（无 expression）恒为编号 1。
+ *
+ * 同一表情只保留一条（多条合并标签），因为一个编号对应一个视觉单元；
+ * 未指定表情的行统一归入"默认表情"组，它由「角色模型 → 外观」的静态表情决定长相。
+ */
+export function normalizeModelEntries(entries: ModelPaletteEntry[]): ModelPaletteEntry[] {
+  const groups = new Map<string, string[]>()
+  for (const e of entries) {
+    const key = String(e?.expression ?? '').trim()
+    const label = normalizeLabel(e?.name ?? '')
+    if (!label) continue
+    groups.set(key, [...(groups.get(key) ?? []), label])
+  }
+  const out: ModelPaletteEntry[] = []
+  const def = groups.get('')
+  if (def) out.push({ name: normalizeLabel(def.join('，')) })
+  for (const [key, labels] of groups) {
+    if (!key) continue
+    out.push({ name: normalizeLabel(labels.join('，')), expression: key })
+  }
+  return out
+}
+
+/** 读取顺序即编号顺序：默认表情行恒在首位（旧数据可能把默认行放在中间） */
+export function orderModelEntries(entries: ModelPaletteEntry[]): ModelPaletteEntry[] {
+  const def = entries.filter((e) => !String(e.expression ?? '').trim())
+  const rest = entries.filter((e) => !!String(e.expression ?? '').trim())
+  if (def.length === 0) return entries
+  return [def[0]!, ...rest]
+}
+
+/**
+ * 一次性迁移（启动调用）：把"一图多词条 / 一表情多词条"合并成"一条标签"，
+ * 剥离已废弃的 gloss 字段，并按新顺序固化编号。
+ *
+ * 幂等：已迁移的数据归一化后与原值逐字节相同，不会反复写盘。
+ * @returns 实际发生改写的立绘集/模型数量（仅日志用）
+ */
+export async function migratePaletteLabels(): Promise<{ sprites: number; models: number }> {
+  const list = await readJson<Partial<CharacterSprite>[]>(paths.spritesIndexFile, [])
+  let sprites = 0
+  const nextSprites = list.map((raw) => {
+    if (!raw) return raw
+    const rec = raw as Record<string, unknown>
+    // 空词表也要剥离旧字段（否则 defaultEmotion 会永远留在数据里）
+    if (!Array.isArray(raw.emotions) || raw.emotions.length === 0) {
+      if (!('defaultEmotion' in rec)) return raw
+      const next: Record<string, unknown> = { ...rec, defaultImage: typeof rec.defaultImage === 'string' ? rec.defaultImage : '' }
+      delete next.defaultEmotion
+      sprites++
+      return next as unknown as CharacterSprite
+    }
+    const images = Array.isArray(raw.images) ? (raw.images as CharacterSpriteImage[]) : []
+    const merged = normalizeSpriteEntries(raw.emotions as SpritePaletteEntry[], images)
+    // 旧字段 defaultEmotion 存的是**标签文字**：迁移成 defaultImage（按图定位）
+    const hasLegacy = 'defaultEmotion' in rec
+    const legacyDef = typeof rec.defaultEmotion === 'string' ? rec.defaultEmotion : ''
+    const wanted = typeof rec.defaultImage === 'string' ? rec.defaultImage : ''
+    const defImage =
+      merged.find((e) => e.image === wanted)?.image ??
+      (legacyDef ? merged.find((e) => labelMatches(legacyDef, e.name))?.image : undefined) ??
+      merged[0]?.image ??
+      ''
+    const changed =
+      hasLegacy || JSON.stringify(merged) !== JSON.stringify(raw.emotions) || defImage !== wanted
+    if (!changed) return raw
+    const next: Record<string, unknown> = { ...rec, emotions: merged, defaultImage: defImage }
+    delete next.defaultEmotion
+    sprites++
+    return next as unknown as CharacterSprite
+  })
+  if (sprites > 0) await writeJson(paths.spritesIndexFile, nextSprites)
+
+  let models = 0
+  const store = await readJson<ModelPaletteStore>(paths.modelPalettesFile, {})
+  const nextStore: ModelPaletteStore = {}
+  let storeChanged = false
+  for (const [id, pal] of Object.entries(store)) {
+    const entries = Array.isArray(pal?.entries) ? (pal.entries as ModelPaletteEntry[]) : []
+    const merged = normalizeModelEntries(entries)
+    if (JSON.stringify(merged) !== JSON.stringify(entries)) {
+      models++
+      storeChanged = true
+    }
+    if (merged.length > 0) nextStore[id] = { entries: merged }
+  }
+  if (storeChanged) await writeJson(paths.modelPalettesFile, nextStore)
+
+  if (sprites > 0 || models > 0) {
+    console.log('[migrate] 状态标签合并：立绘集 %d 个 / 模型词表 %d 个', sprites, models)
+  }
+  return { sprites, models }
+}
+
+/**
  * 读取 Live2D 模型演出词表视图（live2d 模式取词表入口，永不返回 null）：
  * 模型不存在 / 未配置词表 → 内置最小词表（仅"平静"，无表情联动，回落静态表情）。
  * 模型词表无默认状态概念：归一化兜底词固定取「平静」（在表内）或第一个词条，
@@ -888,9 +1016,10 @@ export async function getModelPalette(modelId: string | null | undefined): Promi
       const palette = store[modelId]
       if (palette && Array.isArray(palette.entries) && palette.entries.length > 0) {
         // 兜底词：平静（在表内）> 第一个词条（与 paletteFromSprite 的缺省口径一致）
-        const names = new Set(palette.entries.map((e) => e.name))
-        const def = names.has(BUILTIN_DEFAULT_EMOTION) ? BUILTIN_DEFAULT_EMOTION : palette.entries[0]!.name
-        return { entries: palette.entries.map((e) => ({ name: e.name, gloss: e.gloss })), defaultEmotion: def }
+        const ordered = orderModelEntries(palette.entries)
+        const names = new Set(ordered.map((e) => e.name))
+        const def = names.has(BUILTIN_DEFAULT_EMOTION) ? BUILTIN_DEFAULT_EMOTION : ordered[0]!.name
+        return { entries: ordered, defaultEmotion: def }
       }
     } catch {
       // 读取失败按未配置处理
@@ -910,15 +1039,7 @@ export async function updateModelPalette(modelId: string, palette: ModelPalette)
   await mutateJson<ModelPaletteStore>(paths.modelPalettesFile, {}, (store) => {
     const next: ModelPaletteStore = { ...store }
     if (Array.isArray(palette.entries) && palette.entries.length > 0) {
-      next[modelId] = {
-        entries: palette.entries
-          .filter((e) => e.name.trim())
-          .map((e) => ({
-            name: e.name.trim(),
-            gloss: e.gloss?.trim?.() ?? '',
-            ...(e.expression?.trim() ? { expression: e.expression.trim() } : {}),
-          })),
-      }
+      next[modelId] = { entries: normalizeModelEntries(palette.entries) }
     } else {
       delete next[modelId]
     }
@@ -937,15 +1058,15 @@ export async function deleteModelPalette(modelId: string): Promise<void> {
 }
 
 /**
- * 旧 6 枚举 → 词表词的迁移映射（含释义）。neutral 缺失时词表默认取第一个词条。
+ * 旧 6 枚举 → 词表标签的迁移映射。neutral 缺失时词表默认取第一个词条。
  */
-const LEGACY_EMOTION_MIGRATION: Record<string, { name: string; gloss: string }> = {
-  neutral: { name: BUILTIN_DEFAULT_EMOTION, gloss: BUILTIN_DEFAULT_GLOSS },
-  happy: { name: '开心', gloss: '愉悦雀跃' },
-  sad: { name: '难过', gloss: '低落委屈' },
-  angry: { name: '生气', gloss: '愤怒恼火' },
-  surprised: { name: '惊讶', gloss: '吃惊意外' },
-  shy: { name: '害羞', gloss: '脸红羞涩' },
+const LEGACY_EMOTION_MIGRATION: Record<string, string> = {
+  neutral: BUILTIN_DEFAULT_EMOTION,
+  happy: '开心',
+  sad: '难过',
+  angry: '生气',
+  surprised: '惊讶',
+  shy: '害羞',
 }
 
 /**
@@ -970,15 +1091,14 @@ export async function migrateSpriteEmotionMaps(): Promise<number> {
     for (const key of ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy']) {
       const image = legacyMap[key]
       if (!image) continue
-      const { name, gloss } = LEGACY_EMOTION_MIGRATION[key] ?? { name: key, gloss: '' }
-      entries.push({ name, gloss, image })
+      entries.push({ name: LEGACY_EMOTION_MIGRATION[key] ?? key, image })
     }
     if (entries.length === 0) return spr as unknown as CharacterSprite
     spr['emotions'] = entries
-    spr['defaultEmotion'] =
-      legacyMap['neutral'] && entries.some((e) => e.name === BUILTIN_DEFAULT_EMOTION)
-        ? BUILTIN_DEFAULT_EMOTION
-        : entries[0]!.name
+    // 默认状态按图存：优先 neutral 对应的图，否则第一条
+    const neutralImage = legacyMap['neutral']
+    spr['defaultImage'] =
+      neutralImage && entries.some((e) => e.image === neutralImage) ? neutralImage : entries[0]!.image
     migrated++
     console.log('[migrate] 立绘集 emotionMap → 词表：%s（%d 词条）', raw.name ?? raw.id, entries.length)
     return spr as unknown as CharacterSprite
@@ -988,10 +1108,10 @@ export async function migrateSpriteEmotionMaps(): Promise<number> {
 }
 
 /**
- * 计算词表内容指纹（djb2 十六进制）：词/释义与顺序任一变化都会改变指纹。
+ * 计算词表内容指纹（djb2 十六进制）：标签内容与顺序任一变化都会改变指纹。
  * 用于剧本 story.yaml 的 vocabHash 比对（打开剧本时检测"词表已变"）。
- * 指纹仅覆盖 name+gloss——vocabHash 的语义是「事件引用的状态词是否仍有效」，
- * 演出物（立绘图/表情绑定）变化不影响词的有效性，不参与指纹。
+ * 指纹仅覆盖标签串——vocabHash 的语义是「事件引用的状态是否仍有效」，
+ * 演出物（立绘图/表情绑定）变化不影响标签的有效性，不参与指纹。
  */
 export function paletteHash(palette: EmotionPaletteRef): string | null {
   if (!palette || palette.entries.length === 0) return null
@@ -1001,7 +1121,7 @@ export function paletteHash(palette: EmotionPaletteRef): string | null {
   }
   feed(palette.defaultEmotion)
   for (const e of palette.entries) {
-    feed(`|${e.name}|${e.gloss}`)
+    feed(`|${e.name}`)
   }
   return (hash >>> 0).toString(16)
 }
@@ -1098,6 +1218,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   textSpeed: 80,
   // 剧情窗对话框文字显示速度（独立于通用 textSpeed，仅剧情系统读取）
   storyTextSpeed: 80,
+  // 桌宠窗口：默认 300×480（模型区 440 + 输入条 40），x/y 未记录时落默认位置
+  petWindow: { width: 300, height: 480, x: null, y: null },
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -1105,6 +1227,7 @@ export async function getSettings(): Promise<AppSettings> {
   const merged = { ...DEFAULT_SETTINGS, ...(saved ?? {}) }
   // vision 为嵌套对象：浅合并会让缺失的子字段变 undefined，此处逐字段兜底
   merged.vision = { ...DEFAULT_SETTINGS.vision, ...(saved?.vision ?? {}) }
+  merged.petWindow = { ...DEFAULT_SETTINGS.petWindow, ...(saved?.petWindow ?? {}) }
   return merged
 }
 
@@ -1117,7 +1240,19 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.profiles !== undefined) {
       next.profiles = (Array.isArray(patch.profiles) ? patch.profiles : [])
         .filter((p): p is ApiProfile => !!p && typeof p.id === 'string' && /^prof_[0-9a-f]{12}$/.test(p.id))
-        .map((p) => ({ id: p.id, name: String(p.name ?? '').slice(0, 40), baseURL: String(p.baseURL ?? '').trim(), model: String(p.model ?? '').trim() }))
+        // 逐字段重建是安全边界（剔除传输态 hasKey 与未知字段），
+        // 但新增的可配置字段必须在这里显式放行，否则会静默丢失 ——
+        // 表现就是"改完保存，重新打开又变回默认值"。
+        .map((p) => ({
+          id: p.id,
+          name: String(p.name ?? '').slice(0, 40),
+          baseURL: String(p.baseURL ?? '').trim(),
+          model: String(p.model ?? '').trim(),
+          ...(typeof p.enableThinking === 'boolean' ? { enableThinking: p.enableThinking } : {}),
+          ...(typeof p.extraBody === 'string' && p.extraBody.trim()
+            ? { extraBody: p.extraBody.trim().slice(0, 4000) }
+            : {}),
+        }))
     }
     if (patch.activeMainProfileId !== undefined) next.activeMainProfileId = patch.activeMainProfileId
     if (patch.activeAuxProfileId !== undefined) next.activeAuxProfileId = patch.activeAuxProfileId
@@ -1191,11 +1326,29 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.userName !== undefined) next.userName = patch.userName
     if (patch.textSpeed !== undefined) next.textSpeed = patch.textSpeed
     if (patch.storyTextSpeed !== undefined) next.storyTextSpeed = patch.storyTextSpeed
+    if (patch.petWindow !== undefined) {
+      // 尺寸/位置都要夹取：手输或旧数据里的极端值会让窗口跑到屏幕外、或窄到按钮挤成一团
+      const pw = (patch.petWindow ?? {}) as Partial<AppSettings['petWindow']>
+      const w = Number(pw.width)
+      const h = Number(pw.height)
+      const num = (v: unknown): number | null =>
+        typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : null
+      // 位置由主进程在拖动结束后静默写入（不广播），所以渲染端手里的 x/y 往往是旧值。
+      // 缺省时保留磁盘上已记录的位置，避免"改一次尺寸把刚拖好的位置顶回去"。
+      const prev = (base.petWindow ?? {}) as Partial<AppSettings['petWindow']>
+      next.petWindow = {
+        width: Number.isFinite(w) ? Math.min(900, Math.max(240, Math.round(w))) : 300,
+        height: Number.isFinite(h) ? Math.min(1000, Math.max(380, Math.round(h))) : 480,
+        x: pw.x === undefined ? num(prev.x) : num(pw.x),
+        y: pw.y === undefined ? num(prev.y) : num(pw.y),
+      }
+    }
     return next
   })
   const merged = { ...DEFAULT_SETTINGS, ...result }
   // vision 同 getSettings：返回值也必须是完整嵌套对象，否则渲染端读子字段会拿到 undefined
   merged.vision = { ...DEFAULT_SETTINGS.vision, ...(result?.vision ?? {}) }
+  merged.petWindow = { ...DEFAULT_SETTINGS.petWindow, ...(result?.petWindow ?? {}) }
   return merged
 }
 
@@ -1220,6 +1373,9 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
     bodyAngleX: 0, bodyAngleY: 0, bodyAngleZ: 0,
     breath: 0,
   },
+  parametersByModel: {},
+  appearancesByModel: {},
+  appearanceLayoutByModel: {},
   animation: {
     mouseTracking: true,
     eyeOffsetX: 0, eyeOffsetY: 0,
@@ -1245,6 +1401,9 @@ export async function getModelSettings(): Promise<ModelSettings> {
   if (!saved) return DEFAULT_MODEL_SETTINGS
   return {
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(saved.parameters ?? {}) },
+    parametersByModel: saved.parametersByModel ?? {},
+    appearancesByModel: saved.appearancesByModel ?? {},
+    appearanceLayoutByModel: saved.appearanceLayoutByModel ?? {},
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
     spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(saved.spriteView ?? {}) },
@@ -1259,6 +1418,10 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     const base = current ?? {}
     const next: Partial<ModelSettings> = { ...base }
     if (patch.parameters) next.parameters = { ...(base.parameters ?? {}), ...patch.parameters }
+    // 按模型的映射：模型维度整体替换（调用方总是提交该模型的完整对象），其它模型原样保留
+    if (patch.parametersByModel) next.parametersByModel = { ...(base.parametersByModel ?? {}), ...patch.parametersByModel }
+    if (patch.appearancesByModel) next.appearancesByModel = { ...(base.appearancesByModel ?? {}), ...patch.appearancesByModel }
+    if (patch.appearanceLayoutByModel) next.appearanceLayoutByModel = { ...(base.appearanceLayoutByModel ?? {}), ...patch.appearanceLayoutByModel }
     if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
     if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
     if (patch.spriteView) next.spriteView = { ...(base.spriteView ?? {}), ...patch.spriteView }
@@ -1268,12 +1431,48 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
   })
   return {
     parameters: { ...DEFAULT_MODEL_SETTINGS.parameters, ...(result?.parameters ?? {}) },
+    parametersByModel: result?.parametersByModel ?? {},
+    appearancesByModel: result?.appearancesByModel ?? {},
+    appearanceLayoutByModel: result?.appearanceLayoutByModel ?? {},
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
     spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(result?.spriteView ?? {}) },
     selectedModelId: result?.selectedModelId ?? DEFAULT_MODEL_SETTINGS.selectedModelId,
     selectedSpriteId: result?.selectedSpriteId ?? DEFAULT_MODEL_SETTINGS.selectedSpriteId,
   }
+}
+
+/**
+ * 删除某个模型的专属设置（姿态参数覆盖 + 外观选中项）。
+ * 模型被删除时调用，避免配置里留下指向不存在模型的孤儿键。
+ * @returns 清理后的完整设置（供主进程广播给桌宠窗）
+ */
+export async function dropModelSettings(modelId: string): Promise<ModelSettings | null> {
+  let changed = false
+  await mutateJson<Partial<ModelSettings> | null>(paths.modelSettingsFile, null, (current) => {
+    if (!current) return current
+    const next: Partial<ModelSettings> = { ...current }
+    if (next.parametersByModel && modelId in next.parametersByModel) {
+      const map = { ...next.parametersByModel }
+      delete map[modelId]
+      next.parametersByModel = map
+      changed = true
+    }
+    if (next.appearancesByModel && modelId in next.appearancesByModel) {
+      const map = { ...next.appearancesByModel }
+      delete map[modelId]
+      next.appearancesByModel = map
+      changed = true
+    }
+    if (next.appearanceLayoutByModel && modelId in next.appearanceLayoutByModel) {
+      const map = { ...next.appearanceLayoutByModel }
+      delete map[modelId]
+      next.appearanceLayoutByModel = map
+      changed = true
+    }
+    return changed ? next : current
+  })
+  return changed ? getModelSettings() : null
 }
 
 // ---------------- TTS 模型卡 ----------------

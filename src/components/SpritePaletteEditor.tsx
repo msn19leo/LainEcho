@@ -1,58 +1,100 @@
 /**
- * 状态词表编辑器（立绘集用，词表方案唯一状态配置入口）。
+ * 状态演出编辑器（立绘集用，状态配置唯一入口）。
  *
- * - 以图为中心的所见即所得编辑：左侧立绘缩略图网格（完整显示+滚动），
- *   点选缩略图 → 右侧大图预览 + 编辑挂在该图上的状态词列表（一图可挂多词，如"中性 平静"）；
- * - 词表数据模型不变（词 → 图：SpritePaletteEntry{name, gloss, image}，多词可指向同一图），
- *   "图为中心"只是编辑视角反转——prompt 注入 / AI 解析 / 渲染链零改动；
- * - 孤立词条兜底：无绑定图的存量词条显示在右区「未绑定立绘图」分组，可编辑或一键绑定到当前图；
- * - 默认状态：词表内选一词作兜底终点（系统唯一保留字，亦是空闲/重置时的默认展示）；
- * - 说话/思考立绘：系统演出态图（不进词表），选中缩略图后一键设置，带缩略预览与清除；
- * - 视觉打标：一键调用视觉模型逐张生成建议，按词归并回填草稿（产物不落盘，保存才生效）；
- * - 保存经 sprite:update({ emotions, defaultEmotion, speakingImage, thinkingImage }) 一次写回。
- *   注意：条目的 expression（Live2D 表情联动）在 Live2D 模型卡的「表情联动」弹窗维护，
- *   此处保存时原样透传，防止全量重建抹掉绑定。
+ * 核心约定：**一个编号 = 一条标签 = 一张图**。
+ *
+ * - 标签是**一个整体**，可以含「，」分隔的多段同义描述（`害羞，心动，脸红`），
+ *   它是一个字符串、一个编号，不是三个独立状态——prompt 里也只占一行；
+ * - 所以每张图只有一个输入框：清空即表示这张图不参与状态演出（不占编号）；
+ * - 编号按**图片列表顺序**生成（跳过没有标签的图），与左侧网格的阅读顺序一致；
+ * - 默认状态作用于**一条标签**（点缩略图右上角星标），不是词表里的某个"词"；
+ * - 说话/思考/观察图是系统演出态，不进词表、不占编号，单独一栏配置；
+ * - 视觉打标一次为每张图生成 2~4 个词，直接拼成一条标签写入草稿（保存才生效）。
  */
 import { useEffect, useMemo, useState } from 'react'
-import { ImageOff, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react'
+import { ImageOff, Loader2, Sparkles, Star, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../api'
-import type { CharacterSprite, SpritePaletteEntry } from '../types'
-import { Button } from './ui'
-import { SelectMenu } from './DropdownMenu'
+import { normalizeLabel, type CharacterSprite, type SpritePaletteEntry } from '../types'
+import { Button, Switch } from './ui'
 import { cn } from '../lib/utils'
 
-export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
+export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange, onDirtyChange }: {
   sprite: CharacterSprite
   /** 保存成功后回调（父级刷新立绘集列表） */
   onSaved: () => void
-  /** 词条数量变化回调（弹窗标题的状态词数量实时同步，增删即更新） */
+  /** 标签数量变化回调（弹窗标题实时同步，增删即更新） */
   onEntriesChange?: (count: number) => void
+  /** 草稿脏标记回调：父级据此决定关闭时是否需要"放弃未保存修改"确认 */
+  onDirtyChange?: (dirty: boolean) => void
 }) {
   const [entries, setEntries] = useState<SpritePaletteEntry[]>([])
-  const [defaultEmotion, setDefaultEmotion] = useState('')
+  /** 默认状态 = 哪一张图（文件名），不是标签文字：标签可能重复，图不会 */
+  const [defaultImage, setDefaultImage] = useState('')
   const [speakingImage, setSpeakingImage] = useState('')
   const [thinkingImage, setThinkingImage] = useState('')
   const [observingImage, setObservingImage] = useState('')
   const [annotating, setAnnotating] = useState(false)
+  /** 仅补未标注：跳过已有状态词的图（打标通常只补缺口，没必要重跑已配好的图） */
+  const [onlyUnlabelled, setOnlyUnlabelled] = useState(true)
   const [saving, setSaving] = useState(false)
-  /** 当前选中的缩略图（右区大图预览与挂词编辑的作用对象；默认第一张） */
+  /** 当前选中的缩略图（右区大图预览与标签编辑的作用对象；默认第一张） */
   const [selectedImage, setSelectedImage] = useState('')
+  /**
+   * 保存成功后的"基线覆盖"：父级刷新 props 是异步的（要重读列表），
+   * 这段空窗里草稿与旧 props 不同，若不覆盖会被误判成未保存 → 点 ✕ 白问一次。
+   */
+  const [savedSigOverride, setSavedSigOverride] = useState<string | null>(null)
 
   // 打开/切换立绘集时从当前配置初始化草稿
   useEffect(() => {
     setEntries(sprite.emotions.map((e) => ({ ...e })))
-    setDefaultEmotion(sprite.defaultEmotion || sprite.emotions[0]?.name || '')
+    setDefaultImage(sprite.defaultImage || sprite.emotions[0]?.image || '')
     setSpeakingImage(sprite.speakingImage ?? '')
     setThinkingImage(sprite.thinkingImage ?? '')
     setObservingImage(sprite.observingImage ?? '')
     setSelectedImage(sprite.images[0]?.filePath ?? '')
-  }, [sprite.id, sprite.emotions, sprite.defaultEmotion, sprite.speakingImage, sprite.thinkingImage, sprite.observingImage])
+    setSavedSigOverride(null)
+  }, [sprite.id, sprite.emotions, sprite.defaultImage, sprite.speakingImage, sprite.thinkingImage, sprite.observingImage])
 
-  // 词条数量变化 → 回调父级（弹窗标题实时同步）
   useEffect(() => {
     onEntriesChange?.(entries.length)
   }, [entries.length, onEntriesChange])
+
+  /**
+   * 草稿签名：与"已保存值"用**同一个函数**归一化后比较，避免因排序/分隔符差异误判为脏。
+   * 只有真正会落盘的四类字段进签名：标签（图 → 标签）、默认状态、说话/思考/观察图。
+   */
+  const signature = (
+    list: SpritePaletteEntry[],
+    def: string,
+    speaking: string,
+    thinking: string,
+    observing: string,
+  ) => {
+    // def 是图片文件名，不需要归一化
+    const byImage = new Map(list.map((e) => [e.image, e]))
+    const labels = sprite.images
+      .map((img) => {
+        const name = normalizeLabel(byImage.get(img.filePath)?.name ?? '')
+        return name ? `${img.filePath}|${name}` : ''
+      })
+      .filter(Boolean)
+    return JSON.stringify({ labels, def, speaking, thinking, observing })
+  }
+
+  const draftSig = signature(entries, defaultImage, speakingImage, thinkingImage, observingImage)
+  const savedSig = signature(
+    sprite.emotions,
+    sprite.defaultImage ?? '',
+    sprite.speakingImage ?? '',
+    sprite.thinkingImage ?? '',
+    sprite.observingImage ?? '',
+  )
+  const dirty = draftSig !== (savedSigOverride ?? savedSig)
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
 
   /** 立绘图预览 URL（pet-res:// 协议，设置窗可直接访问） */
   const imageUrl = useMemo(
@@ -60,48 +102,107 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
     [sprite.id],
   )
 
-  /** 当前选中图挂着的词条（原索引随行，编辑/删除按原索引操作） */
-  const boundEntries = useMemo(
-    () =>
-      entries
-        .map((e, i) => ({ e, i }))
-        .filter(({ e }) => e.image === selectedImage),
-    [entries, selectedImage],
-  )
+  /**
+   * 按图片顺序排列的条目：**数组下标即编号**（保存时后端也按这个顺序落盘）。
+   * 对外一律用归一化后的标签——输入框里允许存在半成品（"害羞，"），编号与校验只看成品。
+   */
+  const ordered = useMemo(() => {
+    const byImage = new Map(entries.map((e) => [e.image, e]))
+    return sprite.images
+      .map((img) => byImage.get(img.filePath))
+      .map((e) => (e ? { name: normalizeLabel(e.name), image: e.image } : null))
+      .filter((e): e is SpritePaletteEntry => !!e && !!e.name)
+  }, [entries, sprite.images])
 
-  /** 未绑定任何图的孤立词条（存量数据兜底；图为中心视图下它们不会出现在任何图下方） */
-  const unboundEntries = useMemo(
-    () =>
-      entries
-        .map((e, i) => ({ e, i }))
-        .filter(({ e }) => !e.image),
-    [entries],
-  )
+  /** 图 → 编号（没有标签的图不在表内） */
+  const numberOf = useMemo(() => {
+    const map = new Map<string, number>()
+    ordered.forEach((e, i) => map.set(e.image, i + 1))
+    return map
+  }, [ordered])
 
-  /** 视觉打标：建议按词归并回填草稿；已有同名词不覆盖（保护用户手动配置） */
+  const labelOf = (image: string) => entries.find((e) => e.image === image)?.name ?? ''
+
+  /**
+   * 写入某张图的标签：清空即删除该图的状态（图仍在，只是不占编号）。
+   * 这里刻意**不做逐字归一化**——否则用户敲下「，」的瞬间就被吃掉，永远打不出第二个词；
+   * 归一化放在失焦（commitLabel）与保存（后端）两处。
+   */
+  const setLabel = (image: string, text: string) => {
+    setEntries((prev) => {
+      const rest = prev.filter((e) => e.image !== image)
+      return text.trim() ? [...rest, { name: text, image }] : rest
+    })
+  }
+
+  /** 失焦整理：去掉多余分隔符与空白（输入过程中的半成品在这里收口） */
+  const commitLabel = (image: string) => {
+    const raw = labelOf(image)
+    const name = normalizeLabel(raw)
+    if (name === raw) return
+    setEntries((prev) => {
+      const rest = prev.filter((e) => e.image !== image)
+      return name ? [...rest, { name, image }] : rest
+    })
+  }
+
+  /** 设为默认状态（点星标）：记住的是**这张图**，与标签文字无关 */
+  const setDefaultFromImage = (image: string) => {
+    if (!normalizeLabel(labelOf(image))) {
+      toast.error('这张图还没有状态词，先填写再设为默认')
+      return
+    }
+    setDefaultImage(image)
+  }
+
+  /** 视觉打标：按图回填标签（已有标签的图不覆盖，保护手动配置） */
   const runAnnotate = async () => {
     if (annotating) return
     setAnnotating(true)
     try {
-      const res = await api.sprite.annotate(sprite.id)
-      if (!res.ok || !res.suggestions) {
+      // 已有状态词的图直接跳过（用当前草稿判断，未保存的改动也算数）
+      const skipImages = onlyUnlabelled ? ordered.map((e) => e.image) : []
+      const res = await api.sprite.annotate(sprite.id, skipImages.length > 0 ? { skipImages } : undefined)
+      if (!res.ok) {
         toast.error(res.error ?? '打标失败')
         return
       }
+      if (!res.suggestions || res.suggestions.length === 0) {
+        toast.success(`没有需要补标的图片（跳过 ${res.skipped ?? 0} 张已有状态词）`)
+        return
+      }
+      // 合并到草稿：同一标签只允许出现在一张图上（编号靠文字区分，重复就没法选）
+      const next = [...entries]
+      const suggestions = res.suggestions ?? []
+      const usedLabels = new Set(next.map((e) => normalizeLabel(e.name)).filter(Boolean))
       let added = 0
-      setEntries((prev) => {
-        const next = [...prev]
-        const seen = new Set(next.map((e) => e.name))
-        for (const s of res.suggestions!) {
-          if (seen.has(s.name)) continue // 同名已存在：保留用户配置
-          seen.add(s.name)
-          next.push({ name: s.name, gloss: s.desc, image: s.filePath })
-          added++
+      let collided = 0
+      for (const s of suggestions) {
+        const label = normalizeLabel(s.name)
+        if (!label) continue
+        if (usedLabels.has(label)) {
+          collided++
+          continue
         }
-        return next
-      })
-      setDefaultEmotion((d) => d || res.suggestions![0]?.name || '')
-      toast.success(`打标完成：新增 ${added} 条建议（${res.failed ?? 0} 张失败）；确认后点"保存词表"生效`)
+        const idx = next.findIndex((e) => e.image === s.filePath)
+        if (idx >= 0 && normalizeLabel(next[idx]?.name ?? '')) {
+          // 该图已有标签：保留用户配置
+          collided++
+          continue
+        }
+        usedLabels.add(label)
+        if (idx >= 0) next[idx] = { name: label, image: s.filePath }
+        else next.push({ name: label, image: s.filePath })
+        added++
+      }
+      setEntries(next)
+      // 还没有默认图时，把第一条建议的图设为默认
+      setDefaultImage((d) => d || suggestions[0]?.filePath || '')
+      const skipped = res.skipped ?? 0
+      const dup = (res.duplicated ?? 0) + collided
+      toast.success(
+        `打标完成：新增 ${added} 条标签（失败 ${res.failed ?? 0} 张${skipped > 0 ? `，跳过 ${skipped} 张已有` : ''}${dup > 0 ? `，${dup} 张标签重复已留空` : ''}）；确认后点"保存词表"生效`,
+      )
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '打标失败')
     } finally {
@@ -109,17 +210,26 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
     }
   }
 
-  /** 保存前校验：词名唯一非空 / 图必选 / 默认词在表内 */
+  /**
+   * 保存前校验：只有**整条标签完全相同**才算重复。
+   * 部分重合（`疲惫，流口水` 与 `疲惫，在打瞌睡`）是合法的——同一情绪可以有不同表现的图，
+   * AI 输出的是编号，不会因为文字相近而混淆；裸词兜底解析命中靠前那张，误差可接受。
+   */
   const validate = (): string | null => {
-    const names = new Set<string>()
-    for (const e of entries) {
+    const seen = new Map<string, number>()
+    for (let i = 0; i < ordered.length; i++) {
+      const e = ordered[i]!
       const name = e.name.trim()
       if (!name) return '状态词不能为空'
-      if (names.has(name)) return `状态词重复：「${name}」`
-      names.add(name)
-      if (!e.image) return `状态词「${name}」未选择立绘图`
+      const prev = seen.get(name)
+      if (prev !== undefined) return `编号 ${i + 1} 与编号 ${prev + 1} 的标签相同：「${name}」`
+      seen.set(name, i)
     }
-    if (entries.length > 0 && !names.has(defaultEmotion)) return '默认状态必须是词表中的词'
+    const dupImage = new Set<string>()
+    for (const e of entries) {
+      if (dupImage.has(e.image)) return '同一张图只能有一条状态标签'
+      dupImage.add(e.image)
+    }
     return null
   }
 
@@ -132,21 +242,19 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
     }
     setSaving(true)
     try {
-      // 词表为空 = 未打标（运行时按内置最小词表"平静"处理），defaultEmotion 一并清空；
-      // 显式重建三要素字段，剥离存量数据可能残留的旧软链字段与旧表情联动字段
-      // （Live2D 表情联动已随演出词表双轨迁移到模型词表 data/model-palettes.json，立绘词表不再承载）
-      const cleaned = entries.map((e) => ({
-        name: e.name.trim(),
-        gloss: e.gloss.trim(),
-        image: e.image,
-      }))
+      // 词表为空 = 未打标（运行时按内置最小词表"平静"处理）；顺序即编号，直接按图片顺序提交
+      const cleaned = ordered.map((e) => ({ name: e.name.trim(), image: e.image }))
+      // 默认图必须仍然有标签：被清空/删掉时落到第一条，避免存出无效默认
+      const defImage = cleaned.some((e) => e.image === defaultImage) ? defaultImage : (cleaned[0]?.image ?? '')
       await api.sprite.update(sprite.id, {
         emotions: cleaned,
-        defaultEmotion: cleaned.length > 0 ? defaultEmotion : '',
+        defaultImage: defImage,
         speakingImage: speakingImage || null,
         thinkingImage: thinkingImage || null,
         observingImage: observingImage || null,
       })
+      // 父级刷新是异步的：先把"刚保存的草稿"设为基线，避免空窗期误判为脏
+      setSavedSigOverride(draftSig)
       toast.success('状态词表已保存')
       onSaved()
     } catch (err) {
@@ -156,108 +264,93 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
     }
   }
 
-  const patch = (i: number, p: Partial<SpritePaletteEntry>) =>
-    setEntries((prev) => prev.map((e, j) => (j === i ? { ...e, ...p } : e)))
-
-  /** 删除词条（索引按 entries 原始下标） */
-  const removeEntry = (i: number) => setEntries((prev) => prev.filter((_, j) => j !== i))
-
-  /** 为当前选中图添加一个状态词（新词条直接绑定该图） */
-  const addEntryToSelected = () => {
-    if (!selectedImage) {
-      toast.error('请先在左侧选择一张立绘图')
-      return
-    }
-    setEntries((prev) => [...prev, { name: '', gloss: '', image: selectedImage }])
-  }
-
-  /** 词行（状态词 + 可选释义 + 删除）：图为中心视图下的基本编辑单元 */
-  const wordRow = (e: SpritePaletteEntry, i: number) => (
-    <div key={i} className="grid grid-cols-[96px_minmax(0,1fr)_26px] items-center gap-1.5">
-      <input
-        value={e.name}
-        onChange={(ev) => patch(i, { name: ev.target.value })}
-        placeholder="状态词"
-        className="w-full rounded-[var(--radius-sm)] border border-border bg-bg-panel px-2 py-1 text-xs outline-none"
-      />
-      <input
-        value={e.gloss}
-        onChange={(ev) => patch(i, { gloss: ev.target.value })}
-        placeholder="释义（可选，注入 prompt）"
-        className="w-full rounded-[var(--radius-sm)] border border-border bg-bg-panel px-2 py-1 text-xs outline-none"
-      />
-      <button
-        onClick={() => removeEntry(i)}
-        className="rounded-[var(--radius-sm)] p-1.5 text-text-2 hover:bg-card-hover hover:text-red-400"
-        title="删除该状态词"
-      >
-        <Trash2 size={13} />
-      </button>
-    </div>
-  )
+  const current = labelOf(selectedImage)
+  const currentLabel = normalizeLabel(current)
+  const currentNumber = numberOf.get(selectedImage)
 
   return (
     <div className="space-y-2.5">
       <div className="flex items-start justify-between gap-2">
         <p className="min-w-0 flex-1 text-xs leading-relaxed text-text-muted">
-          状态词表决定 AI 的 emotion 值域与立绘切换：词命中 → 默认状态。说话图仅在「状态=平静/默认状态」的说话态让位。
-          左侧点选立绘 → 右侧大图下编辑挂在该图上的状态词（一图可挂多词）。未打标的立绘集按内置最小词表（仅"平静"）处理。
+          一个编号对应一张图：编号由 AI 输出，用它决定显示哪张立绘。同一张图可以填多个词（用「，」分隔），它们是一个整体、
+          共用一个编号。没有填词（或没配状态图）的图不占编号，属于未使用资源。
         </p>
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0 whitespace-nowrap"
-          onClick={() => void runAnnotate()}
-          disabled={annotating}
-        >
-          {annotating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-          {annotating ? '打标中…' : '视觉打标'}
-        </Button>
+        <div className="flex shrink-0 items-center gap-3">
+          <Switch checked={onlyUnlabelled} onChange={setOnlyUnlabelled} label="仅补未标注" />
+          <Button
+            variant="outline"
+            size="sm"
+            className="whitespace-nowrap"
+            onClick={() => void runAnnotate()}
+            disabled={annotating}
+          >
+            {annotating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+            {annotating ? '打标中…' : '视觉打标'}
+          </Button>
+        </div>
       </div>
 
-      {/* 上区：左缩略图网格 + 右大图预览/挂词编辑 */}
+      {/* 上区：左缩略图网格 + 右大图预览/标签编辑 */}
       <div className="flex items-stretch gap-3">
-        {/* 左：缩略图网格（object-contain 完整显示立绘；内部滚动） */}
+        {/* 左：缩略图网格（角标 = AI 看到的编号） */}
         <div className="min-w-0 flex-1">
-          <div className="grid max-h-[464px] grid-cols-3 gap-1.5 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-bg-panel p-1.5 pr-1">
+          <div className="grid max-h-[530px] grid-cols-3 gap-1.5 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-bg-panel p-1.5 pr-1">
             {sprite.images.map((img) => {
-              const bound = entries.filter((e) => e.image === img.filePath).map((e) => e.name.trim() || '（未命名）')
+              const num = numberOf.get(img.filePath)
+              const label = normalizeLabel(labelOf(img.filePath))
+              const isDefault = !!label && img.filePath === defaultImage
               const isSpeaking = speakingImage === img.filePath
               const isThinking = thinkingImage === img.filePath
               const isObserving = observingImage === img.filePath
               return (
-                <button
+                <div
                   key={img.filePath}
                   onClick={() => setSelectedImage(img.filePath)}
                   className={cn(
-                    'flex flex-col overflow-hidden rounded border transition-all',
+                    'flex cursor-pointer flex-col overflow-hidden rounded border transition-all',
                     selectedImage === img.filePath
                       ? 'border-[var(--primary-400)] ring-1 ring-[var(--primary-400)]'
                       : 'border-border hover:border-[var(--border-strong)]',
                   )}
                   title={img.filePath}
                 >
-                  <span className="flex h-[104px] items-center justify-center bg-surface-2">
+                  <span className="relative flex h-[104px] items-center justify-center bg-surface-2">
                     <img src={imageUrl(img.filePath)} alt={img.filePath} className="h-full w-full object-contain" />
+                    {/* 编号角标：有标签才有编号 */}
+                    {num !== undefined ? (
+                      <span className="absolute left-1 top-1 rounded bg-black/65 px-1 text-[10px] font-medium leading-4 text-white">
+                        {num}
+                      </span>
+                    ) : (
+                      <span className="absolute left-1 top-1 rounded bg-black/45 px-1 text-[10px] leading-4 text-white/70">
+                        未使用
+                      </span>
+                    )}
+                    {isDefault && (
+                      <span className="absolute right-1 top-1 rounded bg-amber-500/90 px-1 text-[10px] leading-4 text-white">
+                        默认
+                      </span>
+                    )}
                   </span>
                   <span
                     className={cn(
                       'block truncate px-0.5 text-center text-[10px] leading-5',
-                      bound.length > 0 || isSpeaking || isThinking || isObserving ? 'text-[var(--primary-400)]' : 'text-text-muted',
+                      num !== undefined || isSpeaking || isThinking || isObserving ? 'text-[var(--primary-400)]' : 'text-text-muted',
                     )}
                   >
-                    {bound.length > 0 ? bound.join('·') : '未标注'}
-                    {isSpeaking && <span className="text-amber-400"> · 说话图</span>}
-                    {isThinking && <span className="text-violet-400"> · 思考图</span>}
-                    {isObserving && <span className="text-sky-400"> · 观察图</span>}
+                    {label || '无状态词'}
+                    {isSpeaking && <span className="text-amber-400"> · 说话</span>}
+                    {isThinking && <span className="text-violet-400"> · 思考</span>}
+                    {/* 观察用绿色：原来 sky-400 与主色青（#00d4ff）几乎同色，混在标签里看不出区别 */}
+                    {isObserving && <span className="text-emerald-400"> · 观察</span>}
                   </span>
-                </button>
+                </div>
               )
             })}
           </div>
         </div>
 
-        {/* 右：大图预览 + 该图的挂词编辑 + 说话/思考图设置 */}
+        {/* 右：大图预览 + 该图标签 + 系统态设置 */}
         <div className="flex w-[364px] shrink-0 flex-col gap-2">
           <div className="flex h-80 items-center justify-center overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface-2">
             {selectedImage ? (
@@ -270,61 +363,35 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
             )}
           </div>
 
-          {/* 该图挂着的状态词（词 + 可选释义 + 删除；一图多词） */}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] text-text-muted">该图的状态词（一图可挂多词）</span>
+              <span className="text-[11px] text-text-muted">
+                {currentNumber !== undefined ? `编号 ${currentNumber} · 状态词` : '状态词（该图未使用）'}
+              </span>
               <button
-                onClick={addEntryToSelected}
-                className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] text-[var(--primary-400)] hover:bg-card-hover"
-                title="在这张图上添加一个新状态词"
+                onClick={() => setDefaultFromImage(selectedImage)}
+                disabled={!currentLabel}
+                className={cn(
+                  'inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] hover:bg-card-hover disabled:opacity-40',
+                  currentLabel && selectedImage === defaultImage ? 'text-amber-400' : 'text-text-muted',
+                )}
+                title="把这张图的状态设为默认（未命中任何编号时使用）"
               >
-                <Plus size={11} /> 为该图添加状态词
+                <Star size={11} className={selectedImage === defaultImage ? 'fill-amber-400' : ''} />
+                {selectedImage === defaultImage ? '默认状态' : '设为默认'}
               </button>
             </div>
-            <div className="max-h-[150px] space-y-1 overflow-y-auto pr-0.5">
-              {boundEntries.length === 0 && (
-                <div className="rounded-[var(--radius-md)] border border-dashed border-border px-2 py-3 text-center text-[11px] text-text-muted">
-                  这张图还没有状态词，点上方「为该图添加状态词」
-                </div>
-              )}
-              {boundEntries.map(({ e, i }) => wordRow(e, i))}
-            </div>
+            <input
+              value={current}
+              onChange={(ev) => setLabel(selectedImage, ev.target.value)}
+              onBlur={() => commitLabel(selectedImage)}
+              placeholder="如：害羞，心动，脸红（多个词用，分隔，共用一个编号）"
+              className="w-full rounded-[var(--radius-sm)] border border-border bg-bg-panel px-2 py-1.5 text-xs outline-none focus:border-[var(--border-strong)]"
+            />
+            <p className="text-[10px] leading-relaxed text-text-muted">
+              清空即表示这张图不参与状态演出。多个词表示同一张图的不同说法，AI 看到的是同一行。
+            </p>
           </div>
-
-          {/* 孤立词条兜底：无绑定图的存量词条（不出现在任何图下方，在此编辑/绑定） */}
-          {unboundEntries.length > 0 && (
-            <div className="space-y-1 rounded-[var(--radius-md)] border border-dashed border-border p-1.5">
-              <div className="text-[11px] text-text-muted">未绑定立绘图的词条（点「绑到当前图」修复）</div>
-              <div className="max-h-[96px] space-y-1 overflow-y-auto pr-0.5">
-                {unboundEntries.map(({ e, i }) => (
-                  <div key={i} className="grid grid-cols-[96px_minmax(0,1fr)_26px] items-center gap-1.5">
-                    <input
-                      value={e.name}
-                      onChange={(ev) => patch(i, { name: ev.target.value })}
-                      placeholder="状态词"
-                      className="w-full rounded-[var(--radius-sm)] border border-border bg-bg-panel px-2 py-1 text-xs outline-none"
-                    />
-                    <button
-                      onClick={() => patch(i, { image: selectedImage })}
-                      disabled={!selectedImage}
-                      className="rounded-[var(--radius-sm)] border border-border px-1 py-1 text-[10px] text-[var(--primary-400)] hover:bg-card-hover disabled:opacity-40"
-                      title="把该词条绑定到当前选中的立绘图"
-                    >
-                      绑到当前图
-                    </button>
-                    <button
-                      onClick={() => removeEntry(i)}
-                      className="rounded-[var(--radius-sm)] p-1.5 text-text-2 hover:bg-card-hover hover:text-red-400"
-                      title="删除该词条"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
 
           {/* 说话/思考/观察图：一键作用于当前选中的图 + 缩略预览与清除 */}
           <div className="flex items-center gap-1.5">
@@ -334,7 +401,7 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
               className="min-w-0 flex-1 px-1.5 text-[11px]"
               disabled={!selectedImage}
               onClick={() => setSpeakingImage(selectedImage)}
-              title="把选中的立绘图设为说话立绘（状态=平静的说话态使用）"
+              title="把选中的立绘图设为说话立绘（状态=默认状态的说话态使用）"
             >
               设为说话图
             </Button>
@@ -360,85 +427,60 @@ export function SpritePaletteEditor({ sprite, onSaved, onEntriesChange }: {
             </Button>
           </div>
           <div className="flex items-center gap-3">
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="shrink-0 text-[11px] text-text-muted">说话图</span>
-              {speakingImage ? (
-                <span className="relative inline-block h-8 w-8 shrink-0 overflow-hidden rounded border border-border">
-                  <img src={imageUrl(speakingImage)} alt="说话图" className="h-full w-full object-cover" />
-                  <button
-                    onClick={() => setSpeakingImage('')}
-                    className="absolute inset-y-0 right-0 flex w-3 items-center justify-center bg-black/50 text-white"
-                    title="清除说话图"
-                  >
-                    <X size={8} />
-                  </button>
-                </span>
-              ) : (
-                <span className="text-[11px] text-text-muted">未配置</span>
-              )}
-            </div>
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="shrink-0 text-[11px] text-text-muted">思考图</span>
-              {thinkingImage ? (
-                <span className="relative inline-block h-8 w-8 shrink-0 overflow-hidden rounded border border-border">
-                  <img src={imageUrl(thinkingImage)} alt="思考图" className="h-full w-full object-cover" />
-                  <button
-                    onClick={() => setThinkingImage('')}
-                    className="absolute inset-y-0 right-0 flex w-3 items-center justify-center bg-black/50 text-white"
-                    title="清除思考图"
-                  >
-                    <X size={8} />
-                  </button>
-                </span>
-              ) : (
-                <span className="text-[11px] text-text-muted">未配置</span>
-              )}
-            </div>
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="shrink-0 text-[11px] text-text-muted">观察图</span>
-              {observingImage ? (
-                <span className="relative inline-block h-8 w-8 shrink-0 overflow-hidden rounded border border-border">
-                  <img src={imageUrl(observingImage)} alt="观察图" className="h-full w-full object-cover" />
-                  <button
-                    onClick={() => setObservingImage('')}
-                    className="absolute inset-y-0 right-0 flex w-3 items-center justify-center bg-black/50 text-white"
-                    title="清除观察图"
-                  >
-                    <X size={8} />
-                  </button>
-                </span>
-              ) : (
-                <span className="text-[11px] text-text-muted">未配置</span>
-              )}
-            </div>
+            {([
+              ['说话图', speakingImage, setSpeakingImage, '清除说话图'],
+              ['思考图', thinkingImage, setThinkingImage, '清除思考图'],
+              ['观察图', observingImage, setObservingImage, '清除观察图'],
+            ] as const).map(([label, value, setter, title]) => (
+              <div key={label} className="flex min-w-0 flex-1 items-center gap-1.5">
+                <span className="shrink-0 text-[11px] text-text-muted">{label}</span>
+                {value ? (
+                  <span className="relative inline-block h-8 w-8 shrink-0 overflow-hidden rounded border border-border">
+                    <img src={imageUrl(value)} alt={label} className="h-full w-full object-cover" />
+                    <button
+                      onClick={() => setter('')}
+                      className="absolute inset-y-0 right-0 flex w-3 items-center justify-center bg-black/50 text-white"
+                      title={title}
+                    >
+                      <X size={8} />
+                    </button>
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-text-muted">未配置</span>
+                )}
+              </div>
+            ))}
           </div>
+
+          {/* AI 视角预览：真实注入的编号清单，用户可自行核对 */}
+          <details className="rounded-[var(--radius-md)] border border-border bg-bg-panel px-2 py-1.5">
+            <summary className="cursor-pointer text-[11px] text-text-muted">AI 视角预览（{ordered.length} 个编号）</summary>
+            <ol className="mt-1 max-h-32 space-y-0.5 overflow-y-auto font-mono text-[11px] leading-4 text-text-2">
+              {ordered.map((e, i) => (
+                <li key={e.image}>
+                  {i + 1}. {e.name}
+                  {e.image === defaultImage && <span className="text-amber-400">（默认）</span>}
+                </li>
+              ))}
+              {ordered.length === 0 && <li className="text-text-muted">（空：AI 只能选内置的「平静」）</li>}
+            </ol>
+          </details>
         </div>
       </div>
 
       <p className="text-[11px] text-text-muted">
-        说话图在「正在说话且状态=平静/默认状态」时使用（默认状态可设为其它词，说话时显示该状态的图）；思考图在 AI
-        准备回答期间使用；观察图在你点桌宠眼睛、角色看屏幕的那几秒使用，未配置时回落思考图。
-        三者为系统演出态，不属于词表，且只作用于桌面端（剧情窗不参与观察图）。释义可选：不填时 prompt 只注入状态词本身。
+        说话图在「正在说话且状态=默认状态」时使用；思考图在 AI 准备回答期间使用；观察图在你点桌宠眼睛、角色看屏幕的那几秒使用，
+        未配置时回落思考图。三者为系统演出态，不占编号，且只作用于桌面端（剧情窗不参与观察图）。
       </p>
 
-      {/* 底部：默认状态 + 保存 */}
+      {/* 底部：统计 + 保存 */}
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] text-text-muted">
-          共 {sprite.images.length} 张图 · {entries.length} 个状态词
+          {sprite.images.length} 张图 · {ordered.length} 个编号 · {sprite.images.length - ordered.length} 张未使用
         </span>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-text-muted">默认状态</span>
-          <div className="w-32">
-            <SelectMenu
-              value={defaultEmotion}
-              onChange={setDefaultEmotion}
-              options={entries.filter((e) => e.name.trim()).map((e) => ({ value: e.name.trim(), label: e.name.trim() }))}
-            />
-          </div>
-          <Button size="sm" onClick={() => void save()} disabled={saving || entries.length === 0}>
-            {saving ? '保存中…' : '保存词表'}
-          </Button>
-        </div>
+        <Button size="sm" onClick={() => void save()} disabled={saving}>
+          {saving ? '保存中…' : '保存词表'}
+        </Button>
       </div>
     </div>
   )

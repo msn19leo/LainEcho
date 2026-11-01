@@ -5,13 +5,27 @@
  * 避免 sbv2Tts 反向依赖 genieTts —— 否则 Genie 调整翻译策略会连带影响 SBV2。
  */
 import { sendChatCompletion } from './aiClient'
-import { resolveProfile } from './apiProfiles'
+import { llmRequest, resolveProfile } from './apiProfiles'
 import { resolveAuxLlmConfig } from './auxModel'
 
 const HANGUL_RE = /[\uAC00-\uD7AF\u1100-\u11FF]/
 const KANA_RE = /[\u3040-\u309F\u30A0-\u30FF]/
-const KANJI_RE = /[\u4e00-\u9fff]/
 const LATIN_WORD_RE = /[A-Za-z][A-Za-z'’-]*/g
+
+/**
+ * “纯中文残句”判定前剔除的字符：数字、空白与常见中英日标点/符号。
+ * 目的：17対15、2026年10月31日、第3位 这类“数字 + 汉字”表达不参与纯中文判定。
+ */
+const RESIDUAL_STRIP_RE =
+  /[0-9０-９\s、，,。！？!?…:：；;·・\-—~～%％"'“”‘’「」『』（）()【】\[\]{}]/g
+
+/**
+ * 中文专用字符/中文虚词（非穷举，宁可漏判也不误杀合法日语）。
+ * 只列中文简体专用字与高频虚词；日语汉字词（以上/最新情報/完了/17対15）不在其中。
+ * 维护时务必用 analyzeJaTranslation 的日语汉字词用例回归，避免把正常译文判成中文。
+ */
+const CHINESE_ONLY_RE =
+  /[这你她它哪谁们么吗呢吧啊呀哦啦嘛嘿嗯呗儿很说时过还让给对爱见气开关听语话电头发车东马龙鸟鱼风飞书长门问间闻买卖认识记讲谢请欢边变应该为从个两几实际处带张团园围层岁历亿员单卫厂专业热选远进运达适错铁银钱钟网罗罚胜负责场现环产决态标样确图课题视觉]/
 
 /**
  * 滑窗 n-gram 重复率：模型复读时该值会飙到 1 以上，正常文本接近 0。
@@ -34,6 +48,8 @@ export interface JaCheckResult {
   reason: string
   /** 便于排障的一行指标，直接进日志 */
   metrics: string
+  /** 触发失败的片段（句子级；仅失败时提供，便于日志直接定位） */
+  offending?: string
 }
 
 /**
@@ -44,8 +60,9 @@ export interface JaCheckResult {
  * 于是全部放行 → 264 字送进声库 → jtalk 念英文 → 46 秒噪音。
  *
  * 改为多判据，任一命中即判失败：语言混杂看的是「量」而不是「有没有」。
- * 注 1：曾有一条「简体专用字黑名单」判据，因同时误杀合法引用（『让子弹飞』）与真实日语词（把手）
- * 且漏掉表外的中文词（离谱），已移除；中文残留改用「长度比 + 逐句无假名」间接覆盖。
+ * 注 1：旧版「全量简体字黑名单」因误杀合法引用（『让子弹飞』）与真实日语词（把手）被移除。
+ *      2026-10-31 改为保守的「数字/标点剔除 + 中文专用字符/虚词」：只认中文专用字，
+ *      共享汉字（以上/最新情報/完了）与数字表达（17対15）不拦；独立成句的中文标题仍可能被拦。
  * 注 2：英文判据曾用「白名单外的英文总量」，但模型名层出不穷（Anthropic/DeepSeek/GLM…），
  * 白名单永远补不完，改成只数「小写英文词」——专有名词放行，句子式泄漏才拦。
  */
@@ -80,11 +97,14 @@ export function analyzeJaTranslation(out: string, srcText: string): JaCheckResul
   if (dupRatio > 0.3) {
     return { ok: false, reason: `译文出现整段重复（${(dupRatio * 100).toFixed(0)}%）`, metrics }
   }
-  // 逐句：有汉字但整句无假名 = 纯中文残句；长度 ≥4 过滤「私。」这类短句误报
+  // 逐句：剔除数字/标点后仍含中文专用字符、且整句无假名 = 未翻译的中文残句。
+  // 2026-10-31 修正：不再把“有汉字”等同于中文——17対15、以上、最新情報 等
+  // 合法日语汉字/数字表达不再误判；中文专用字符集见 CHINESE_ONLY_RE。
   for (const sentence of out.split(/[。！？!?\n…]+/)) {
     const s = sentence.trim()
-    if (KANJI_RE.test(s) && !KANA_RE.test(s) && s.length >= 4) {
-      return { ok: false, reason: '存在纯中文残句', metrics }
+    const core = s.replace(RESIDUAL_STRIP_RE, '')
+    if (!KANA_RE.test(core) && CHINESE_ONLY_RE.test(core)) {
+      return { ok: false, reason: '存在纯中文残句', metrics, offending: s }
     }
   }
   return { ok: true, reason: '', metrics }
@@ -99,22 +119,18 @@ export function analyzeJaTranslation(out: string, srcText: string): JaCheckResul
  *    content 为空；或模型偷懒回显中文原文）→ 强化提示词重试一次；
  *  - 仍失败则抛错（不再静默回退原文合成）——宁可跳过该块语音（文本照常上屏跟读），
  *    也不能让日文声库读中文出怪音；上层 PetApp catch 后按既有静默降级处理。
- * 纯度防线（2026-10-14，"翻译夹杂中文残留/韩文"实锤后补）：
+ * 纯度防线（2026-10-14，"翻译夹杂中文残留/韩文"实锤后补；2026-10-31 修正误判）：
  *  - 含韩文（Hangul 区，实测 "먼저"）→ 判不纯；
- *  - 逐句检查：含汉字但整句无假名且长度 ≥4（日文句子必含假名助词/送假名）→ 未翻译的
- *    中文残句（实测 "那、那算什么呀"）→ 判不纯；
- *  - 不纯 → 强化提示词重试一次；重试后仍不纯 → **照旧放行合成**（用户选择的降级策略：
- *    不跳过语音、不回退中文原文，与既有行为一致，仅多一次纠偏机会）。
+ *  - 逐句检查：先剔除数字/标点，剩余仍含**中文专用字符/虚词**且整句无假名 → 未翻译的
+ *    中文残句（实测 "那、那算什么呀"）→ 判不纯；不再用"含汉字且无假名"作为判据，
+ *    避免把 "17対15"、"以上"、"最新情報" 这类合法日语汉字/数字表达误判为中文；
+ *  - 不纯 → 强化提示词重试一次；重试后仍不纯 → 抛错跳过该段语音（文本照常上屏）。
  */
 export async function translateText(text: string, targetLang: 'ja' | 'zh'): Promise<string> {
   // P0-2B：翻译走辅助模型（机械任务，主对话模型可能是思考型，延迟 1.3~28.8s 波动）；
   // 未激活辅助档案时回落主模型激活档案的三元组（档案制）
-  const aux = await resolveAuxLlmConfig()
-  const mainCfg = aux ?? (await resolveProfile('main'))
-  const useModel = mainCfg?.model ?? ''
-  const useBaseURL = mainCfg?.baseURL ?? ''
-  const useApiKey = mainCfg?.apiKey ?? ''
-  if (!useApiKey || !useBaseURL.trim() || !useModel.trim()) {
+  const cfg = (await resolveAuxLlmConfig()) ?? (await resolveProfile('main'))
+  if (!cfg || !cfg.apiKey || !cfg.baseURL.trim() || !cfg.model.trim()) {
     console.warn('[genie] 翻译跳过：未配置 LLM API（主或翻译辅助模型档案）')
     return text
   }
@@ -138,14 +154,8 @@ export async function translateText(text: string, targetLang: 'ja' | 'zh'): Prom
           { role: 'system', content: systemPrompt(attempt > 1) },
           { role: 'user', content: text },
         ],
-        {
-          model: useModel,
-          baseURL: useBaseURL,
-          apiKey: useApiKey,
-          temperature: 0.3,
-          stream: false,
-          maxTokensOverride: 2048,
-        },
+        // 档案上的思考开关同样生效；预算不足被截断时 aiClient 会自动翻倍重试一次
+        llmRequest(cfg, { temperature: 0.3, stream: false, maxTokensOverride: 2048 }, { aux: true }),
       )
     } catch (err) {
       console.error('[genie] 翻译请求异常（第 %d 次）', attempt, err)
@@ -168,18 +178,19 @@ export async function translateText(text: string, targetLang: 'ja' | 'zh'): Prom
     if (targetLang === 'ja') {
       const check = analyzeJaTranslation(result, text)
       if (!check.ok) {
-        if (attempt < 2) {
-          console.warn(
-            '[tts] 译文校验未通过（第 %d 次，%s）→ 强化提示词重试｜%s｜输出=%j',
-            attempt,
-            check.reason,
-            check.metrics,
-            result.slice(0, 80),
-          )
-          continue
-        }
+        // 两次失败都落日志：第 2 次以前是直接 throw，线上只能看到第 1 次，无法定位
+        console.warn(
+          '[tts] 译文校验未通过（第 %d 次，%s）→ %s｜%s｜片段=%j｜输出=%j',
+          attempt,
+          check.reason,
+          attempt < 2 ? '强化提示词重试' : '跳过该段语音',
+          check.metrics,
+          check.offending ?? '',
+          result.slice(0, 80),
+        )
+        if (attempt < 2) continue
         throw new Error(
-          `日语翻译校验失败（${check.reason}）——跳过该段语音，文本照常上屏`,
+          `日语翻译校验失败（${check.reason}${check.offending ? `：${check.offending}` : ''}）——跳过该段语音，文本照常上屏`,
         )
       }
       console.log(

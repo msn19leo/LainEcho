@@ -6,48 +6,34 @@
  *  - Key 安全：按档案独立加密落盘（safeStorage/DPAPI），仅回显掩码（hasKey），明文不出主进程；
  *  - 测试连接按「回落后生效配置」发极简请求（辅助未启用时回落主模型激活档案）。
  */
-import { useEffect, useState } from 'react'
-import { Check, CheckCircle2, ChevronDown, Cpu, Eye, Pencil, Plus, RefreshCw, Trash2, XCircle, Zap } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Check, ChevronDown, Cpu, Eye, Pencil, Plus, RefreshCw, Trash2, Zap } from 'lucide-react'
 import { api } from '../../api'
 import { cn } from '../../lib/utils'
 import { useSettingsStore } from '../../store/settingsStore'
-import { AccordionItem, Button, ConfirmModal, Field, Input, Loading, Modal, Switch } from '../../components/ui'
+import { Button, ConfirmModal, Field, Input, Loading, Modal, Switch, Textarea } from '../../components/ui'
+import { Section } from '../components/PanelShell'
 import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import type { ApiProfile } from '../../types'
 
-/** 测试对象 profile（与主进程 ai:test-connection 的参数对应） */
-type TestProfile = 'main' | 'aux' | 'vision'
-/** 单块测试结果 */
-interface TestResult {
-  ok: boolean
-  message: string
+/** 校验「额外请求参数」：空 = 通过；必须是 JSON 对象 */
+function validateExtra(raw: string): { ok: true } | { ok: false; error: string } {
+  const text = raw.trim()
+  if (!text) return { ok: true }
+  try {
+    const parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: '必须是一个 JSON 对象，例如 {"top_k": 40}' }
+    }
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: `JSON 格式错误：${err instanceof Error ? err.message : '无法解析'}` }
+  }
 }
 
 /** 档案编辑器状态：create = 新建；edit = 编辑已有档案 */
 type EditorState = { mode: 'create' } | { mode: 'edit'; profile: ApiProfile } | null
-
-/** 测试结果显示条（成功绿/失败红，三块复用） */
-function TestResultView({ result }: { result: TestResult | undefined }) {
-  if (!result) return null
-  return (
-    <div
-      className={`flex items-start gap-2 rounded-[var(--radius-md)] border px-4 py-2 text-sm ${
-        result.ok
-          ? 'border-success/30 bg-success/10 text-success'
-          : 'border-danger/30 bg-danger/10 text-danger'
-      }`}
-    >
-      <span className="mt-0.5 shrink-0">
-        {result.ok ? <CheckCircle2 size={15} strokeWidth={1.75} /> : <XCircle size={15} strokeWidth={1.75} />}
-      </span>
-      {/* 错误里常带原始 JSON（无空格长串），必须允许任意位置断行，否则会横向撑破容器 */}
-      <span className="min-w-0 break-all whitespace-pre-wrap">
-        {result.ok ? '连接成功' : result.message}
-      </span>
-    </div>
-  )
-}
 
 /** 档案下拉选项文案：名称 · 模型名（未配 Key 追加提示） */
 function profileLabel(p: ApiProfile): string {
@@ -69,6 +55,28 @@ export function ApiConfigPanel() {
   const [formName, setFormName] = useState('')
   const [formBaseURL, setFormBaseURL] = useState('')
   const [formModel, setFormModel] = useState('')
+  /** 思考模式：auto = 不注入（沿用服务商默认）；off = 显式关闭；on = 显式开启 */
+  const [formThinking, setFormThinking] = useState<'auto' | 'off' | 'on'>('auto')
+  /** 额外请求参数（JSON 原文）；extraError 非空时禁止保存 */
+  const [formExtra, setFormExtra] = useState('')
+  const [extraError, setExtraError] = useState('')
+  /**
+   * 额外参数的解析预览：能解析成对象时列出键名。
+   * 目的不是"再校验一遍"，而是让用户当场看到「我填的这几项被认出来了几个」——
+   * 语义错误（字段名拼错、值类型不对）只有真发请求才会被服务商拒绝，
+   * 这里能提前暴露的只有"键有没有被正确解析"。
+   */
+  const extraPreview = useMemo(() => {
+    const text = formExtra.trim()
+    if (!text) return null
+    try {
+      const parsed = JSON.parse(text)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+      return Object.keys(parsed)
+    } catch {
+      return null
+    }
+  }, [formExtra])
   const [formKey, setFormKey] = useState('')
   const [savingProfile, setSavingProfile] = useState(false)
   const [deleting, setDeleting] = useState<ApiProfile | null>(null)
@@ -80,8 +88,6 @@ export function ApiConfigPanel() {
   const [modelListOpen, setModelListOpen] = useState(false)
 
   // 测试连接：进行中的 profile + 各块结果（互不覆盖）
-  const [testing, setTesting] = useState<TestProfile | null>(null)
-  const [testResults, setTestResults] = useState<Partial<Record<TestProfile, TestResult>>>({})
 
   useEffect(() => {
     if (!loaded) void load()
@@ -93,6 +99,15 @@ export function ApiConfigPanel() {
     setFormName(state?.mode === 'edit' ? state.profile.name : '')
     setFormBaseURL(state?.mode === 'edit' ? state.profile.baseURL : '')
     setFormModel(state?.mode === 'edit' ? state.profile.model : '')
+    setFormThinking(
+      state?.mode === 'edit' && state.profile.enableThinking !== undefined
+        ? state.profile.enableThinking
+          ? 'on'
+          : 'off'
+        : 'auto',
+    )
+    setFormExtra(state?.mode === 'edit' ? (state.profile.extraBody ?? '') : '')
+    setExtraError('')
     setFormKey('')
     setModelOptions(null)
     setModelListOpen(false)
@@ -128,6 +143,11 @@ export function ApiConfigPanel() {
     if (!formName.trim()) return toast('请填写档案名称', 'error')
     if (!formBaseURL.trim()) return toast('请填写 API 地址（baseURL）', 'error')
     if (!formModel.trim()) return toast('请填写模型名（model）', 'error')
+    const extraCheck = validateExtra(formExtra)
+    if (!extraCheck.ok) {
+      setExtraError(extraCheck.error)
+      return toast('额外请求参数不是合法的 JSON 对象', 'error')
+    }
     setSavingProfile(true)
     try {
       await api.settings.saveProfile({
@@ -136,6 +156,9 @@ export function ApiConfigPanel() {
         baseURL: formBaseURL,
         model: formModel,
         key: formKey.trim() || undefined,
+        // auto 存成 undefined：不注入 thinking 字段，交给服务商默认
+        ...(formThinking === 'auto' ? {} : { enableThinking: formThinking === 'on' }),
+        extraBody: formExtra.trim() || undefined,
       })
       await refresh()
       toast(editor.mode === 'edit' ? '档案已更新' : '档案已创建')
@@ -171,32 +194,16 @@ export function ApiConfigPanel() {
   }
 
   /** 测试连接（按 profile 测各自回落后的生效配置；辅助未启用时主进程回落测主模型） */
-  const handleTest = async (profile: TestProfile) => {
-    setTesting(profile)
-    try {
-      const res = await api.ai.testConnection(profile)
-      setTestResults((r) => ({ ...r, [profile]: res.ok ? { ok: true, message: '连接成功' } : { ok: false, message: res.error ?? '连接失败' } }))
-    } catch (err) {
-      setTestResults((r) => ({ ...r, [profile]: { ok: false, message: err instanceof Error ? err.message : '连接失败' } }))
-    } finally {
-      setTesting(null)
-    }
-  }
 
   if (!loaded) return <Loading />
 
-  // 各类型的当前激活档案（用于按钮禁用判定）
-  const mainActive = profiles.find((p) => p.id === settings.activeMainProfileId)
-  const auxActive = profiles.find((p) => p.id === settings.activeAuxProfileId)
-  const visionActive = profiles.find((p) => p.id === settings.activeVisionProfileId)
-  /** 主模型生效配置是否完整（辅助测试回落时也看它） */
-  const mainReady = !!mainActive && mainActive.hasKey
   const profileOptions = profiles.map((p) => ({ value: p.id, label: profileLabel(p) }))
 
   return (
-    <div className="space-y-4">
+    <div>
       {/* ===== 服务商档案库（全局复用：名称 + 地址 + 模型 + Key） ===== */}
-      <AccordionItem title="服务商档案库" icon={<Plus size={15} strokeWidth={1.75} />} defaultOpen>
+      <Section title="服务商档案库" hint={profiles.length === 0 ? '尚未配置，点击展开添加' : `${profiles.length} 个档案`} collapsible defaultOpen={false}>
+        <div className="px-4 py-3">
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
             每个档案 = 一套「API 地址 + 模型名 + API Key」组合，集中管理、可被下方各类模型同时引用。
@@ -233,10 +240,12 @@ export function ApiConfigPanel() {
             新增档案
           </Button>
         </div>
-      </AccordionItem>
+      </div>
+      </Section>
 
       {/* ===== 主模型（主对话链，必填） ===== */}
-      <AccordionItem title="主模型" icon={<Cpu size={15} strokeWidth={1.75} />} defaultOpen>
+      <Section title="主模型" collapsible>
+        <div className="px-4 py-3">
         <div className="space-y-4">
           <Field
             label="激活档案"
@@ -316,17 +325,13 @@ export function ApiConfigPanel() {
             </div>
           </div>
 
-          <TestResultView result={testResults.main} />
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void handleTest('main')} disabled={testing !== null || !mainReady}>
-              {testing === 'main' ? '测试中…' : '测试连接'}
-            </Button>
-          </div>
         </div>
-      </AccordionItem>
+      </div>
+      </Section>
 
       {/* ===== 辅助模型（翻译/结构修复/情景摘要，可选，未启用回落主模型档案） ===== */}
-      <AccordionItem title="辅助模型（翻译 / 结构修复 / 情景摘要）（可选）" icon={<Zap size={15} strokeWidth={1.75} />} defaultOpen={false}>
+      <Section title="辅助模型" hint="翻译 / 结构修复 / 情景摘要（可选）" collapsible defaultOpen={false}>
+        <div className="px-4 py-3">
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
             日语翻译、JSON 修复与情景摘要更新都是机械型小任务：前两者串行在语音首响路径上，情景摘要在每轮
@@ -339,15 +344,13 @@ export function ApiConfigPanel() {
             options={[AUX_OFF_OPTION, ...profileOptions]}
             placeholder="未启用（回落主模型）"
           />
-          <TestResultView result={testResults.aux} />
-          <Button variant="outline" onClick={() => void handleTest('aux')} disabled={testing !== null || !(auxActive?.hasKey || mainReady)}>
-            {testing === 'aux' ? '测试中…' : '测试连接'}
-          </Button>
         </div>
-      </AccordionItem>
+      </div>
+      </Section>
 
       {/* ===== 视觉模型（屏幕感知/立绘打标/图片转述，可选；独立必填不回落） ===== */}
-      <AccordionItem title="视觉模型（屏幕感知 / 立绘打标 / 图片转述 用，可选）" icon={<Eye size={15} strokeWidth={1.75} />} defaultOpen={false}>
+      <Section title="视觉模型" hint="屏幕感知 / 立绘打标 / 图片转述（可选）" collapsible defaultOpen={false}>
+        <div className="px-4 py-3">
         <div className="space-y-3">
           <div className="text-xs leading-relaxed text-text-muted">
             用于屏幕感知（角色"偷看"桌面转述话题）、立绘集 AI 视觉打标、聊天图片转述（读图方式选「视觉模型辅助」时）三类图像理解任务，
@@ -360,12 +363,9 @@ export function ApiConfigPanel() {
             options={[OFF_OPTION, ...profileOptions]}
             placeholder="未启用（选择一个档案）"
           />
-          <TestResultView result={testResults.vision} />
-          <Button variant="outline" onClick={() => void handleTest('vision')} disabled={testing !== null || !visionActive?.hasKey}>
-            {testing === 'vision' ? '测试中…' : '测试连接'}
-          </Button>
         </div>
-      </AccordionItem>
+      </div>
+      </Section>
 
       {/* ===== 档案编辑器（Modal） ===== */}
       <Modal
@@ -447,6 +447,56 @@ export function ApiConfigPanel() {
               autoComplete="off"
             />
           </Field>
+
+          <Field
+            label="思考模式"
+            hint="关闭可显著降低首字延迟。DeepSeek Reasoner 等思考型模型在字段缺失时默认开启，建议显式选「关闭」"
+          >
+            <SelectMenu
+              value={formThinking}
+              onChange={(v) => setFormThinking(v as 'auto' | 'off' | 'on')}
+              options={[
+                { value: 'auto', label: '自动（不注入，按服务商默认）' },
+                { value: 'off', label: '关闭（首字更快）' },
+                { value: 'on', label: '开启（需要更深推理）' },
+              ]}
+              className="w-full"
+            />
+          </Field>
+
+          <Field
+            label="额外请求参数（JSON，可选）"
+            hint='原样并入请求体，同名覆盖（model / messages / stream 受保护）。
+                 辅助任务（摘要 / 翻译 / 记忆抽取 / 人设）不透传 response_format、tools、tool_choice —— 这三个会改变输出格式。'
+          >
+            <Textarea
+              // 关掉拼写检查：JSON 的键在拼写器眼里全是错词，满屏红波浪线
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              value={formExtra}
+              onChange={(e) => {
+                setFormExtra(e.target.value)
+                if (extraError) setExtraError('')
+              }}
+              onBlur={() => {
+                const r = validateExtra(formExtra)
+                setExtraError(r.ok ? '' : r.error)
+              }}
+              rows={3}
+              placeholder={'{\n  "top_k": 40\n}'}
+            />
+          </Field>
+          {extraError && <p className="-mt-1 text-[11px] text-[var(--danger)]">{extraError}</p>}
+          {!extraError && extraPreview && extraPreview.length > 0 && (
+            <p className="-mt-1 flex items-start gap-1 text-[11px] leading-relaxed text-text-muted">
+              <Check size={11} strokeWidth={2.5} className="mt-0.5 shrink-0 text-[var(--success)]" />
+              <span className="min-w-0 break-all">
+                解析通过 · {extraPreview.length} 个参数：{extraPreview.slice(0, 8).join(' / ')}
+                {extraPreview.length > 8 ? ' …' : ''}
+              </span>
+            </p>
+          )}
         </div>
       </Modal>
 

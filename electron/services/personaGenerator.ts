@@ -6,7 +6,7 @@
  */
 import type { CharacterPersona, PersonaGenerateInput } from '../../src/types'
 import { sendChatCompletion } from './aiClient'
-import { resolveProfile } from './apiProfiles'
+import { llmRequest, resolveProfile } from './apiProfiles'
 import { getSettings } from './repository'
 
 /** 生成时使用的 JSON 结构说明（作为 system prompt 的骨架约束） */
@@ -283,20 +283,18 @@ export async function generatePersona(input: PersonaGenerateInput): Promise<Char
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: userMessage },
     ],
-    {
-      model: mainCfg.model,
-      baseURL: mainCfg.baseURL,
-      apiKey: mainCfg.apiKey,
-      // 生成人设是结构化 JSON：用固定低温提高格式稳定性，并强制较大 maxTokens 防止输出被截断
+    llmRequest(mainCfg, {
+      // 生成人设是结构化 JSON：低温提高格式稳定性，并强制大预算防止输出被截断
       temperature: 0.7,
       maxTokens: settings.maxTokens,
       maxTokensOverride: 16384,
       stream: false,
-      disableThinking: true,
+      // 思考开关跟随档案（原先硬编码 disableThinking=true，智谱方言；现与其他链路一致）。
+      // 思考开着也安全：16384 预算 + 下方"从 reasoning 抢救 JSON"双保险
       onReasoning: (chunk) => {
         reasoningText += chunk
       },
-    },
+    }),
   )
 
   // 解析顺序：正文（剥 <think>）优先 → 思考通道抢救。思考型模型可能把最终 JSON 写进

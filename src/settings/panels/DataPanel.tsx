@@ -6,7 +6,8 @@ import { FolderOpen, MessageSquare, Pencil, RotateCcw, Search } from 'lucide-rea
 import { api } from '../../api'
 import { useCharacterStore } from '../../store/characterStore'
 import type { SessionIndexItem } from '../../types'
-import { Button, Card, ConfirmModal, Empty, Input, Loading, Modal } from '../../components/ui'
+import { Button, ConfirmModal, Empty, Input, Loading, Modal } from '../../components/ui'
+import { Section } from '../components/PanelShell'
 import { SelectMenu } from '../../components/DropdownMenu'
 import { toast } from '../../components/toast'
 import { formatRelativeTime, formatTimeFull, truncate } from '../../lib/utils'
@@ -187,9 +188,9 @@ export function DataPanel() {
       ) : filtered.length === 0 ? (
         <Empty text="没有匹配的会话" />
       ) : (
-        <div className="space-y-2">
+        <Section>
           {filtered.map((s) => (
-            <Card key={s.id} className="flex items-center gap-3 py-3">
+            <div key={s.id} className="flex items-center gap-3 px-4 py-2.5">
               <button
                 type="button"
                 title="打开会话"
@@ -225,9 +226,9 @@ export function DataPanel() {
                   删除
                 </Button>
               </div>
-            </Card>
+            </div>
           ))}
-        </div>
+        </Section>
       )}
 
       {/* 删除确认：是否导出为 Markdown 后再删除 */}
@@ -293,15 +294,11 @@ export function DataPanel() {
 
       {/* 数据存放位置 */}
       {dataDir && (
-        <Card className="space-y-3">
-          <div className="flex items-center gap-2">
-            <FolderOpen size={15} strokeWidth={1.75} color="var(--primary-400)" />
-            <span className="text-sm font-medium text-text-2">数据存放位置</span>
-            {dataDir.isCustom && (
-              <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[10px] text-accent ring-1 ring-accent/30">
-                自定义
-              </span>
-            )}
+        <Section title="数据存放位置" hint={dataDir.isCustom ? '自定义' : undefined}>
+          <div className="space-y-3 px-4 py-3">
+          <div className="flex items-center gap-2 text-[11px] text-text-muted">
+            <FolderOpen size={12} strokeWidth={1.75} />
+            当前数据目录
           </div>
           <div className="rounded-[var(--radius-sm)] bg-surface-2 px-3 py-2">
             <p className="break-all text-xs leading-relaxed text-text-muted selectable">
@@ -332,7 +329,8 @@ export function DataPanel() {
             更改位置后，所有数据（角色卡、会话、模型、设置、日志等）将移动到新目录，
             复制成功并切换后会删除原目录里的数据，需手动重启应用生效。
           </p>
-        </Card>
+          </div>
+        </Section>
       )}
 
       <ConfirmModal

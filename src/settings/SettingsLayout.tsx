@@ -1,36 +1,37 @@
 /**
- * 设置窗口布局：左侧导航（Logo + 渐变选中指示条）+ 主内容区。
- * - 主页：顶部「设置」大标题 + 外观主题切换，下方一级设置卡片列表
- * - 点击卡片 / 左侧导航进入二级面板；面板进出使用淡入上移动效
+ * 设置窗口布局：左侧分组导航 + 右侧吸顶标题条 + 面板内容。
+ *
+ * 设计（见 docs/settings-redesign.md）：
+ * - 只有一套导航：左侧。删掉了「主页卡片列表」与面板内「返回」按钮。
+ * - 通用设置置顶（无组标题），它同时是默认落地页。
+ * - 内容区不使用毛玻璃/渐变/光晕；装饰只留在左栏与标题条。
+ * - 切换面板时滚动位置归零，且不加退场动画（避免 150-200ms 空白期）。
  */
-import { useEffect, useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
+import { useEffect, useRef, useState } from 'react'
+import { motion } from 'framer-motion'
 import {
-  Bot,
+  AudioLines,
   BookOpen,
+  Bot,
   BrainCircuit,
-  ChevronLeft,
-  ChevronRight,
   Database,
   Eye,
-  House,
-  KeyRound,
-  PersonStanding,
-  Sparkles,
-  AudioLines,
   Info,
-  SlidersHorizontal,
+  KeyRound,
   MessagesSquare,
+  PersonStanding,
   ScrollText,
+  SlidersHorizontal,
+  Sparkles,
   type LucideIcon,
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
-import { IconTile } from '../components/IconTile'
-import { ThemeSwitcher } from '../components/ThemeSwitcher'
 import { api } from '../api'
 import { cn } from '../lib/utils'
-import { fadeSlideUp, springSoft } from '../lib/motion'
+import { fadeSlideUp } from '../lib/motion'
 import { useSettingsStore } from '../store/settingsStore'
+import { PanelShell, type PanelWidth } from './components/PanelShell'
+import { ApiAside } from './components/asides/ApiAside'
 import { ApiConfigPanel } from './panels/ApiConfigPanel'
 import { CharacterCardPanel } from './panels/CharacterCardPanel'
 import { CharacterModelPanel } from './panels/CharacterModelPanel'
@@ -44,39 +45,77 @@ import { VoicePanel } from './panels/VoicePanel'
 import { AboutPanel } from './panels/AboutPanel'
 import { GeneralPanel } from './panels/GeneralPanel'
 
-export type ModuleId = 'general' | 'character-card' | 'model' | 'api' | 'vision' | 'memory' | 'proactive' | 'story' | 'data' | 'voice' | 'logs' | 'about'
+export type ModuleId =
+  | 'general'
+  | 'character-card'
+  | 'model'
+  | 'api'
+  | 'vision'
+  | 'memory'
+  | 'proactive'
+  | 'story'
+  | 'data'
+  | 'voice'
+  | 'logs'
+  | 'about'
 
 interface ModuleDef {
   id: ModuleId
   title: string
-  desc: string
   icon: LucideIcon
+  /** 所属分组；置顶项不填（渲染在分隔线之上，且不带组标题） */
+  group?: string
+  /** 内容宽度档：narrow 720 / medium 600+右栏 / wide 864 */
+  width: PanelWidth
 }
 
 const MODULES: ModuleDef[] = [
-  { id: 'general', title: '通用设置', desc: '一些不便归入其它模块的通用设置。', icon: SlidersHorizontal },
-  { id: 'character-card', title: '角色卡', desc: '编写 / 管理 AI 桌宠的身份与意识（自定义人设），支持多角色卡切换。', icon: Bot },
-  { id: 'model', title: '角色模型', desc: 'Live2D 模型 / 2D 立绘导入与管理。', icon: PersonStanding },
-  { id: 'api', title: 'AI API 配置', desc: '配置兼容 OpenAI 格式的大模型接口（baseURL、Key、model 等）。', icon: KeyRound },
-  { id: 'vision', title: '视觉', desc: '屏幕感知、图片理解与隐私边界。', icon: Eye },
-  { id: 'voice', title: '语音合成', desc: '配置 MiMo 声音克隆 TTS，上传参考音频生成克隆声音并驱动口型同步。或者使用本地语音模型（Genie-TTS）。', icon: AudioLines },
-  { id: 'memory', title: '记忆体', desc: '用户手动维护的全局固定记忆条目。', icon: BrainCircuit },
-  { id: 'proactive', title: '主动搭话', desc: '桌宠在长时间无交互后主动开口，可选先感知屏幕内容再搭话。', icon: MessagesSquare },
-  { id: 'story', title: '剧情系统', desc: '剧本导入管理、galgame 式剧情演出（独立剧情窗）与多周目存档。', icon: BookOpen },
-  { id: 'data', title: 'Data', desc: '会话数据管理（搜索、筛选、导出、删除）。', icon: Database },
-  { id: 'logs', title: '运行日志', desc: '查看主进程与各窗口的运行日志（级别/来源过滤、搜索、实时滚动），打包版同样可用。', icon: ScrollText },
-  { id: 'about', title: '关于与更新', desc: '检查并安装新版本，查看应用信息。', icon: Info },
+  { id: 'general', title: '通用设置', icon: SlidersHorizontal, width: 'narrow' },
+  { id: 'character-card', title: '角色卡', icon: Bot, group: '人格', width: 'wide' },
+  { id: 'model', title: '角色模型', icon: PersonStanding, group: '人格', width: 'wide' },
+  { id: 'api', title: 'AI 模型接入', icon: KeyRound, group: '能力', width: 'medium' },
+  { id: 'vision', title: '视觉感知', icon: Eye, group: '能力', width: 'narrow' },
+  { id: 'voice', title: '语音合成', icon: AudioLines, group: '能力', width: 'narrow' },
+  { id: 'memory', title: '记忆体', icon: BrainCircuit, group: '能力', width: 'wide' },
+  { id: 'proactive', title: '主动搭话', icon: MessagesSquare, group: '能力', width: 'narrow' },
+  { id: 'story', title: '剧情系统', icon: BookOpen, group: '能力', width: 'wide' },
+  { id: 'data', title: '数据管理', icon: Database, group: '数据与诊断', width: 'wide' },
+  { id: 'logs', title: '运行日志', icon: ScrollText, group: '数据与诊断', width: 'wide' },
+  { id: 'about', title: '关于与更新', icon: Info, group: '数据与诊断', width: 'narrow' },
 ]
 
+/** 置顶项（无分组） */
+const PINNED = MODULES.filter((m) => !m.group)
+
+/** 分组导航：按 group 在 MODULES 中首次出现的顺序聚合 */
+const GROUPS: Array<{ label: string; items: ModuleDef[] }> = (() => {
+  const out: Array<{ label: string; items: ModuleDef[] }> = []
+  for (const m of MODULES) {
+    if (!m.group) continue
+    const last = out[out.length - 1]
+    if (last && last.label === m.group) last.items.push(m)
+    else out.push({ label: m.group, items: [m] })
+  }
+  return out
+})()
+
 export function SettingsLayout() {
-  const [view, setView] = useState<ModuleId | 'home'>('home')
+  const [view, setView] = useState<ModuleId>('general')
   /** 待确认记忆数量：有自动沉淀候选时在左侧「记忆体」导航项显示角标 */
   const [pendingCount, setPendingCount] = useState(0)
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  const mod = MODULES.find((m) => m.id === view) ?? MODULES[0]!
 
   // 打开设置窗口即加载设置（主题切换器需要反映已保存的主题）
   useEffect(() => {
     void useSettingsStore.getState().load()
   }, [])
+
+  // 切换面板：滚动位置归零。main 是滚动容器，不重置会停在上一个面板的半空。
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 })
+  }, [view])
 
   // 待确认记忆数量：初始化查询 + 订阅变更（自动沉淀/确认/删除后刷新）
   useEffect(() => {
@@ -101,38 +140,58 @@ export function SettingsLayout() {
     <div className="app-window flex h-screen flex-col">
       <WindowTitlebar title="LainEcho · 设置" />
       <div className="flex min-h-0 flex-1">
-        {/* 左侧导航 */}
-        <nav className="flex w-48 shrink-0 flex-col border-r border-border bg-surface-2/40 p-4">
+        {/* 左侧导航：唯一的一套导航 */}
+        <nav className="flex w-[168px] shrink-0 flex-col border-r border-border bg-surface-2/40 p-3">
           <Logo />
-          <div className="mt-4 min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
-            <NavButton active={view === 'home'} onClick={() => setView('home')} icon={House} label="主页" />
-            <div className="my-2 border-t border-border" />
-            {MODULES.map((m) => (
+          <div className="mt-3 min-h-0 flex-1 space-y-0.5 overflow-y-auto pr-0.5">
+            {PINNED.map((m) => (
               <NavButton
                 key={m.id}
                 active={view === m.id}
                 onClick={() => setView(m.id)}
                 icon={m.icon}
                 label={m.title}
-                badge={m.id === 'memory' ? pendingCount : undefined}
               />
+            ))}
+            <div className="my-2 border-t border-border" />
+            {GROUPS.map((g) => (
+              <div key={g.label}>
+                <div className="px-2 pb-1 pt-2 text-[11px] text-text-muted">{g.label}</div>
+                {g.items.map((m) => (
+                  <NavButton
+                    key={m.id}
+                    active={view === m.id}
+                    onClick={() => setView(m.id)}
+                    icon={m.icon}
+                    label={m.title}
+                    badge={m.id === 'memory' ? pendingCount : undefined}
+                  />
+                ))}
+              </div>
             ))}
           </div>
         </nav>
 
-        {/* 主内容区 */}
-        <main className="min-w-0 flex-1 overflow-y-auto">
-          <AnimatePresence mode="wait">
-            {view === 'home' ? (
-              <motion.div key="home" {...fadeSlideUp}>
-                <HomeView onSelect={(id) => setView(id)} />
-              </motion.div>
-            ) : (
-              <motion.div key={view} {...fadeSlideUp}>
-                <PanelView id={view} onBack={() => setView('home')} />
-              </motion.div>
-            )}
-          </AnimatePresence>
+        {/* 主内容区：吸顶标题条 + 面板 */}
+        <main ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
+          <PanelTitlebar title={mod.title} icon={mod.icon} />
+          {/* 不加 AnimatePresence：退场动画会带来空白期，切换应当即时 */}
+          <motion.div key={view} {...fadeSlideUp}>
+            <PanelShell width={mod.width} aside={view === 'api' ? <ApiAside /> : undefined}>
+              {view === 'general' && <GeneralPanel />}
+              {view === 'character-card' && <CharacterCardPanel />}
+              {view === 'model' && <CharacterModelPanel />}
+              {view === 'api' && <ApiConfigPanel />}
+              {view === 'voice' && <VoicePanel />}
+              {view === 'memory' && <MemoryPanel />}
+              {view === 'proactive' && <ProactivePanel />}
+              {view === 'vision' && <VisionPanel />}
+              {view === 'story' && <StoryPanel />}
+              {view === 'data' && <DataPanel />}
+              {view === 'logs' && <LogPanel />}
+              {view === 'about' && <AboutPanel />}
+            </PanelShell>
+          </motion.div>
         </main>
       </div>
     </div>
@@ -141,14 +200,30 @@ export function SettingsLayout() {
 
 function Logo() {
   return (
-    <div className="glass flex items-center gap-3 rounded-[var(--radius-md)]">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)]" style={{ background: 'var(--gradient-brand)' }}>
-        <Sparkles size={18} strokeWidth={2} style={{ color: 'var(--on-brand)' }} />
+    <div className="flex items-center gap-2.5 rounded-[var(--radius-md)] px-1 py-0.5">
+      <div
+        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)]"
+        style={{ background: 'var(--gradient-brand)' }}
+      >
+        <Sparkles size={16} strokeWidth={2} style={{ color: 'var(--on-brand)' }} />
       </div>
       <div className="min-w-0 leading-tight">
-        <div className="truncate text-[13px] font-semibold text-text">LainEcho</div>
+        <div className="truncate text-[12.5px] font-semibold text-text">LainEcho</div>
         <div className="text-[11px] text-text-muted">AI 桌宠</div>
       </div>
+    </div>
+  )
+}
+
+/** 吸顶标题条：44px，滚到第几屏都知道自己在哪 */
+function PanelTitlebar({ title, icon: Icon }: { title: string; icon: LucideIcon }) {
+  return (
+    <div className="sticky top-0 z-10 flex h-11 items-center justify-between border-b border-border bg-surface/80 px-5 backdrop-blur-md">
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon size={15} strokeWidth={2} className="shrink-0 text-primary-400" />
+        <span className="truncate text-[14px] font-medium text-text">{title}</span>
+      </div>
+      <span className="shrink-0 text-[11px] text-text-muted">改动即时生效</span>
     </div>
   )
 }
@@ -171,7 +246,7 @@ function NavButton({
     <button
       onClick={onClick}
       className={cn(
-        'relative mb-1 flex w-full items-center gap-3 rounded-[var(--radius-md)] px-3 py-2 text-left text-[13px] transition-colors',
+        'relative mb-0.5 flex h-8 w-full items-center gap-2.5 rounded-[var(--radius-md)] px-2 text-left text-[12.5px] transition-colors',
         active ? 'text-text' : 'text-text-2 hover:bg-card-hover hover:text-text',
       )}
     >
@@ -179,12 +254,17 @@ function NavButton({
       {active && (
         <motion.div
           layoutId="nav-active-indicator"
-          transition={springSoft}
-          className="absolute left-0 top-1 bottom-1 w-[3px] rounded-full"
+          transition={{ type: 'spring', stiffness: 420, damping: 34 }}
+          className="absolute left-0 top-1 bottom-1 w-[2px] rounded-full"
           style={{ background: 'var(--gradient-brand)', boxShadow: '0 0 8px var(--primary-glow)' }}
         />
       )}
-      <Icon size={16} strokeWidth={active ? 2 : 1.75} color={active ? 'var(--primary-400)' : 'currentColor'} className="relative" />
+      <Icon
+        size={15}
+        strokeWidth={active ? 2 : 1.75}
+        color={active ? 'var(--primary-400)' : 'currentColor'}
+        className="relative shrink-0"
+      />
       <span className={cn('relative truncate', active && 'font-medium')}>{label}</span>
       {badge !== undefined && badge > 0 && (
         <span className="ml-auto flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[var(--accent-500)] px-1 text-[9px] font-bold leading-none text-white">
@@ -192,90 +272,5 @@ function NavButton({
         </span>
       )}
     </button>
-  )
-}
-
-function HomeView({ onSelect }: { onSelect: (id: ModuleId) => void }) {
-  return (
-    <div className="mx-auto max-w-5xl p-6">
-      <h1 className="text-[28px] font-bold tracking-tight text-text">设置</h1>
-      <p className="mt-1 text-[13px] text-text-2">管理角色、模型、API 与数据</p>
-
-      <div className="glass mt-6 flex items-center justify-between gap-4 rounded-[var(--radius-lg)] px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-sm font-medium text-text">外观主题</div>
-          <div className="mt-0.5 text-xs text-text-muted">跟随系统将根据当前系统偏好自动切换</div>
-        </div>
-        <ThemeSwitcher />
-      </div>
-
-      <div className="mt-4 space-y-3">
-        {MODULES.map((m) => (
-          <SettingsCard key={m.id} title={m.title} desc={m.desc} icon={m.icon} onClick={() => onSelect(m.id)} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function SettingsCard({
-  icon,
-  title,
-  desc,
-  onClick,
-}: {
-  icon: LucideIcon
-  title: string
-  desc: string
-  onClick: () => void
-}) {
-  return (
-    <motion.button
-      whileHover={{ y: -4 }}
-      whileTap={{ scale: 0.98 }}
-      transition={springSoft}
-      onClick={onClick}
-      className="glass flex w-full items-center gap-4 rounded-[var(--radius-lg)] p-6 text-left transition-all duration-200 hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-glow-primary)]"
-    >
-      <IconTile icon={icon} />
-      <div className="min-w-0 flex-1">
-        <h3 className="text-[15px] font-semibold text-text">{title}</h3>
-        <p className="mt-1 line-clamp-2 text-[13px] leading-relaxed text-text-muted">{desc}</p>
-      </div>
-      <ChevronRight size={18} className="shrink-0 text-text-tertiary" />
-    </motion.button>
-  )
-}
-
-function PanelView({ id, onBack }: { id: ModuleId; onBack: () => void }) {
-  const mod = MODULES.find((m) => m.id === id)
-  return (
-    <div className="mx-auto max-w-5xl p-6">
-      <div className="mb-6 flex items-center gap-3">
-        <button
-          onClick={onBack}
-          className="flex items-center gap-1 rounded-[var(--radius-sm)] border border-border px-3 py-2 text-xs text-text-2 transition hover:border-border-strong hover:text-text"
-        >
-          <ChevronLeft size={14} /> 返回
-        </button>
-        {mod && <IconTile icon={mod.icon} size="sm" />}
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight text-text">{mod?.title}</h2>
-          {mod?.desc && <p className="mt-0.5 text-xs text-text-muted">{mod.desc}</p>}
-        </div>
-      </div>
-      {id === 'general' && <GeneralPanel />}
-      {id === 'character-card' && <CharacterCardPanel />}
-      {id === 'model' && <CharacterModelPanel />}
-      {id === 'api' && <ApiConfigPanel />}
-      {id === 'voice' && <VoicePanel />}
-      {id === 'memory' && <MemoryPanel />}
-      {id === 'proactive' && <ProactivePanel />}
-      {id === 'vision' && <VisionPanel />}
-      {id === 'story' && <StoryPanel />}
-      {id === 'data' && <DataPanel />}
-      {id === 'logs' && <LogPanel />}
-      {id === 'about' && <AboutPanel />}
-    </div>
   )
 }

@@ -21,7 +21,6 @@ import type {
 } from '../../../src/types'
 
 /** 旧 6 标准状态（保留词集）：词表方案下仍合法的历史值，导入校验只要求非空字符串 */
-export const STANDARD_EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy'] as const
 
 /** 校验错误（file = 剧本包内相对路径） */
 export interface SchemaIssue {

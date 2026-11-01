@@ -15,10 +15,12 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, RenderMode, PetCardPayload, SpritePaletteEntry } from '../types'
-import { BUILTIN_DEFAULT_EMOTION, paletteFromSprite, resolvePaletteImage } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, RenderMode, PetCardPayload, SpritePaletteEntry, ModelProfile } from '../types'
+import { BUILTIN_DEFAULT_EMOTION, labelMatches, paletteFromSprite, resolvePaletteImage, resolvePerformanceTarget } from '../types'
 import { useCharacterStore } from '../store/characterStore'
-import { DEFAULT_MODEL_SETTINGS } from '../store/modelSettingsStore'
+import { DEFAULT_MODEL_SETTINGS, resolveModelParameters } from '../store/modelSettingsStore'
+import { buildAppearanceCatalog, mergeAppearanceSelection } from '../lib/appearanceCatalog'
+import { POSE_SLIDERS, buildModelProfile, paramRange, writeTarget } from '../lib/modelProfile'
 import { LipSyncController } from './lipSync'
 
 export interface PetStageHandle {
@@ -35,8 +37,8 @@ export interface PetStageHandle {
   stopSpeak: () => void
   /** 按句更新当前状态（桌宠句级播放时由 PetApp 调用，驱动立绘/表情联动；词表方案下为自由状态词） */
   setEmotion: (emotion: string) => void
-  /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后调用） */
-  resize: () => void
+  /** 按给定尺寸重建画布并重新适配角色（尺寸来自设置；不传则读容器） */
+  resize: (width?: number, height?: number) => void
 }
 
 interface PetStageProps {
@@ -45,6 +47,16 @@ interface PetStageProps {
 }
 
 const IDLE_MS = 10_000
+
+/**
+ * 角色适配基准（常量，**不随窗口尺寸变化**）。
+ *
+ * 窗口只决定画布大小：放大窗口 = 角色周围多出留白（超出时裁切），而不是把角色放大。
+ * 角色本身的大小归「角色模型 → 缩放」（settings.view.scale）管，两者正交。
+ * 取值沿用旧版固定窗口的模型区尺寸（300×440），默认窗口下观感与旧版一致。
+ */
+const FIT_REF_W = 300
+const FIT_REF_H = 440
 
 // ===== 立绘 alpha 归一化（修复"横向姿态立绘显小"）=====
 // 立绘渲染按整张 PNG 画布 object-contain 拟合：眺望等横向延展姿态的画布更宽，contain 受宽度
@@ -123,6 +135,14 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const loadGenRef = useRef(0)
   /** 当前展示的模型 id（模型列表变化时保持，不跳回 models[0]） */
   const currentModelIdRef = useRef<string | null>(null)
+  /** 上一次上报给主进程的"状态表情"（避免每次 ticker 都发 IPC） */
+  const lastStateReportRef = useRef<string | null>(null)
+  /** 当前模型的参数能力表（存在性/量程/物理驱动），模型加载后采集并上报 */
+  const profileRef = useRef<ModelProfile | null>(null)
+  /** beforeModelUpdate 钩子（每帧 core.update 之前回写用户姿态，保证「拖了就动」） */
+  const beforeUpdateRef = useRef<(() => void) | null>(null)
+  /** 被用户手动取消的状态表情名：名字变了（新状态）就自动失效 */
+  const dismissedStateRef = useRef<string | null>(null)
   /** 当前角色卡绑定的模型 id（null 表示未绑定，应使用全局选中模型） */
   const currentCardModelIdRef = useRef<string | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
@@ -151,7 +171,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const migratedDefaultRef = useRef<string>(BUILTIN_DEFAULT_EMOTION)
   /** 当前生效演出词表快照（演出词表双轨，模式分轨）：sprite 模式 = 立绘集词表（查图）；
    *  live2d 模式 = Live2D 模型词表（查表情联动 expression）。由 refreshPalette 按模式刷新 */
-  const paletteEntriesRef = useRef<Array<{ name: string; gloss: string; expression?: string }>>([])
+  const paletteEntriesRef = useRef<Array<{ name: string; expression?: string }>>([])
   /** 当前角色卡绑定的立绘集 id（立绘模式渲染用） */
   const spriteIdRef = useRef<string | null>(null)
   /** 全局当前立绘集 id（modelSettings.selectedSpriteId，角色卡未绑定立绘时回退用） */
@@ -201,14 +221,33 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     return () => ro.disconnect()
   }, [spriteLayerEl])
 
-  /** 解析当前立绘模式实际使用的立绘集 id：角色卡绑定优先，否则全局当前立绘集 */
-  function getEffectiveSpriteId(): string | null {
-    return spriteIdRef.current ?? selectedSpriteIdRef.current ?? null
+  /**
+   * 本轮演出目标（模式 + 立绘集 + 模型）。
+   *
+   * 与主进程的词表解析共用 `resolvePerformanceTarget`——卡片绑定只在它自己的固定模式下生效，
+   * 「跟随全局」时彻底忽略绑定。早先两处各写一套（渲染看了 renderMode、词表没看），
+   * 于是"画面跟着全局换、AI 还在用卡片绑定的旧词表"（2026-10-31 定位）。
+   */
+  function performanceTarget() {
+    return resolvePerformanceTarget({
+      card: {
+        renderMode: cardModeRef.current,
+        spriteId: spriteIdRef.current,
+        modelId: currentCardModelIdRef.current,
+      },
+      selectedSpriteId: selectedSpriteIdRef.current,
+      selectedModelId: settingsRef.current.selectedModelId,
+    })
   }
 
-  /** 解析当前 Live2D 模式实际使用的模型 id：角色卡绑定优先，否则全局当前模型 */
+  /** 当前立绘模式实际使用的立绘集 id */
+  function getEffectiveSpriteId(): string | null {
+    return performanceTarget().spriteId
+  }
+
+  /** 当前 Live2D 模式实际使用的模型 id */
   function getEffectiveModelId(): string | null {
-    return currentCardModelIdRef.current ?? settingsRef.current.selectedModelId ?? null
+    return performanceTarget().modelId
   }
 
   /**
@@ -216,8 +255,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
    *   角色卡显式设定了形象模式 → 用之；否则跟随全局（全局选中立绘集则立绘，否则 Live2D）。
    */
   function effectiveRenderMode(): RenderMode {
-    if (cardModeRef.current) return cardModeRef.current
-    return selectedSpriteIdRef.current ? 'sprite' : 'live2d'
+    return performanceTarget().mode
   }
 
   /** 模型设置引用（每帧读取，不触发重渲染） */
@@ -261,6 +299,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     },
     /** 按句更新状态：写 emotion 并重应用立绘/表情 */
     setEmotion: (emotion: string) => {
+      if (emotion !== currentEmotionRef.current) dismissedStateRef.current = null
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
         applySprite()
@@ -268,13 +307,17 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         updateCurrentExpression()
       }
     },
-    /** 按容器尺寸重建画布并重新适配角色（聊天区高度变化后由 PetApp 调用） */
-    resize: () => {
+    /**
+     * 重建画布并重新适配角色。**尺寸由调用方给定**（来自设置），不从 DOM 反推：
+     * 透明窗口拖动期间 `clientWidth/Height` 会报失真值，用它决定画布尺寸会被拉长。
+     * 不传时退化为读容器，仅供无设置来源的临时场景（如首帧）。
+     */
+    resize: (width?: number, height?: number) => {
       const container = containerRef.current
       const app = appRef.current
-      if (!container || !app) return
-      const w = container.clientWidth || 300
-      const h = container.clientHeight || 300
+      if (!app) return
+      const w = Math.round(width ?? container?.clientWidth ?? 0) || 300
+      const h = Math.round(height ?? container?.clientHeight ?? 0) || 300
       if (app.screen.width !== w || app.screen.height !== h) {
         try {
           app.renderer.resize(w, h)
@@ -307,9 +350,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     const mw = char?.width || canvasW
     const mh = char?.height || canvasH
 
-    // 基础缩放 × 用户设置的缩放系数
+    // 基础缩放按**固定基准**算，与当前画布尺寸无关 —— 否则调窗口会把角色一起放大/缩小。
+    // 再乘用户设置的缩放系数（角色模型 → 缩放）。
     const view = settingsRef.current.view
-    const baseScale = Math.min(w / mw, h / mh) * 0.9
+    const baseScale = Math.min(FIT_REF_W / mw, FIT_REF_H / mh) * 0.9
     const scale = baseScale * view.scale
     currentScaleRef.current = scale
     model.scale.set(scale, scale)
@@ -339,6 +383,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
     }
     modelRef.current = null
+    // 摘掉上一模型的 beforeModelUpdate 钩子与能力表，避免旧模型数据串到新模型
+    beforeUpdateRef.current?.()
+    beforeUpdateRef.current = null
+    profileRef.current = null
     // 清空表情状态，防止旧模型的表情基础值残留到新模型
     expressionListRef.current = []
     currentExpressionParamsRef.current = []
@@ -446,19 +494,47 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   }
 
   /**
-   * 获取当前生效的表情名。优先级从高到低：
-   *   状态词表联动（当前状态词命中词表条目且配了 expression，且模型存在该表情）→ 全局设置。
-   * 返回空串表示不应用表情。
+   * 当前由「状态词表」驱动的表情（临时层）。
+   * 规则（与用户确认）：默认状态词不算状态层——默认词走外观，否则外观会被默认表情永久压住。
    */
-  function getEffectiveExpression(): string {
-    // P2b 状态表情联动：AI 输出的状态词（主进程已归一化到词表词）→ 词表条目.expression
-    const entry = paletteEntriesRef.current.find((e) => e.name === currentEmotionRef.current)
-    const emotionExpr = entry?.expression?.trim()
-    if (emotionExpr && expressionListRef.current.some((e) => e.name === emotionExpr)) {
-      return emotionExpr
-    }
-    // 未配表情 / 模型无该表情 / 词表未命中 → 回落全局静态表情
-    return settingsRef.current.animation.selectedExpression
+  function getActiveStateExpression(): string | null {
+    if (currentEmotionRef.current === BUILTIN_DEFAULT_EMOTION) return null
+    // 标签可能含「，」分隔的多段（害羞，心动）：旧消息里存的是单个词，按段匹配回查
+    const entry = paletteEntriesRef.current.find((e) => labelMatches(currentEmotionRef.current, e.name))
+    const expr = entry?.expression?.trim()
+    if (!expr) return null
+    if (!expressionListRef.current.some((e) => e.name === expr)) return null
+    // 用户在外观面板点掉了这一项：直到状态词换掉之前都不再生效
+    if (dismissedStateRef.current === expr) return null
+    return expr
+  }
+
+  /** 外观面板点了"·状态"项：取消当前状态表情并立刻重算 */
+  function dismissStateExpression(): void {
+    const entry = paletteEntriesRef.current.find((e) => labelMatches(currentEmotionRef.current, e.name))
+    const expr = entry?.expression?.trim()
+    if (!expr) return
+    dismissedStateRef.current = expr
+    updateCurrentExpression()
+  }
+
+  /**
+   * 获取当前生效的表情名（可多个）= 外观持久层 ∪ 状态临时层。
+   *  - 互斥组内：状态优先（覆盖外观对应单选）；
+   *  - 其余：并集（状态脸红不会把外观的裙子切换关掉）。
+   * 外观（appearancesByModel）之后又加了一层旧字段 selectedExpression 的兼容兜底。
+   */
+  function getEffectiveExpressions(): string[] {
+    const has = (name: string) => expressionListRef.current.some((e) => e.name === name)
+    if (!settingsRef.current.animation.expressionEnabled) return []
+    // 注意区分「没配过」和「配过但全部关掉」：只有前者才回落到旧的全局 selectedExpression
+    const perModelRaw = settingsRef.current.appearancesByModel?.[currentModelIdRef.current ?? '']
+    const legacy = settingsRef.current.animation.selectedExpression
+    const userList = perModelRaw ?? (legacy ? [legacy] : [])
+    const state = getActiveStateExpression()
+    if (!state) return userList.filter(has)
+    const catalog = buildAppearanceCatalog(expressionListRef.current)
+    return mergeAppearanceSelection(catalog, userList, state).filter(has)
   }
 
   /**
@@ -497,15 +573,37 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
    * 参考 airi 的 expression-controller.ts：不使用 SDK 的 Expression Manager，直接管理参数。
    * P2b：表情名由 getEffectiveExpression 决定——状态词表联动优先，回落全局静态表情。
    */
+  /** 状态表情变化时上报主进程（设置窗用它标记外观项） */
+  function reportStateExpression(): void {
+    const state = getActiveStateExpression()
+    if (state === lastStateReportRef.current) return
+    lastStateReportRef.current = state
+    api.pet.reportStateExpression(state)
+  }
+
   function updateCurrentExpression() {
-    const anim = settingsRef.current.animation
-    const selectedExpression = getEffectiveExpression()
-    if (!anim.expressionEnabled || !selectedExpression) {
+    reportStateExpression()
+    if (!settingsRef.current.animation.expressionEnabled) {
       currentExpressionParamsRef.current = []
       return
     }
-    const expr = expressionListRef.current.find((e) => e.name === selectedExpression)
-    currentExpressionParamsRef.current = expr?.parameters ?? []
+    const names = getEffectiveExpressions()
+    if (names.length === 0) {
+      currentExpressionParamsRef.current = []
+      return
+    }
+    // 多个外观项合并成一份参数表：同一参数按"后者覆盖"（互斥组在 UI 侧已保证只会选一个）
+    const merged: ExpressionParameter[] = []
+    for (const name of names) {
+      const expr = expressionListRef.current.find((e) => e.name === name)
+      if (!expr) continue
+      for (const p of expr.parameters) {
+        const idx = merged.findIndex((m) => m.Id === p.Id)
+        if (idx >= 0) merged[idx] = p
+        else merged.push(p)
+      }
+    }
+    currentExpressionParamsRef.current = merged
   }
 
   /**
@@ -516,7 +614,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   async function refreshPalette() {
     try {
       if (modeRef.current === 'live2d') {
-        const modelId = currentCardModelIdRef.current ?? settingsRef.current.selectedModelId ?? null
+        const modelId = getEffectiveModelId()
         const palette = modelId ? await api.model.getPalette(modelId) : null
         if (palette && palette.entries.length > 0) {
           paletteEntriesRef.current = palette.entries
@@ -577,7 +675,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     const findModel = (id?: string | null) => id ? models.find((m) => m.id === id) : undefined
     const meta =
       findModel(modelId) ??
-      findModel(currentCardModelIdRef.current) ??
+      findModel(getEffectiveModelId()) ??
       findModel(settingsRef.current.selectedModelId) ??
       (models[0] as Live2DModelMeta)
     currentModelIdRef.current = meta.id
@@ -601,6 +699,28 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       }
       modelRef.current = model
       app.stage.addChild(model as unknown as PIXI.DisplayObject)
+
+      // ② 眼球所有权归应用：SDK 内置眨眼每帧在 core.update 之前把 ParamEyeLOpen/ROpen
+      //    写回 1，应用随后写的眼睛参数会在下一帧被冲掉（实测强制写 0 仍然睁眼）。
+      //    这里直接摘掉 SDK 眨眼控制器，眼睛完全交给应用自己的状态机，手动值才真正有效。
+      const imAny = (model as unknown as {
+        internalModel?: {
+          eyeBlink?: unknown
+          on?: (ev: string, fn: () => void) => void
+          off?: (ev: string, fn: () => void) => void
+        }
+      }).internalModel
+      if (imAny) {
+        imAny.eyeBlink = undefined
+        // ① 写入时机前移：beforeModelUpdate 就在 core.update() 前一行，
+        //    在这里回写用户姿态，物理/眨眼/动作都压不过它，且当帧生效。
+        if (typeof imAny.on === 'function') {
+          const handler = () => applyFinalPoseOverrides()
+          imAny.on('beforeModelUpdate', handler)
+          beforeUpdateRef.current = () => imAny.off?.('beforeModelUpdate', handler)
+        }
+      }
+
       // 等 physics（长发/飘带）跑几帧稳定后再测量拟合：首帧包围盒会被甩动部件撑大
       await waitFrames(app, 10)
       if (gen !== loadGenRef.current || cancelledRef.current) return
@@ -641,6 +761,28 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       setLoading(false)
       onStatus('ready')
       setBanner(null)
+
+      // ④ 采集能力表：参数存在性/真实量程（core）+ 眨眼/口型组（model3）+ 物理驱动（physics3）
+      try {
+        const coreForProfile = (model as unknown as { internalModel?: InternalModelLike }).internalModel?.coreModel
+        if (coreForProfile) {
+          const profile = await collectModelProfile(meta.id, url, coreForProfile)
+          if (profile && gen === loadGenRef.current && !cancelledRef.current) {
+            profileRef.current = profile
+            api.pet.reportModelProfile(profile)
+            console.log(
+              '[pet] 能力表已采集:', meta.name,
+              '参数', Object.keys(profile.params).length,
+              '物理输出', profile.physicsOutputs.length,
+              '可驱动', Object.keys(profile.drivers).length,
+              '眨眼组', profile.eyeBlink.length,
+            )
+          }
+        }
+      } catch (err) {
+        console.warn('[pet] 能力表采集失败（UI 退回兜底量程）:', err instanceof Error ? err.message : err)
+      }
+
       // 加载模型的表情列表（参考 airi 的 expression-store.ts：自行解析 exp3.json）
       try {
         const expressions = await api.model.expressionList(meta.id)
@@ -669,6 +811,53 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     }
   }
 
+  /**
+   * ① 每帧 core.update() 之前的「用户姿态回写」。
+   *
+   * 为什么需要这一层：引擎的 update 顺序是
+   *   动作 → 眨眼 → focus → 呼吸 → 物理 → pose → beforeModelUpdate → core.update → loadParameters
+   * 物理与眨眼都在 core.update 之前把参数改成自己的值，应用在 update 之后写的参数下一帧就被冲掉。
+   * 在 beforeModelUpdate 里回写，等于拿到「最后一句发言权」，且当帧生效。
+   *
+   * 但优先级仍要守住：表情、口型、鼠标跟踪、眨眼进行中占用的参数一律跳过，
+   * 否则拖一次滑杆会把正在说话的口型或正在闪的表情压死。
+   */
+  function applyFinalPoseOverrides(): void {
+    const model = modelRef.current
+    if (!model) return
+    const core = (model as unknown as { internalModel?: InternalModelLike }).internalModel?.coreModel
+    if (!core?.setParameterValueById) return
+    const settings = settingsRef.current
+    const params = resolveModelParameters(settings, currentModelIdRef.current)
+    const profile = profileRef.current
+    const anim = settings.animation
+    const speaking = lipSyncRef.current.isPlaying
+    const tracking = anim.mouseTracking && mouseRef.current.active
+    const blinking = blinkRef.current.phase !== 'idle'
+    const exprIds = new Set(currentExpressionParamsRef.current.map((p) => p.Id))
+    const done = new Set<string>()
+    for (const slider of POSE_SLIDERS) {
+      const id = slider.id
+      if (done.has(id)) continue
+      done.add(id)
+      // 模型没有这个参数：写了也没有任何效果
+      if (profile && !paramRange(profile, id)) continue
+      // 表情 / 口型 / 鼠标跟踪 / 眨眼在进行中：这些是更高优先级的实时特征
+      if (exprIds.has(id)) continue
+      if (speaking && (id === 'ParamMouthOpenY' || id === 'ParamMouthForm' || id === 'ParamMouthOpen')) continue
+      if (tracking && (id === 'ParamAngleX' || id === 'ParamAngleY')) continue
+      // 跟踪时身体由驱动参数（如 PositionX）带起来，这里再回写输出参数会把跟随动作盖掉
+      if (tracking && id.startsWith('ParamBodyAngle') && profile?.drivers?.[id]) continue
+      if (blinking && (id === 'ParamEyeLOpen' || id === 'ParamEyeROpen')) continue
+      const value = params[slider.key]
+      const fallbackDef = slider.key === 'leftEyeOpen' || slider.key === 'rightEyeOpen' ? 1 : 0
+      const def = (profile ? profile.params[id]?.def : undefined) ?? fallbackDef
+      // 没动过的滑杆不写：保持「只有用户明确设置过的项才强制覆盖」
+      if (Math.abs(value - def) < 1e-4) continue
+      core.setParameterValueById(id, value)
+    }
+  }
+
   useEffect(() => {
     cancelledRef.current = false // 组件重挂载时复位（防 StrictMode 双挂载等场景）
     let idleTimer: ReturnType<typeof setInterval> | null = null
@@ -676,12 +865,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     let unsubModels = () => {}
     let unsubCore = () => {}
     let unsubSettings = () => {}
+    let unsubMotion = () => {}
+    let unsubDismiss = () => {}
     let unsubEmotion = () => {}
     let unsubThinking = () => {}
     let unsubObserving = () => {}
     let unsubSprites = () => {}
     let unsubCursor = () => {}
-    let ro: ResizeObserver | null = null
     let booting = false
 
     /** 每帧参数引擎回调（注册到 PIXI ticker） */
@@ -706,7 +896,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (!model) return
       const settings = settingsRef.current
       const animation = settings.animation
-      const params = settings.parameters
+      // 姿态参数按模型取：优先 parametersByModel[当前模型]，没有专属值才回落全局
+      const params = resolveModelParameters(settings, currentModelIdRef.current)
 
       // 获取 internalModel（暴露 coreModel 和 focusController）
       const internal = (model as unknown as {
@@ -732,7 +923,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       // 执行顺序（参考 airi：用户参数 → 表情 → 眨眼 → 眼神）：
       // 1. 应用用户参数（写 angleZ + eyeOpen + eyebrow + mouth + body + breath）
       //    鼠标跟踪激活时跳过 angleX/Y（由 updateEyeTracking 覆盖）
-      applyModelParameters(coreModel, params, mouseTrackingActive)
+      applyModelParameters(coreModel, params, mouseTrackingActive, profileRef.current)
 
       // 2. 表情（在用户参数之后、眨眼之前应用，参考 airi 的表情应用顺序）
       //    P2b lerp 渐变：applyExpression 内部对参数值做跨帧插值——切换表情时向新目标平滑过渡，
@@ -747,12 +938,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
       // 3. 眨眼（读回 eyeOpen 值，乘以眨眼系数）
       if (animation.enableBlink) {
-        updateBlink(coreModel, blinkRef.current, animation.blinkMode, delta, params)
+        // SDK 内置眨眼已在 loadModel 里被摘掉，'auto' 依赖的曲线不存在 → 统一走应用状态机
+        updateBlink(coreModel, blinkRef.current, 'force', delta, params)
       }
 
       // 4. 鼠标跟踪 / 空闲眼神（覆盖 angleX/Y 和 eyeBallX/Y）
       if (mouseTrackingActive) {
-        updateEyeTracking(coreModel, mouseRef.current, animation, focusRef.current)
+        updateEyeTracking(coreModel, mouseRef.current, animation, focusRef.current, profileRef.current, params)
       } else if (animation.idleEyeMovement) {
         updateIdleEyes(internal!, idleEyeRef.current, delta)
       }
@@ -771,6 +963,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         // 嘴"张开+咧开"比纯上下开合更自然；各主流模型都有该参数（cdi 已验证）
         coreModel.setParameterValueById?.('ParamMouthForm', mouthOpen * 0.4)
       }
+
+      // 6. 控制器参数镜像（只对 VTS/VBridger 型模型生效）
+      //    上面 1~5 步写的都是标准 Cubism 参数；这类模型真正驱动头/身体/物理的是
+      //    AngleX/AngleY/AngleZ、PositionX/Y/Z 等「控制器参数」，不镜像就等于没动。
+      //    放在最后 = 读到本帧最终值（含鼠标跟踪的 angleX/Y 与口型的 ParamMouthOpenY）。
+      mirrorRigParameters(coreModel, profileRef.current)
     }
 
     /** 完整初始化（幂等）：
@@ -810,10 +1008,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         }
         live2dClassRef.current = cls
 
-        // 基准尺寸：桌宠窗口固定不可缩放，画布始终钉住初始尺寸。
-        // 注意：Windows 上拖动透明无边框窗口时 container.clientWidth 可能瞬时失真，
-        // 若 ResizeObserver 跟随它缩放画布，就会出现「拖动时框一直自动延长」。
-        const baseW = container.clientWidth || 380
+        // 初始尺寸按容器量一次（此时窗口已按设置建好，读数可信）。
+        // 之后画布尺寸只由 PetApp 通过 handle.resize 显式驱动：Windows 上拖动透明无边框窗口时
+        // container.clientWidth 会瞬时失真，谁拿它当尺寸来源，谁就会被"拖着拖着变长"咬。
+        const baseW = container.clientWidth || 300
         const baseH = container.clientHeight || 440
 
         let app: PIXI.Application
@@ -849,13 +1047,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
         const anim = settingsRef.current.animation
         app.ticker.maxFPS = anim.maxFps === 0 ? 0 : anim.maxFps
 
-        // 监听窗口尺寸变化：始终恢复到基准尺寸，忽略拖动中的失真读数
-        ro = new ResizeObserver(() => {
-          if (!container || cancelledRef.current) return
-          app.renderer.resize(baseW, baseH)
-          fitModel()
-        })
-        ro.observe(container)
+        // 画布尺寸改由 PetApp 显式驱动（见 handle.resize）：窗口尺寸现在是设置项，
+        // 只需要一个可信来源。此前这里的 ResizeObserver 会无条件 resize 回初始化尺寸，
+        // 正是"放大窗口但 Live2D 只画在左上角 300×440 里"的原因（立绘走 CSS 居中，所以没暴露）。
 
         // 鼠标跟踪：通过主进程全局轮询获取鼠标坐标（参考 airi 桌面端用 OS API）
         // 透明窗口 + -webkit-app-region: drag 导致 window.mousemove 无法正常触发，
@@ -980,8 +1174,18 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       applySettings(settings)
     })
 
+    // 订阅「取消状态表情」：外观面板点了"·状态"项
+    unsubDismiss = api.pet.onDismissStateExpression(() => dismissStateExpression())
+
+    // 订阅「一键动作」：设置面板点动作按钮 → 立刻播放一次（不改动待机动作设置）
+    unsubMotion = api.pet.onPlayMotion((group) => {
+      void playRandomIdle(modelRef.current, group, true)
+    })
+
     // 订阅 AI 回复状态：立绘切图 / Live2D 切表情（状态联动核心；词表方案下为自由状态词）
     unsubEmotion = api.pet.onEmotion((emotion: string) => {
+      // 新一轮回复 = 新的状态，用户上一轮点掉的"取消"到此失效（否则同样的情绪再来一次会永远不生效）
+      dismissedStateRef.current = null
       currentEmotionRef.current = emotion
       if (modeRef.current === 'sprite') {
         // 回复完成：退出思考态，回到状态/空闲态
@@ -1049,12 +1253,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       unsubModels()
       unsubCore()
       unsubSettings()
+      unsubMotion()
+      unsubDismiss()
       unsubEmotion()
       unsubThinking()
       unsubObserving()
       unsubSprites()
       unsubCursor()
-      ro?.disconnect()
       // 停止口型同步并释放 AudioContext
       lipSyncRef.current.stop()
       clearModel()
@@ -1113,7 +1318,8 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
               // 由窗口左右对称裁掉（两臂各裁一点）。flex 居中对超宽子元素的溢出方向不可靠
               //（实锤单侧裁切），改用 left/top 50% + translate(-50%,-50%) 保证对称溢出
               const box = bb.box
-              const s = spriteLayerSize.h / box.bh
+              // 与 Live2D 同一基准：高度取常量而非当前容器高度，窗口变大不会放大立绘
+              const s = FIT_REF_H / box.bh
               return (
                 <div
                   className="absolute"
@@ -1541,6 +1747,140 @@ interface CoreModelLike {
   getParameterValueById?: (id: string) => number
   addParameterValueById?: (id: string, value: number, weight?: number) => void
   multiplyParameterValueById?: (id: string, value: number, weight?: number) => void
+  /** CubismModel 内部数据（用于枚举真实存在的参数 id 与量程） */
+  _model?: {
+    parameters?: {
+      ids?: readonly string[]
+      minimumValues?: ArrayLike<number>
+      maximumValues?: ArrayLike<number>
+      defaultValues?: ArrayLike<number>
+    }
+  }
+}
+
+// ---------------- VTS/VBridger 型模型的「控制器参数」镜像 ----------------
+
+/**
+ * 一部分 Live2D 模型是给 VTube Studio 直播用的（目录里带 .vtube.json / .vbridger），
+ * 作者把标准 Cubism 参数接到了另一组「控制器参数」上：面捕角度写入的是
+ * AngleX/AngleY/AngleZ 与 PositionX/Y/Z，而不是 ParamAngleX/ParamAngleY/ParamAngleZ。
+ * 证据来自模型自带的 .vtube.json → ParameterSettings：
+ *   FaceAngleX → AngleX 与 PositionX、FaceAngleY → AngleY/PositionY、FaceAngleZ → AngleZ/PositionZ
+ *   JawOpen → JawOpen、CheekPuff → CheeckPuff（模型里确实拼成 CheeckPuff）、MouthSmile → EyeSmile
+ * 物理（physics3.json）与变形器也基本挂在这组参数上。
+ *
+ * 只写标准参数时这些控制器恒为 0 → 头不转、身体不摆、130+ 组物理全都没输入，
+ * 模型看上去就是「僵住」。这里按存在性做一次镜像：只有模型真的声明了目标 id 才写，
+ * 因此对普通 Live2D 模型（如阿库露、原版大肥鱼）完全无副作用。
+ */
+const RIG_PARAM_ALIASES: ReadonlyArray<{
+  from: string
+  to: readonly string[]
+  /** 自发摆动（幅度=角度，freq=rad/s，phase=相位）——只加在角度类上，位置类跟随 */
+  sway?: { amp: number; freq: number; phase: number }
+}> = [
+  { from: 'ParamAngleX', to: ['AngleX', 'PositionX'], sway: { amp: 0.8, freq: 0.70, phase: 0.0 } },
+  { from: 'ParamAngleY', to: ['AngleY', 'PositionY'], sway: { amp: 1.1, freq: 0.90, phase: 1.7 } },
+  { from: 'ParamAngleZ', to: ['AngleZ', 'PositionZ'], sway: { amp: 1.3, freq: 0.55, phase: 0.6 } },
+  { from: 'ParamMouthOpenY', to: ['JawOpen'] },
+  { from: 'ParamCheek', to: ['CheeckPuff'] },
+  { from: 'ParamEyeSmile', to: ['EyeSmile'] },
+]
+
+/**
+ * 采集当前模型的能力表：core 参数表（存在性 + 真实量程）+ model3.json（眨眼/口型组）
+ * + physics3.json（哪些参数是物理输出、其驱动输入是谁）。
+ *
+ * 为什么要现场采集而不是写死：参数归谁管完全由模型决定——
+ * 大肥鱼把 ParamAngleX 当成物理输出（输入是 AngleX），阿库露的 ParamAngleX 则是普通参数。
+ * 读不到 model3/physics（自定义协议异常）时退化为「只有参数表」，UI 仍能正确隐藏不存在的滑杆。
+ */
+async function collectModelProfile(
+  modelId: string,
+  model3Url: string,
+  core: CoreModelLike,
+): Promise<ModelProfile | null> {
+  const table = core._model?.parameters
+  const ids = table?.ids
+  if (!ids || ids.length === 0 || !table.minimumValues || !table.maximumValues || !table.defaultValues) {
+    return null
+  }
+  let model3: { Groups?: Array<{ Name?: string; Ids?: string[] }>; FileReferences?: { Physics?: string } } | null = null
+  let physics: unknown = null
+  try {
+    const res = await fetch(model3Url)
+    if (res.ok) model3 = await res.json()
+    const physicsFile = model3?.FileReferences?.Physics
+    if (physicsFile) {
+      const baseDir = model3Url.slice(0, model3Url.lastIndexOf('/') + 1)
+      const pres = await fetch(baseDir + encodeURI(physicsFile))
+      if (pres.ok) physics = await pres.json()
+    }
+  } catch (err) {
+    console.warn('[pet] 读取模型 json 失败（能力表退化为仅参数表）:', err instanceof Error ? err.message : err)
+  }
+  return buildModelProfile({
+    modelId,
+    paramIds: ids,
+    minimumValues: table.minimumValues,
+    maximumValues: table.maximumValues,
+    defaultValues: table.defaultValues,
+    model3,
+    physics: physics as Parameters<typeof buildModelProfile>[0]['physics'],
+  })
+}
+
+/** 每个 core 模型解析一次的别名表缓存（null = 该模型不是控制器型，无需镜像） */
+const rigAliasCache = new WeakMap<object, Map<string, string[]> | null>()
+
+/**
+ * 解析当前模型实际存在的控制器参数。
+ * @returns from → 实际存在的目标 id 列表；模型不带控制器参数时返回 null
+ */
+function resolveRigAliases(core: CoreModelLike): Map<string, string[]> | null {
+  const cached = rigAliasCache.get(core as object)
+  if (cached !== undefined) return cached
+  const ids = core._model?.parameters?.ids
+  if (!ids || ids.length === 0) return null // 拿不到参数表：不缓存，下一帧再试
+  const all = new Set(ids)
+  const map = new Map<string, string[]>()
+  for (const alias of RIG_PARAM_ALIASES) {
+    const hit = alias.to.filter((id) => all.has(id))
+    if (hit.length > 0) map.set(alias.from, hit)
+  }
+  const result = map.size > 0 ? map : null
+  rigAliasCache.set(core as object, result)
+  if (result) {
+    console.log(
+      '[pet] 检测到控制器参数（VTS/VBridger 型模型），已启用参数镜像:',
+      [...map.keys()].join(', '),
+    )
+  }
+  return result
+}
+
+/**
+ * 把标准参数镜像到控制器参数（每帧最后调用，读回本帧最终值）。
+ *
+ * 顺带叠加一点极轻微的自发摆动：这类模型的待机动作往往是「静态重置姿势」
+ * （例如大肥鱼的 脱捕.motion3.json 只有一个关键帧），不叠自摆就完全没有动画，
+ * 而物理要靠角度输入才会飘。幅度只有 1° 上下，不会盖过用户设置的姿势。
+ */
+function mirrorRigParameters(core: CoreModelLike, profile?: ModelProfile | null): void {
+  const map = resolveRigAliases(core)
+  if (!map || !core.setParameterValueById) return
+  const t = performance.now() / 1000
+  for (const alias of RIG_PARAM_ALIASES) {
+    const targets = map.get(alias.from)
+    if (!targets) continue
+    // ③ 该标准参数已经是物理输出、且能反推出驱动时，姿态会直接写驱动；
+    //    镜像再拿旧的标准参数值回写，等于把用户设置盖掉，所以跳过。
+    if (profile?.drivers?.[alias.from]) continue
+    const base = core.getParameterValueById?.(alias.from) ?? 0
+    const s = alias.sway
+    const value = s ? base + s.amp * Math.sin(t * s.freq + s.phase) : base
+    for (const id of targets) core.setParameterValueById(id, value)
+  }
 }
 
 /** pixi-live2d-display 的 focusController 接口（驱动头部旋转平滑过渡） */
@@ -1556,42 +1896,68 @@ interface InternalModelLike {
 }
 
 /**
+ * 控制器型模型的自发摆动（约 1°）。
+ * 这类模型的物理每帧重算标准参数，不自摆就是完全静止；只在"写驱动参数"时叠加。
+ */
+function rigSway(id: string, t: number): number {
+  if (id === 'ParamAngleX') return 0.8 * Math.sin(t * 0.7)
+  if (id === 'ParamAngleY') return 1.1 * Math.sin(t * 0.9 + 1.7)
+  if (id === 'ParamAngleZ') return 1.3 * Math.sin(t * 0.55 + 0.6)
+  return 0
+}
+
+/**
  * 将用户设置的模型参数写入 Cubism Core（每帧调用，覆盖 SDK 动画的同名参数）。
  * 对应 airi 的 Model.vue 第 339-359 行参数映射。
  * 当 mouseTrackingActive=true 时跳过 angleX/angleY，让 model.focus() 的 focusController 控制头部旋转。
  */
-function applyModelParameters(core: CoreModelLike, p: ModelParameters, mouseTrackingActive: boolean): void {
+function applyModelParameters(
+  core: CoreModelLike,
+  p: ModelParameters,
+  mouseTrackingActive: boolean,
+  profile?: ModelProfile | null,
+): void {
   if (!core.setParameterValueById) return
+  // ③ 物理输出的参数（例如大肥鱼的 ParamAngleX 由 AngleX 经物理驱动）必须写它的驱动参数，
+  //    否则下一帧物理会把标准参数重算回去，滑杆等于没动。普通模型没有 drivers，行为不变。
+  // 控制器型模型：写驱动时叠加一点自发摆动（幅度 1° 上下）。
+  // 这类模型的物理会把标准参数每帧重算，若不自己摆，模型看上去是"完全静止"的。
+  const now = performance.now() / 1000
+  const set = (id: string, value: number) => {
+    const target = writeTarget(profile, id)
+    // 只有"改写驱动"的项才叠自摆：普通参数直接写自身，避免把用户设置改花
+    core.setParameterValueById?.(target, target === id ? value : value + rigSway(id, now))
+  }
   // Head Rotation（鼠标跟踪激活时跳过 X/Y，由 focusController 控制）
   if (!mouseTrackingActive) {
-    core.setParameterValueById('ParamAngleX', p.angleX)
-    core.setParameterValueById('ParamAngleY', p.angleY)
+    set('ParamAngleX', p.angleX)
+    set('ParamAngleY', p.angleY)
   }
-  core.setParameterValueById('ParamAngleZ', p.angleZ)
+  set('ParamAngleZ', p.angleZ)
   // Eyes（注意：ParamEyeBallX/Y 不在此处设置，由鼠标跟踪/空闲眼神控制）
-  core.setParameterValueById('ParamEyeLOpen', p.leftEyeOpen)
-  core.setParameterValueById('ParamEyeROpen', p.rightEyeOpen)
-  core.setParameterValueById('ParamEyeSmile', p.leftEyeSmile)
+  set('ParamEyeLOpen', p.leftEyeOpen)
+  set('ParamEyeROpen', p.rightEyeOpen)
+  set('ParamEyeSmile', p.leftEyeSmile)
   // Eyebrows
-  core.setParameterValueById('ParamBrowLX', p.leftEyebrowLR)
-  core.setParameterValueById('ParamBrowRX', p.rightEyebrowLR)
-  core.setParameterValueById('ParamBrowLY', p.leftEyebrowY)
-  core.setParameterValueById('ParamBrowRY', p.rightEyebrowY)
-  core.setParameterValueById('ParamBrowLAngle', p.leftEyebrowAngle)
-  core.setParameterValueById('ParamBrowRAngle', p.rightEyebrowAngle)
-  core.setParameterValueById('ParamBrowLForm', p.leftEyebrowForm)
-  core.setParameterValueById('ParamBrowRForm', p.rightEyebrowForm)
+  set('ParamBrowLX', p.leftEyebrowLR)
+  set('ParamBrowRX', p.rightEyebrowLR)
+  set('ParamBrowLY', p.leftEyebrowY)
+  set('ParamBrowRY', p.rightEyebrowY)
+  set('ParamBrowLAngle', p.leftEyebrowAngle)
+  set('ParamBrowRAngle', p.rightEyebrowAngle)
+  set('ParamBrowLForm', p.leftEyebrowForm)
+  set('ParamBrowRForm', p.rightEyebrowForm)
   // Mouth
-  core.setParameterValueById('ParamMouthOpenY', p.mouthOpen)
-  core.setParameterValueById('ParamMouthForm', p.mouthForm)
+  set('ParamMouthOpenY', p.mouthOpen)
+  set('ParamMouthForm', p.mouthForm)
   // Face
-  core.setParameterValueById('ParamCheek', p.cheek)
+  set('ParamCheek', p.cheek)
   // Body
-  core.setParameterValueById('ParamBodyAngleX', p.bodyAngleX)
-  core.setParameterValueById('ParamBodyAngleY', p.bodyAngleY)
-  core.setParameterValueById('ParamBodyAngleZ', p.bodyAngleZ)
+  set('ParamBodyAngleX', p.bodyAngleX)
+  set('ParamBodyAngleY', p.bodyAngleY)
+  set('ParamBodyAngleZ', p.bodyAngleZ)
   // Breath
-  core.setParameterValueById('ParamBreath', p.breath)
+  set('ParamBreath', p.breath)
 }
 
 // ---------------- 表情参数应用 ----------------
@@ -1874,6 +2240,8 @@ function updateEyeTracking(
   mouse: { x: number; y: number; active: boolean; lastMoveAt: number },
   animation: ModelAnimationSettings,
   focus: { x: number; y: number },
+  profile?: ModelProfile | null,
+  params?: ModelParameters,
 ): void {
   const canvasEl = document.querySelector('canvas')
   if (!canvasEl) return
@@ -1898,7 +2266,21 @@ function updateEyeTracking(
   core.setParameterValueById?.('ParamEyeBallX', focus.x)
   core.setParameterValueById?.('ParamEyeBallY', -focus.y) // Y 轴翻转：鼠标在上方时眼睛看上
 
-  // 头部旋转跟随（ParamAngleX/Y 范围 -30~30）
-  core.setParameterValueById?.('ParamAngleX', focus.x * 30)
-  core.setParameterValueById?.('ParamAngleY', -focus.y * 30)
+  const t = performance.now() / 1000
+  // 头部旋转跟随（ParamAngleX/Y 范围 -30~30）；物理输出型模型要写到驱动参数上才有效
+  core.setParameterValueById?.(writeTarget(profile, 'ParamAngleX'), focus.x * 30 + rigSway('ParamAngleX', t))
+  core.setParameterValueById?.(writeTarget(profile, 'ParamAngleY'), -focus.y * 30 + rigSway('ParamAngleY', t))
+
+  // 身体跟随：VTS 型模型的身体角度由独立控制器（如 PositionX）驱动，
+  // 只写头部不会带动身体。不补这一下，鼠标跟踪时就只有一颗头在转，身体像钉住一样僵
+  // ——这正是「开启鼠标跟踪后身体变僵硬」的直接原因。
+  const bodyX = writeTarget(profile, 'ParamBodyAngleX')
+  const headTargets = new Set([
+    'ParamAngleX', 'ParamAngleY', 'ParamAngleZ', 'ParamBodyAngleX',
+    writeTarget(profile, 'ParamAngleX'),
+    writeTarget(profile, 'ParamAngleY'),
+  ])
+  if (!headTargets.has(bodyX)) {
+    core.setParameterValueById?.(bodyX, (params?.bodyAngleX ?? 0) + focus.x * 30 + rigSway('ParamAngleX', t))
+  }
 }
