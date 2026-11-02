@@ -40,6 +40,11 @@ const api: WindowApi = {
       ipcRenderer.on('ai:stream-user', listener)
       return () => ipcRenderer.removeListener('ai:stream-user', listener)
     },
+    onSessionAppended: (cb) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { sessionId: string; message: import('../src/types').ChatMessage }) => cb(payload)
+      ipcRenderer.on('ai:session-appended', listener)
+      return () => ipcRenderer.removeListener('ai:session-appended', listener)
+    },
     cancel: () => ipcRenderer.send('ai:cancel'),
     /** ===== 方案A快照协议（见 docs/方案A-主进程回合文档与幂等快照协议.md）===== */
     getTurnSnapshot: () => ipcRenderer.invoke('ai:get-turn-snapshot') as Promise<import('../src/types').TurnDocument | null>,
@@ -254,6 +259,14 @@ const api: WindowApi = {
     reportStateExpression: (name) => ipcRenderer.send('pet:state-expression', name),
     /** 上报当前模型的参数能力表（加载完成后调用一次） */
     reportModelProfile: (profile) => ipcRenderer.send('pet:model-profile', profile),
+    /** 订阅「要一张触摸编辑用的截图」 */
+    onTouchSnapshot: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('pet:touch-snapshot', listener)
+      return () => ipcRenderer.removeListener('pet:touch-snapshot', listener)
+    },
+    /** 回传截图（image 为 dataURL；bounds 为角色包围盒在图片里的像素坐标） */
+    sendTouchSnapshot: (payload) => ipcRenderer.send('pet:touch-snapshot-data', payload),
     /** 取消当前状态表情（设置窗外观点"·状态"项时触发） */
     dismissStateExpression: () => ipcRenderer.invoke('model:dismiss-state-expression'),
     onDismissStateExpression: (cb) => {
@@ -377,6 +390,24 @@ const api: WindowApi = {
     save: (patch) => ipcRenderer.invoke('model-settings:save', patch),
   },
   /** 主动搭话：调度状态查询/订阅 */
+  /** 触摸互动：语音与 AI 感知 */
+  touch: {
+    snapshot: () =>
+      ipcRenderer.invoke('touch:snapshot') as Promise<{
+        image: string
+        width: number
+        height: number
+        bounds: { x: number; y: number; w: number; h: number }
+        mode?: 'live2d' | 'sprite'
+        spriteId?: string | null
+        spriteFile?: string | null
+      } | null>,
+    voice: (text, allowSynthesize = true) =>
+      ipcRenderer.invoke('touch:voice', { text, allowSynthesize }) as Promise<string | null>,
+    notify: (payload) => ipcRenderer.invoke('touch:notify', payload) as Promise<void>,
+    /** 上报「接下来 durationMs 内处于触摸演出」：主动搭话会让路 */
+    reportPerforming: (durationMs) => ipcRenderer.send('touch:performing', durationMs),
+  },
   proactive: {
     /** 读取调度状态（兴趣值/当日次数/最近搭话时间） */
     getState: () => ipcRenderer.invoke('proactive:get-state') as Promise<import('../src/types').ProactiveState>,

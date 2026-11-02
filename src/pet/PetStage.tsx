@@ -15,12 +15,14 @@ import * as PIXI from 'pixi.js'
 import type { Live2DModel } from 'pixi-live2d-display'
 import { api } from '../api'
 import { IconTile } from '../components/IconTile'
-import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, RenderMode, PetCardPayload, SpritePaletteEntry, ModelProfile } from '../types'
+import type { Live2DModelMeta, ModelSettings, ModelParameters, ModelAnimationSettings, ExpressionMeta, ExpressionParameter, RenderMode, PetCardPayload, SpritePaletteEntry, ModelProfile, TouchRegion, SpriteTouchRegion, SpriteTouchFrame } from '../types'
 import { BUILTIN_DEFAULT_EMOTION, labelMatches, paletteFromSprite, resolvePaletteImage, resolvePerformanceTarget } from '../types'
 import { useCharacterStore } from '../store/characterStore'
-import { DEFAULT_MODEL_SETTINGS, resolveModelParameters } from '../store/modelSettingsStore'
+import { DEFAULT_MODEL_SETTINGS, resolveModelParameters, resolveModelTouchRegions, resolveSpriteTouchRegions } from '../store/modelSettingsStore'
+import { useSettingsStore } from '../store/settingsStore'
 import { buildAppearanceCatalog, mergeAppearanceSelection } from '../lib/appearanceCatalog'
 import { POSE_SLIDERS, buildModelProfile, paramRange, writeTarget } from '../lib/modelProfile'
+import { buildTouchRegionsFromParts, pickRegion } from '../lib/touch'
 import { LipSyncController } from './lipSync'
 
 export interface PetStageHandle {
@@ -39,6 +41,10 @@ export interface PetStageHandle {
   setEmotion: (emotion: string) => void
   /** 按给定尺寸重建画布并重新适配角色（尺寸来自设置；不传则读容器） */
   resize: (width?: number, height?: number) => void
+  /** 命中测试：窗口坐标 → 触点部位 id（未命中返回 null） */
+  hitTest: (clientX: number, clientY: number) => string | null
+  /** 播放一次触摸反应（动作 + 临时表情 + 语音 + 通知 AI） */
+  playTouch: (regionId: string) => void
 }
 
 interface PetStageProps {
@@ -141,6 +147,12 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const profileRef = useRef<ModelProfile | null>(null)
   /** beforeModelUpdate 钩子（每帧 core.update 之前回写用户姿态，保证「拖了就动」） */
   const beforeUpdateRef = useRef<(() => void) | null>(null)
+  /** 当前模型的触摸命中区（用户覆盖 > 自动识别） */
+  const touchRegionsRef = useRef<TouchRegion[]>([])
+  /** 触摸触发的临时表情（压过状态词表与外观，到期自动失效） */
+  const touchExprRef = useRef<{ names: string[]; until: number } | null>(null)
+  /** 各部位上次触发时间（冷却） */
+  const touchCooldownRef = useRef<Record<string, number>>({})
   /** 被用户手动取消的状态表情名：名字变了（新状态）就自动失效 */
   const dismissedStateRef = useRef<string | null>(null)
   /** 当前角色卡绑定的模型 id（null 表示未绑定，应使用全局选中模型） */
@@ -158,6 +170,10 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
   const [spriteLayerSize, setSpriteLayerSize] = useState<{ w: number; h: number } | null>(null)
   /** 当前模型缩放比例（滚轮缩放百分比徽标读取） */
   const currentScaleRef = useRef(1)
+  /** 自适应得到的基准缩放（不含滚轮倍率） */
+  const baseScaleRef = useRef(1)
+  /** 滚轮缩放倍率（相对基准），1 = 原始大小 */
+  const zoomFactorRef = useRef(1)
   /** 当前渲染模式引用（供 effect 闭包读取最新值，避免依赖数组重跑） */
   const modeRef = useRef<RenderMode>('live2d')
   /** 角色卡显式设定的形象模式（null = 跟随全局当前形象），由 onCardChanged 维护 */
@@ -240,6 +256,113 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     })
   }
 
+  /** 立绘内容框节点（alpha 包围盒对应的 div）：命中测试用它的屏幕矩形 */
+  const spriteContentRef = useRef<HTMLDivElement | null>(null)
+  /** 立绘模式下的触摸区域（按立绘集存） */
+  const spriteTouchRegionsRef = useRef<SpriteTouchRegion[]>([])
+  /** 立绘演出锁：演出期间丢弃情绪/说话/思考的切图请求，结束后补一次 */
+  const spriteShowLockRef = useRef(false)
+  /** 演出代数：重入/切模式时让旧演出的等待循环失效 */
+  const spriteShowGenRef = useRef(0)
+  /** 演出期间被丢弃的切图请求 */
+  const spritePendingResolveRef = useRef(false)
+  /** 当前 LipSync 播的是"触摸语音"（用于区分 AI 朗读：AI 朗读要让位，上一帧的触摸语音可以覆盖） */
+  const touchVoiceActiveRef = useRef(false)
+  const touchVoiceSeqRef = useRef(0)
+
+  /** 播一句触摸台词（TTS 缓存命中即秒回；AI 朗读中由调用方跳过） */
+  async function playTouchLine(line: string): Promise<void> {
+    const text = line.trim()
+    if (!text) return
+    const seq = ++touchVoiceSeqRef.current
+    const b64 = await api.touch.voice(text).catch(() => null)
+    if (!b64) return
+    // AI 正在朗读（且不是触摸自己播的）→ 让位，不掐断它
+    if (lipSyncRef.current.isPlaying && !touchVoiceActiveRef.current) return
+    // 触摸语音之间允许互相覆盖：立绘多帧演出时，下一帧的台词要顶掉上一句，
+    // 否则单帧时长比语音短，后面几帧会被 isPlaying 挡掉（"只有第一帧出声"就是这样来的）
+    touchVoiceActiveRef.current = true
+    const bin = atob(b64)
+    const buf = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i)
+    try {
+      await lipSyncRef.current.play(buf.buffer)
+    } catch {
+      // 播放被中断：忽略
+    } finally {
+      // 只有"最后一次触摸语音"播完才清标记，避免覆盖播放时误清
+      if (touchVoiceSeqRef.current === seq) touchVoiceActiveRef.current = false
+    }
+  }
+
+  /**
+   * 2D 立绘的触摸反应。
+   *
+   * 与 Live2D 的差别：
+   * - 没有动作/表情，触发的是"立绘序列"（逐帧切图 + 每帧台词 + 各自保持时长）；
+   * - 开启「立即回应」时**整段跳过**：不切图、不播台词，只把旁白交给 AI。
+   *   立绘有多段切换 + 思考图，和 AI 回复抢会非常乱，这是与 Live2D 的关键差异。
+   */
+  function playSpriteTouch(regionId: string): void {
+    const region = spriteTouchRegionsRef.current.find((r) => r.id === regionId)
+    if (!region) return
+    const now = performance.now()
+    const cfg = useSettingsStore.getState().settings.touch
+    const cooldown = Math.max(200, cfg?.cooldownMs || 1200)
+    if (now - (touchCooldownRef.current[regionId] ?? 0) < cooldown) return
+    touchCooldownRef.current[regionId] = now
+
+    const frames = (region.frames ?? []).filter((f) => !!f.image)
+    if (cfg?.aiReply) {
+      // 交给 AI：挡掉主动搭话，且不进入演出
+      api.touch.reportPerforming(8000)
+      void api.touch.notify({ label: region.label }).catch(() => undefined)
+      console.log('[touch] 立绘区域「%s」：已开「立即回应」，跳过立绘切换与触摸台词', region.label)
+      return
+    }
+
+    if (frames.length === 0) {
+      console.warn('[touch] 立绘区域「%s」没有配置立绘序列，点了不会有视觉变化', region.label)
+    }
+    // 演出窗口：总时长 + 收尾余量，期间主动搭话让路
+    const total = frames.reduce((sum, f) => sum + Math.max(200, f.holdMs || 1200), 0)
+    api.touch.reportPerforming(total + 3000)
+
+    void runSpriteShow(region, frames)
+    // 旁白一次触摸一条（不是每帧一条，避免刷屏）
+    void api.touch.notify({ label: region.label, line: frames[0]?.line ?? null }).catch(() => undefined)
+  }
+
+  /** 逐帧演出：切图 → 播该帧台词 → 等 holdMs；结束后按 restore 回到原图或停在最后一帧 */
+  async function runSpriteShow(region: SpriteTouchRegion, frames: SpriteTouchFrame[]): Promise<void> {
+    const spriteId = getEffectiveSpriteId()
+    if (!spriteId || frames.length === 0) return
+    const gen = ++spriteShowGenRef.current
+    spriteShowLockRef.current = true
+    spritePendingResolveRef.current = false
+    try {
+      for (const frame of frames) {
+        if (gen !== spriteShowGenRef.current) return
+        setSprite({ url: api.pet.spriteUrl(spriteId, frame.image), name: spriteId })
+        const line = (frame.line ?? '').trim()
+        if (line && useSettingsStore.getState().settings.touch?.voice) {
+          void playTouchLine(line)
+        }
+        await sleep(Math.max(200, frame.holdMs || 1200))
+      }
+    } finally {
+      // 代数不一致 = 被新演出/切模式作废，别去改共享状态
+      if (gen === spriteShowGenRef.current) {
+        const pendingDuringShow = spritePendingResolveRef.current
+        spriteShowLockRef.current = false
+        spritePendingResolveRef.current = false
+        // restore=true：回到按当前情绪解析的图；
+        // restore=false：停在最后一帧，但演出期间被挡下的请求要补上（否则会被"停住"吞掉）
+        if (region.restore !== false || pendingDuringShow) applySprite()
+      }
+    }
+  }
+
   /** 当前立绘模式实际使用的立绘集 id */
   function getEffectiveSpriteId(): string | null {
     return performanceTarget().spriteId
@@ -281,15 +404,102 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
   useImperativeHandle(stageRef, () => ({
     zoom: (factor) => {
-      currentScaleRef.current = zoomModel(modelRef.current, factor)
+      const res = applyZoomFactor(modelRef.current, baseScaleRef.current, zoomFactorRef.current * factor)
+      zoomFactorRef.current = res.factor
+      currentScaleRef.current = res.scale
     },
     playTap: () => playTap(modelRef.current, settingsRef.current.animation.idleAnimation || undefined),
     getScale: () => currentScaleRef.current,
+
+    hitTest: (clientX: number, clientY: number) => {
+      // 立绘模式：内容框（alpha 包围盒对应的 div）的屏幕矩形就是归一化基准
+      if (modeRef.current === 'sprite') {
+        const el = spriteContentRef.current
+        if (!el) return null
+        const rect = el.getBoundingClientRect()
+        if (rect.width <= 0 || rect.height <= 0) return null
+        const u = (clientX - rect.left) / rect.width
+        const v = (clientY - rect.top) / rect.height
+        const hit = pickRegion(spriteTouchRegionsRef.current, u, v)
+        console.log('[touch] sprite click u=%s v=%s regions=%d -> %s', u.toFixed(3), v.toFixed(3), spriteTouchRegionsRef.current.length, hit?.id ?? 'none')
+        return hit?.id ?? null
+      }
+      const model = modelRef.current
+      const canvasEl = document.querySelector('canvas')
+      if (!model || !canvasEl) return null
+      const b = computeCharacterBounds(model)
+      if (!b || b.width <= 0 || b.height <= 0) return null
+      // 包围盒是"模型本地像素"坐标，先换成屏幕坐标再和鼠标比，
+      // 免得本地空间与画布空间的缩放/偏移约定不一致导致整体偏移
+      const p0 = model.toGlobal(new PIXI.Point(b.x, b.y))
+      const p1 = model.toGlobal(new PIXI.Point(b.x + b.width, b.y + b.height))
+      const rect = canvasEl.getBoundingClientRect()
+      const px = clientX - rect.left
+      const py = clientY - rect.top
+      const u = (px - p0.x) / (p1.x - p0.x)
+      const v = (py - p0.y) / (p1.y - p0.y)
+      const hit = pickRegion(touchRegionsRef.current, u, v)
+      console.log('[touch] click u=%s v=%s regions=%d -> %s', u.toFixed(3), v.toFixed(3), touchRegionsRef.current.length, hit?.id ?? 'none')
+      return hit?.id ?? null
+    },
+
+    playTouch: (regionId: string) => {
+      if (modeRef.current === 'sprite') {
+        playSpriteTouch(regionId)
+        return
+      }
+      const region = touchRegionsRef.current.find((r) => r.id === regionId)
+      if (!region) return
+      const now = performance.now()
+      const touchCfg = useSettingsStore.getState().settings.touch
+      const cooldown = Math.max(200, touchCfg?.cooldownMs || 1200)
+      if (now - (touchCooldownRef.current[regionId] ?? 0) < cooldown) return
+      touchCooldownRef.current[regionId] = now
+      // 演出窗口：主动搭话在此期间让路（动作时长未知，按表情保持时长 + 余量估）
+      api.touch.reportPerforming(Math.max(5000, (region.holdMs ?? 1800) + 2500))
+      // 动作：按配置顺序依次播（一个播完再下一个），播完按需回到空闲动作
+      const motions = (region.motions ?? (region.motion ? [region.motion] : [])).filter(Boolean)
+      if (motions.length > 0) {
+        void playTouchMotions(
+          modelRef.current,
+          motions,
+          region.restoreIdle !== false,
+          settingsRef.current.animation.idleAnimation || undefined,
+        )
+      }
+      // 表情：临时层（可多个同时套），压过状态词表与外观，到期自动回落
+      const exprs = (region.expressions ?? (region.expression ? [region.expression] : [])).filter(Boolean)
+      if (exprs.length > 0) {
+        touchExprRef.current = { names: exprs, until: now + (region.holdMs ?? 1800) }
+        updateCurrentExpression()
+      }
+      // 编辑时允许存在空行（否则按 Enter 不换行），真正播放前再过滤
+      const lines = (region.lines ?? []).map((x) => x.trim()).filter(Boolean)
+      // 命中但没有配任何反应时给一条日志：否则表现就是"点了没反应"，很难判断是没命中还是没配
+      const hasReaction =
+        (region.motions?.length ?? 0) > 0 ||
+        !!region.motion ||
+        (region.expressions?.length ?? 0) > 0 ||
+        !!region.expression ||
+        lines.length > 0
+      if (!hasReaction) {
+        console.warn('[touch] 命中「%s」，但该部位没有配置动作/表情/台词，所以看不到反应', region.label)
+      }
+      const line = lines.length > 0 ? lines[Math.floor(Math.random() * lines.length)] ?? null : null
+      // 语音：AI 正在朗读时静默跳过；触摸语音之间允许覆盖（由 playTouchLine 统一处理）
+      if (line && useSettingsStore.getState().settings.touch?.voice) {
+        void playTouchLine(line)
+      }
+      // AI 感知：默认旁白入史，开启「立即回应」才当场说话
+      void api.touch.notify({ label: region.label, line }).catch(() => undefined)
+    },
     switchModel: (modelId) => {
       void loadModel(modelId)
     },
     /** 播放音频并启动口型同步 */
     speak: async (audio: ArrayBuffer) => {
+      // AI 朗读接管声道：清掉"触摸语音占用"标记，之后触摸语音才会正确让位
+      touchVoiceActiveRef.current = false
       await lipSyncRef.current.play(audio)
     },
     getPlayProgress: () => lipSyncRef.current.progress,
@@ -354,7 +564,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     // 再乘用户设置的缩放系数（角色模型 → 缩放）。
     const view = settingsRef.current.view
     const baseScale = Math.min(FIT_REF_W / mw, FIT_REF_H / mh) * 0.9
-    const scale = baseScale * view.scale
+    const base = baseScale * view.scale
+    // 滚轮缩放用「基准 × 倍率」而不是在当前 scale 上连乘：
+    // 连乘一旦被别处重置或漂移，就会出现"只能放大、回不去"的现象
+    baseScaleRef.current = base
+    const scale = base * zoomFactorRef.current
     currentScaleRef.current = scale
     model.scale.set(scale, scale)
     model.anchor.set(0.5, 0.5)
@@ -387,6 +601,9 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     beforeUpdateRef.current?.()
     beforeUpdateRef.current = null
     profileRef.current = null
+    touchExprRef.current = null
+    touchRegionsRef.current = []
+    touchCooldownRef.current = {}
     // 清空表情状态，防止旧模型的表情基础值残留到新模型
     expressionListRef.current = []
     currentExpressionParamsRef.current = []
@@ -409,6 +626,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     emotion: string = BUILTIN_DEFAULT_EMOTION,
     variant: 'idle' | 'speaking' | 'thinking' | 'observing' = 'idle',
   ) {
+    // 触摸演出进行中：丢弃并记账，演出结束后补一次解析
+    if (spriteShowLockRef.current) {
+      spritePendingResolveRef.current = true
+      return
+    }
     if (!spriteId) {
       if (gen !== spriteGenRef.current) return
       setSprite(null)
@@ -526,6 +748,15 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
    */
   function getEffectiveExpressions(): string[] {
     const has = (name: string) => expressionListRef.current.some((e) => e.name === name)
+    // 触摸临时表情：优先级最高，到期自动失效（不会永久压住状态词表）
+    const touch = touchExprRef.current
+    if (touch) {
+      if (performance.now() > touch.until) touchExprRef.current = null
+      else {
+        const names = touch.names.filter(has)
+        if (names.length > 0) return names
+      }
+    }
     if (!settingsRef.current.animation.expressionEnabled) return []
     // 注意区分「没配过」和「配过但全部关掉」：只有前者才回落到旧的全局 selectedExpression
     const perModelRaw = settingsRef.current.appearancesByModel?.[currentModelIdRef.current ?? '']
@@ -764,9 +995,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
       // ④ 采集能力表：参数存在性/真实量程（core）+ 眨眼/口型组（model3）+ 物理驱动（physics3）
       try {
-        const coreForProfile = (model as unknown as { internalModel?: InternalModelLike }).internalModel?.coreModel
-        if (coreForProfile) {
-          const profile = await collectModelProfile(meta.id, url, coreForProfile)
+        const imForProfile = (model as unknown as {
+          internalModel?: InternalModelLike & { pixelsPerUnit?: number; originalWidth?: number; originalHeight?: number }
+        }).internalModel
+        if (imForProfile?.coreModel) {
+          const profile = await collectModelProfile(meta.id, url, imForProfile)
           if (profile && gen === loadGenRef.current && !cancelledRef.current) {
             profileRef.current = profile
             api.pet.reportModelProfile(profile)
@@ -866,6 +1099,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
     let unsubCore = () => {}
     let unsubSettings = () => {}
     let unsubMotion = () => {}
+    let unsubSnapshot = () => {}
     let unsubDismiss = () => {}
     let unsubEmotion = () => {}
     let unsubThinking = () => {}
@@ -876,6 +1110,13 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     /** 每帧参数引擎回调（注册到 PIXI ticker） */
     const tickerFn = (delta: number) => {
+      // 触摸区域两种模式都要刷新：立绘模式没有 Live2D 模型，不能放到下面的 model 早退之后
+      // （放错位置会导致 spriteTouchRegionsRef 永远是空数组，点击全部落空）
+      const settingsNow = settingsRef.current
+      touchRegionsRef.current =
+        resolveModelTouchRegions(settingsNow, currentModelIdRef.current) ?? profileRef.current?.regions ?? []
+      spriteTouchRegionsRef.current = resolveSpriteTouchRegions(settingsNow, getEffectiveSpriteId())
+
       // 立绘模式：检测说话态翻转，切换说话/空闲立绘（思考态优先不被覆盖）
       if (modeRef.current === 'sprite') {
         const speakingNow = lipSyncRef.current.isPlaying
@@ -898,7 +1139,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       const animation = settings.animation
       // 姿态参数按模型取：优先 parametersByModel[当前模型]，没有专属值才回落全局
       const params = resolveModelParameters(settings, currentModelIdRef.current)
-
+      // 触摸表情到期检查：必须每帧查，否则只在下次事件时才重算，表现为"表情一直挂着"
+      if (touchExprRef.current && performance.now() > touchExprRef.current.until) {
+        touchExprRef.current = null
+        updateCurrentExpression()
+      }
       // 获取 internalModel（暴露 coreModel 和 focusController）
       const internal = (model as unknown as {
         internalModel?: InternalModelLike
@@ -1112,6 +1357,11 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       if (modeChanged) {
         modeRef.current = nextMode
         setMode(nextMode)
+        // 作废旧模式的触摸演出：代数 +1 让等待循环自行退出，并释放锁
+        spriteShowGenRef.current++
+        spriteShowLockRef.current = false
+        spritePendingResolveRef.current = false
+        spriteTouchRegionsRef.current = []
       }
       if (nextMode === 'sprite') {
         // 立绘：作废在途的 Live2D 加载请求并销毁已加载模型，避免初始阶段二者并存
@@ -1176,6 +1426,76 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
 
     // 订阅「取消状态表情」：外观面板点了"·状态"项
     unsubDismiss = api.pet.onDismissStateExpression(() => dismissStateExpression())
+
+    // 订阅「截一张当前姿势」：只上报几何信息，真正的窗口截图由主进程做
+    // （自己 extract 画布会涉及裁剪原点/分辨率换算，坐标很容易整体偏移）
+    unsubSnapshot = api.pet.onTouchSnapshot(() => {
+      // 立绘模式：归一化基准是"立绘内容框"（alpha 包围盒），不是 Live2D 模型包围盒
+      if (modeRef.current === 'sprite') {
+        const el = spriteContentRef.current
+        // 兜底：内容框节点还没挂上时（bbox 解析中/尺寸未就绪），用立绘层容器顶一下，
+        // 至少能出图并编辑，不然设置窗会一直卡在"加载不出来"
+        const fallback = spriteLayerEl
+        const target = el ?? fallback
+        if (!target) {
+          console.warn('[touch] snapshot: 立绘层未挂载（mode=sprite，无内容框也无容器）')
+          api.pet.sendTouchSnapshot(null)
+          return
+        }
+        const r = target.getBoundingClientRect()
+        if (r.width <= 0 || r.height <= 0) {
+          console.warn('[touch] snapshot: 立绘几何为 0', { el: !!el, w: r.width, h: r.height })
+          api.pet.sendTouchSnapshot(null)
+          return
+        }
+        console.log('[touch] snapshot sprite', { content: !!el, fallback: !el, w: Math.round(r.width), h: Math.round(r.height) })
+        api.pet.sendTouchSnapshot({
+          image: '',
+          width: 0,
+          height: 0,
+          bounds: { x: r.left, y: r.top, w: r.width, h: r.height },
+          mode: 'sprite',
+          spriteId: getEffectiveSpriteId(),
+          // 当前正在显示的图（选择器里标「当前」用）
+          spriteFile: sprite
+            ? decodeURIComponent(sprite.url.replace(/^pet-res:\/\/sprites\/[^/]+\//, ''))
+            : null,
+        })
+        return
+      }
+      const modelNow = modelRef.current
+      const canvasEl = document.querySelector('canvas')
+      if (!modelNow || !canvasEl) {
+        api.pet.sendTouchSnapshot(null)
+        return
+      }
+      try {
+        const b = computeCharacterBounds(modelNow)
+        if (!b || b.width <= 0 || b.height <= 0) {
+          api.pet.sendTouchSnapshot(null)
+          return
+        }
+        const p0 = modelNow.toGlobal(new PIXI.Point(b.x, b.y))
+        const p1 = modelNow.toGlobal(new PIXI.Point(b.x + b.width, b.y + b.height))
+        const rect = canvasEl.getBoundingClientRect()
+        api.pet.sendTouchSnapshot({
+          image: '',
+          width: 0,
+          height: 0,
+          bounds: {
+            x: p0.x + rect.left,
+            y: p0.y + rect.top,
+            w: p1.x - p0.x,
+            h: p1.y - p0.y,
+          },
+          mode: 'live2d',
+          spriteId: null,
+        })
+      } catch (err) {
+        console.warn('[pet] 上报截图几何失败：', err instanceof Error ? err.message : err)
+        api.pet.sendTouchSnapshot(null)
+      }
+    })
 
     // 订阅「一键动作」：设置面板点动作按钮 → 立刻播放一次（不改动待机动作设置）
     unsubMotion = api.pet.onPlayMotion((group) => {
@@ -1255,6 +1575,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
       unsubSettings()
       unsubMotion()
       unsubDismiss()
+      unsubSnapshot()
       unsubEmotion()
       unsubThinking()
       unsubObserving()
@@ -1322,6 +1643,7 @@ export function PetStage({ stageRef, onStatus }: PetStageProps) {
               const s = FIT_REF_H / box.bh
               return (
                 <div
+                  ref={spriteContentRef}
                   className="absolute"
                   style={{ left: '50%', top: '50%', width: box.bw * s, height: box.bh * s, transform: 'translate(-50%, -50%)' }}
                 >
@@ -1472,13 +1794,17 @@ function patchCubismCoreCompatibility(mod: Record<string, unknown>): void {
 }
 
 
-function zoomModel(model: Live2DModel | null, factor: number): number {
-  if (!model) return 1
-  const next = Math.min(3, Math.max(0.2, model.scale.x * factor))
-  const ratio = next / model.scale.x
-  model.scale.x = next
-  model.scale.y = model.scale.y * ratio
-  return next
+/**
+ * 滚轮缩放：只改「倍率」，实际缩放 = 基准 × 倍率。
+ * 之前是在 model.scale 上连乘，任何一次 fitModel/外部重置都会让基准漂掉，
+ * 表现为"越滚越大、滚回去没反应"。
+ */
+function applyZoomFactor(model: Live2DModel | null, baseScale: number, factor: number): { scale: number; factor: number } {
+  const nextFactor = Math.min(4, Math.max(0.25, factor))
+  if (!model) return { scale: baseScale * nextFactor, factor: nextFactor }
+  const scale = baseScale * nextFactor
+  model.scale.set(scale, scale)
+  return { scale, factor: nextFactor }
 }
 
 // pixi-live2d-display 的动作优先级：None=0 / Idle=1 / Normal=2 / Force=3
@@ -1580,6 +1906,66 @@ async function playRandomIdle(model: Live2DModel | null, preferredGroup?: string
   } catch (err) {
     console.warn('[pet] 播放空闲动作失败:', err instanceof Error ? err.message : err)
   }
+}
+
+/**
+ * 顺序播放一组动作：await 每个动作的结束（pixi-live2d 的 motion() 在动作播完时 resolve），
+ * 全部播完后再决定是否回到设置里的空闲动作。
+ */
+async function playTouchMotions(
+  model: Live2DModel | null,
+  groups: string[],
+  restoreIdle: boolean,
+  idleGroup?: string,
+): Promise<void> {
+  for (const g of groups) {
+    await playRandomIdle(model, g, true)
+    await waitMotionFinished(model)
+  }
+  if (!restoreIdle) return
+  if (idleGroup && !groups.includes(idleGroup)) {
+    await playRandomIdle(model, idleGroup, false)
+    return
+  }
+  // 没有配置空闲动作时，动作会停在最后一帧（手/手臂等参数不回位）。
+  // 这里显式停播 + 复位参数，让角色回到标准姿势。
+  const mgr = (model as unknown as {
+    internalModel?: { motionManager?: { stopAllMotions?: () => void } }
+  })?.internalModel?.motionManager
+  mgr?.stopAllMotions?.()
+  resetModelParameters(model)
+}
+
+/**
+ * 等当前动作播完。
+ * 注意：库的 `model.motion()` 在动作**开始**时就 resolve（返回 true），不是结束时，
+ * 所以不能用 await 来串动作，只能轮询 motionManager.isFinished()。
+ */
+function waitMotionFinished(model: Live2DModel | null, timeoutMs = 20000): Promise<void> {
+  return new Promise((resolve) => {
+    if (!model) {
+      resolve()
+      return
+    }
+    const mgr = (model as unknown as {
+      internalModel?: { motionManager?: { isFinished?: () => boolean } }
+    }).internalModel?.motionManager
+    if (!mgr?.isFinished) {
+      resolve()
+      return
+    }
+    const started = performance.now()
+    // 起播需要一两帧才进队列，先等一小段再开始判定，避免"还没开始就判定已结束"
+    setTimeout(() => {
+      const tick = () => {
+        const done = mgr.isFinished?.() ?? true
+        if (done) resolve()
+        else if (performance.now() - started > timeoutMs) resolve()
+        else requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    }, 150)
+  })
 }
 
 function getMotionGroups(model: Live2DModel | null): string[] {
@@ -1747,7 +2133,7 @@ interface CoreModelLike {
   getParameterValueById?: (id: string) => number
   addParameterValueById?: (id: string, value: number, weight?: number) => void
   multiplyParameterValueById?: (id: string, value: number, weight?: number) => void
-  /** CubismModel 内部数据（用于枚举真实存在的参数 id 与量程） */
+  /** CubismModel 内部数据（用于枚举参数 id/量程，以及按部件聚合包围盒） */
   _model?: {
     parameters?: {
       ids?: readonly string[]
@@ -1755,7 +2141,11 @@ interface CoreModelLike {
       maximumValues?: ArrayLike<number>
       defaultValues?: ArrayLike<number>
     }
+    parts?: { ids?: readonly string[] }
+    drawables?: { ids?: readonly string[]; parentPartIndices?: ArrayLike<number> }
   }
+  getDrawableCount?: () => number
+  getDrawableVertexPositions?: (i: number) => Float32Array | undefined
 }
 
 // ---------------- VTS/VBridger 型模型的「控制器参数」镜像 ----------------
@@ -1798,18 +2188,40 @@ const RIG_PARAM_ALIASES: ReadonlyArray<{
 async function collectModelProfile(
   modelId: string,
   model3Url: string,
-  core: CoreModelLike,
+  internal: {
+    coreModel?: CoreModelLike
+    pixelsPerUnit?: number
+    originalWidth?: number
+    originalHeight?: number
+  },
 ): Promise<ModelProfile | null> {
+  const core = internal.coreModel
+  if (!core) return null
   const table = core._model?.parameters
   const ids = table?.ids
   if (!ids || ids.length === 0 || !table.minimumValues || !table.maximumValues || !table.defaultValues) {
     return null
   }
-  let model3: { Groups?: Array<{ Name?: string; Ids?: string[] }>; FileReferences?: { Physics?: string } } | null = null
+  let model3: {
+    Groups?: Array<{ Name?: string; Ids?: string[] }>
+    FileReferences?: { Physics?: string; DisplayInfo?: string }
+  } | null = null
   let physics: unknown = null
+  let partNames: Record<string, string> = {}
   try {
     const res = await fetch(model3Url)
     if (res.ok) model3 = await res.json()
+    const cdiFile = model3?.FileReferences?.DisplayInfo
+    if (cdiFile) {
+      const baseDir = model3Url.slice(0, model3Url.lastIndexOf('/') + 1)
+      const cres = await fetch(baseDir + encodeURI(cdiFile))
+      if (cres.ok) {
+        const cdi = (await cres.json()) as { Parts?: Array<{ Id?: string; Name?: string }> }
+        for (const part of cdi.Parts ?? []) {
+          if (part?.Id) partNames[part.Id] = part.Name ?? part.Id
+        }
+      }
+    }
     const physicsFile = model3?.FileReferences?.Physics
     if (physicsFile) {
       const baseDir = model3Url.slice(0, model3Url.lastIndexOf('/') + 1)
@@ -1819,7 +2231,7 @@ async function collectModelProfile(
   } catch (err) {
     console.warn('[pet] 读取模型 json 失败（能力表退化为仅参数表）:', err instanceof Error ? err.message : err)
   }
-  return buildModelProfile({
+  const profile = buildModelProfile({
     modelId,
     paramIds: ids,
     minimumValues: table.minimumValues,
@@ -1828,6 +2240,77 @@ async function collectModelProfile(
     model3,
     physics: physics as Parameters<typeof buildModelProfile>[0]['physics'],
   })
+
+  // 自动识别触摸命中区：把 drawable 顶点按 parentPart 聚合 → 归一化到角色包围盒
+  try {
+    const ppu = internal.pixelsPerUnit || 1
+    const ow = internal.originalWidth || 0
+    const oh = internal.originalHeight || 0
+    const count = core.getDrawableCount?.() ?? 0
+    const parent = core._model?.drawables?.parentPartIndices
+    const partIds = core._model?.parts?.ids ?? []
+    if (count > 0 && ow > 0 && oh > 0) {
+      const perPart = new Map<number, { x0: number; y0: number; x1: number; y1: number }>()
+      let gx0 = Infinity
+      let gy0 = Infinity
+      let gx1 = -Infinity
+      let gy1 = -Infinity
+      for (let i = 0; i < count; i++) {
+        const v = core.getDrawableVertexPositions?.(i)
+        if (!v || v.length < 2) continue
+        let x0 = Infinity
+        let y0 = Infinity
+        let x1 = -Infinity
+        let y1 = -Infinity
+        for (let k = 0; k < v.length; k += 2) {
+          const px = (v[k] ?? 0) * ppu + ow / 2
+          const py = -(v[k + 1] ?? 0) * ppu + oh / 2
+          if (px < x0) x0 = px
+          if (px > x1) x1 = px
+          if (py < y0) y0 = py
+          if (py > y1) y1 = py
+        }
+        if (!Number.isFinite(x0) || !Number.isFinite(y0)) continue
+        gx0 = Math.min(gx0, x0)
+        gy0 = Math.min(gy0, y0)
+        gx1 = Math.max(gx1, x1)
+        gy1 = Math.max(gy1, y1)
+        const pi = parent?.[i] ?? -1
+        if (pi < 0) continue
+        const cur = perPart.get(pi)
+        if (cur) {
+          cur.x0 = Math.min(cur.x0, x0)
+          cur.y0 = Math.min(cur.y0, y0)
+          cur.x1 = Math.max(cur.x1, x1)
+          cur.y1 = Math.max(cur.y1, y1)
+        } else {
+          perPart.set(pi, { x0, y0, x1, y1 })
+        }
+      }
+      const gw = gx1 - gx0
+      const gh = gy1 - gy0
+      if (gw > 0 && gh > 0) {
+        const parts = []
+        for (const [pi, b] of perPart) {
+          const id = partIds[pi]
+          if (!id) continue
+          parts.push({
+            id,
+            name: partNames[id] ?? id,
+            x: (b.x0 - gx0) / gw,
+            y: (b.y0 - gy0) / gh,
+            w: (b.x1 - b.x0) / gw,
+            h: (b.y1 - b.y0) / gh,
+          })
+        }
+        profile.regions = buildTouchRegionsFromParts(parts)
+        profile.parts = parts
+      }
+    }
+  } catch (err) {
+    console.warn('[pet] 触摸命中区识别失败（可稍后手动画）:', err instanceof Error ? err.message : err)
+  }
+  return profile
 }
 
 /** 每个 core 模型解析一次的别名表缓存（null = 该模型不是控制器型，无需镜像） */
@@ -1893,6 +2376,10 @@ interface FocusControllerLike {
 interface InternalModelLike {
   coreModel?: CoreModelLike
   focusController?: FocusControllerLike
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
 }
 
 /**

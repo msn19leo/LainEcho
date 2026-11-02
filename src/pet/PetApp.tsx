@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { LogOut, Eye, MessageSquare, Settings } from 'lucide-react'
+import { LogOut, Eye, MessageSquare, Settings, Hand, GripVertical, X } from 'lucide-react'
 import { api } from '../api'
 import { toast } from '../components/toast'
 import { PositionedMenu, type MenuItem } from '../components/DropdownMenu'
@@ -49,6 +49,11 @@ const STORAGE_KEY = 'lainecho.petChatPanel'
 
 export default function PetApp() {
   const stageRef = useRef<PetStageHandle>(null)
+  /** 互动模式开关（全局设置） */
+  const touchEnabled = useSettingsStore((st) => st.settings.touch?.enabled ?? false)
+  const saveSettings = useSettingsStore((st) => st.save)
+  /** 点击判定用：按下位置（位移超过 8px 视为拖动，不触发触摸） */
+  const touchDownRef = useRef<{ x: number; y: number } | null>(null)
   /** 方案A：当前回合文档 turnId（快照订阅更新；语音进度上行用） */
   const turnCoordinatorIdRef = useRef<string | null>(null)
   /** 桌宠窗口尺寸（来自设置；只决定画布大小，不改变角色大小） */
@@ -682,6 +687,9 @@ export default function PetApp() {
 
   const onWheel = (e: React.WheelEvent) => {
     e.preventDefault()
+    e.stopPropagation()
+    // 部分鼠标/触控板会发 deltaY=0 的横向滚轮，别把它当成缩小
+    if (!e.deltaY) return
     const factor = e.deltaY < 0 ? 1.1 : 0.9
     stageRef.current?.zoom(factor)
     setScalePct(Math.round((stageRef.current?.getScale() ?? 1) * 100))
@@ -769,6 +777,29 @@ export default function PetApp() {
         style={{ position: 'absolute', left: 0, right: 0, top: 0, height: modelH, zIndex: 0 }}
       >
         <PetStage stageRef={stageRef} onStatus={() => {}} />
+        {touchEnabled && (
+          // 交互层：只覆盖模型区，且 no-drag（否则整窗拖动会把点击吃掉）。
+          // 位移 < 8px 才算点击，避免误触；真正的拖动交给第三排的抓手按钮。
+          <div
+            className="app-no-drag absolute inset-0"
+            style={{ zIndex: 20 }}
+            onPointerDown={(e) => {
+              touchDownRef.current = { x: e.clientX, y: e.clientY }
+            }}
+            onPointerUp={(e) => {
+              const down = touchDownRef.current
+              touchDownRef.current = null
+              if (!down) return
+              if (Math.abs(e.clientX - down.x) + Math.abs(e.clientY - down.y) > 8) return
+              const regionId = stageRef.current?.hitTest(e.clientX, e.clientY)
+              if (regionId) stageRef.current?.playTouch(regionId)
+            }}
+            onPointerLeave={() => {
+              touchDownRef.current = null
+            }}
+          />
+        )}
+
       </div>
 
       {/* 底部浮层：迷你会话内容框（半透明叠加在模型上，位于输入框上方） */}
@@ -815,6 +846,30 @@ export default function PetApp() {
             {/* hover 变红（退出语义）：group-hover 覆盖按钮的 hover:text-text */}
             <LogOut size={14} strokeWidth={1.75} className="group-hover:!text-danger" />
           </PetQuickButton>
+        </div>
+        {/* 第三排：互动模式。未开启 = 「手」进入；开启后换成「拖动」+「✕退出」 */}
+        <div className="flex items-center gap-1.5">
+          {!touchEnabled ? (
+            <PetQuickButton title="进入互动模式（可以摸头/身体）" onClick={() => void saveSettings({ touch: { ...useSettingsStore.getState().settings.touch, enabled: true } })}>
+              <Hand size={14} strokeWidth={1.75} />
+            </PetQuickButton>
+          ) : (
+            <>
+              {/* 拖动区必须是 drag，收不到点击；退出用旁边的 ✕ */}
+              <div
+                title="按住拖动窗口"
+                className="glass-strong app-drag flex h-8 w-8 items-center justify-center rounded-full text-text-2"
+              >
+                <GripVertical size={14} strokeWidth={1.75} />
+              </div>
+              <PetQuickButton
+                title="退出互动模式"
+                onClick={() => void saveSettings({ touch: { ...useSettingsStore.getState().settings.touch, enabled: false } })}
+              >
+                <X size={14} strokeWidth={1.75} />
+              </PetQuickButton>
+            </>
+          )}
         </div>
       </div>
 

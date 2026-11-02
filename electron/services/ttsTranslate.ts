@@ -28,6 +28,18 @@ const CHINESE_ONLY_RE =
   /[这你她它哪谁们么吗呢吧啊呀哦啦嘛嘿嗯呗儿很说时过还让给对爱见气开关听语话电头发车东马龙鸟鱼风飞书长门问间闻买卖认识记讲谢请欢边变应该为从个两几实际处带张团园围层岁历亿员单卫厂专业热选远进运达适错铁银钱钟网罗罚胜负责场现环产决态标样确图课题视觉]/
 
 /**
+ * 仅用于长度比较：剔除空白与常见中英日标点，保留数字与文字。
+ * 日语译文经常补「。」「！」「…」，若不去掉，短句比例会被额外抬高。
+ */
+const LENGTH_STRIP_RE =
+  /[\s、，,。．.！？!?…:：；;·・\-—~～%％"'“”‘’「」『』（）()【】\[\]{}／\/]/g
+
+/** 长度比较专用：去掉空白/标点，避免日语补句号把比例抬高 */
+function stripForLength(s: string): string {
+  return s.replace(LENGTH_STRIP_RE, '')
+}
+
+/**
  * 滑窗 n-gram 重复率：模型复读时该值会飙到 1 以上，正常文本接近 0。
  * 2026-10-28 实例：一条 226 字译文把中间整段说了两遍，其它判据全过，产出 38.8 秒音频。
  */
@@ -65,14 +77,19 @@ export interface JaCheckResult {
  *      共享汉字（以上/最新情報/完了）与数字表达（17対15）不拦；独立成句的中文标题仍可能被拦。
  * 注 2：英文判据曾用「白名单外的英文总量」，但模型名层出不穷（Anthropic/DeepSeek/GLM…），
  * 白名单永远补不完，改成只数「小写英文词」——专有名词放行，句子式泄漏才拦。
+ * 注 3：长度判据改为「失控保护」，不再对短文本一刀切。2026-11-02 实测「好舒服啊」→
+ * 「すごく気持ちいいですね」11 字 / 2.8 倍被误杀；短文本允许「原文 + 20 字」绝对余量，
+ * 长文本仍按 2.5 倍拦。长度比较前统一去标点/空白，避免日语补句号抬高比例。
  */
 export function analyzeJaTranslation(out: string, srcText: string): JaCheckResult {
   const body = out.replace(/\s/g, '')
-  const total = body.length || 1
+  const total = stripForLength(out).length || 1
   const kana = (out.match(/[\u3040-\u309F\u30A0-\u30FF]/g) ?? []).length
   const kanaRatio = kana / total
-  const srcLen = srcText.replace(/\s/g, '').length || 1
+  const srcLen = stripForLength(srcText).length || 1
   const lengthRatio = total / srcLen
+  // 短文本给绝对余量（4 字原文允许到 24 字），长文本仍按 2.5 倍；两者取较大值
+  const allowedLength = Math.ceil(Math.max(srcLen * 2.5, srcLen + 20))
 
   // 只统计「小写开头、长度 ≥3」的英文词：
   // 专有名词与缩写（OpenAI / Anthropic / GLM / DeepSeek）天然大写开头，属于正常日语外来词；
@@ -84,12 +101,17 @@ export function analyzeJaTranslation(out: string, srcText: string): JaCheckResul
   const dupRatio = repeatRatio(body)
 
   const metrics =
-    `字数=${total} 假名=${(kanaRatio * 100).toFixed(0)}% ` +
-    `小写英文=${lowerWords.length}词 长度比=${lengthRatio.toFixed(1)} 重复率=${dupRatio.toFixed(2)}`
+    `字数=${total} 原文=${srcLen} 允许≤${allowedLength}字 ` +
+    `假名=${(kanaRatio * 100).toFixed(0)}% 小写英文=${lowerWords.length}词 ` +
+    `长度比=${lengthRatio.toFixed(1)} 重复率=${dupRatio.toFixed(2)}`
 
   if (HANGUL_RE.test(out)) return { ok: false, reason: '混入韩文', metrics }
-  if (lengthRatio > 2.5) {
-    return { ok: false, reason: `译文异常冗长（${lengthRatio.toFixed(1)} 倍）`, metrics }
+  if (total > allowedLength) {
+    return {
+      ok: false,
+      reason: `译文异常冗长（${total} 字 / 原文 ${srcLen} 字，上限 ${allowedLength} 字）`,
+      metrics,
+    }
   }
   if (lowerWords.length >= 2) {
     return { ok: false, reason: `混入未翻译英文（${lowerWords.join('/')}）`, metrics }
@@ -180,11 +202,12 @@ export async function translateText(text: string, targetLang: 'ja' | 'zh'): Prom
       if (!check.ok) {
         // 两次失败都落日志：第 2 次以前是直接 throw，线上只能看到第 1 次，无法定位
         console.warn(
-          '[tts] 译文校验未通过（第 %d 次，%s）→ %s｜%s｜片段=%j｜输出=%j',
+          '[tts] 译文校验未通过（第 %d 次，%s）→ %s｜%s｜原文=%j｜片段=%j｜输出=%j',
           attempt,
           check.reason,
           attempt < 2 ? '强化提示词重试' : '跳过该段语音',
           check.metrics,
+          text.replace(/\s+/g, ' ').slice(0, 80),
           check.offending ?? '',
           result.slice(0, 80),
         )

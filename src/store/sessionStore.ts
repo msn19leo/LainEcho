@@ -366,6 +366,26 @@ export function bindPersistentSessionSync(): () => void {
     }))
     console.log('[bind] streamUser ADD usr=' + payload.content.slice(0, 12))
   })
+  /**
+   * 主进程直接落盘的消息（触摸旁白）：只追加气泡，不碰 streaming。
+   * 不能复用 stream-user —— 那边会把 streaming 置 true 等回复，
+   * 而旁白之后没有 stream-done 来复位，两个窗口会一直卡在"正在回复"。
+   */
+  const unsubAppended = api.ai.onSessionAppended((payload) => {
+    const st = useSessionStore.getState()
+    if (!payload?.sessionId || !payload.message || isStoryRunId(payload.sessionId)) return
+    // 正在看别的会话：不把这条塞进当前视图
+    if (st.currentSessionId && st.currentSessionId !== payload.sessionId) return
+    const m = payload.message
+    // 幂等：同内容同时间戳已存在（例如随后 stream-done 全量拉取）就跳过
+    if (st.messages.some((x) => x.timestamp === m.timestamp && x.content === m.content)) return
+    useSessionStore.setState((s2) => ({
+      currentSessionId: payload.sessionId,
+      messages: [...s2.messages, m],
+    }))
+    console.log('[bind] sessionAppended ADD sid=' + payload.sessionId + ' usr=' + m.content.slice(0, 12))
+  })
+
   // ===== 方案A第3步：旧直播链退役 =====
   // 已删除：onActiveSession 认领补发（快照拉取取代）、onStreamChunk 增量消费（快照取代）。
   // 保留：streamUser（用户气泡即时同步，非直播显示职责）、streamDone（落盘拉取）、
@@ -503,6 +523,7 @@ export function bindPersistentSessionSync(): () => void {
 
   return () => {
     unsubUser()
+    unsubAppended()
     unsubDone()
     unsubError()
     unsubRewound()

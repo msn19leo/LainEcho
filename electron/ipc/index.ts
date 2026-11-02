@@ -11,6 +11,7 @@ import { registerModelSettingsIpc } from './modelSettings.ipc'
 import { registerProactiveIpc } from './proactive.ipc'
 import { registerSessionIpc } from './session.ipc'
 import { registerSettingsIpc } from './settings.ipc'
+import { registerTouchIpc } from './touch.ipc'
 import { registerSpritesIpc } from './sprites.ipc'
 import { registerStoryIpc } from './story.ipc'
 import { registerTtsIpc } from './tts.ipc'
@@ -29,6 +30,7 @@ export function registerAllIpc(): void {
   registerProactiveIpc()
   registerSessionIpc()
   registerSettingsIpc()
+  registerTouchIpc()
   registerSpritesIpc()
   registerStoryIpc()
   registerTtsIpc()

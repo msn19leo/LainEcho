@@ -687,6 +687,8 @@ export interface AppSettings {
    * x/y 为 null 表示尚未记录，启动时落在默认位置。
    */
   petWindow: PetWindowSettings
+  /** 触摸互动（互动模式开关 / AI 回应 / 语音 / 冷却） */
+  touch: TouchSettings
 }
 
 /** 桌宠窗口配置（见 AppSettings.petWindow） */
@@ -1104,7 +1106,82 @@ export interface ModelProfile {
   eyeBlink: string[]
   /** SDK 口型组参数 */
   lipSync: string[]
+  /** 自动识别出的触摸命中区（部件包围盒归一化；设置里可覆盖） */
+  regions?: TouchRegion[]
+  /** 所有部件的中性姿势包围盒（归一化，供编辑器画参考框与「取部件下半段」用） */
+  parts?: Array<{ id: string; name: string; x: number; y: number; w: number; h: number }>
   createdAt: number
+}
+
+/**
+ * 一个触摸命中区。坐标是**相对角色包围盒的归一化值（0~1）**：
+ * (0,0) = 包围盒左上，(1,1) = 右下。这样换窗口尺寸/缩放都不用改配置。
+ */
+export interface TouchRegion {
+  id: string
+  /** 展示名：头 / 身体 / 腿 / 脚 / 自定义 */
+  label: string
+  x: number
+  y: number
+  w: number
+  h: number
+  /** 触发时按顺序播放的动作组（播完一个再下一个；空 = 不播动作） */
+  motions?: string[]
+  /** 兼容旧配置的单个动作组 */
+  motion?: string
+  /** 触发时同时套用的表情（互斥的请只选一个） */
+  expressions?: string[]
+  /** 兼容旧配置的单个表情 */
+  expression?: string
+  /** 动作全部播完后是否回到设置里的空闲动作 */
+  restoreIdle?: boolean
+  /** 触摸台词（随机一条，走 TTS 预生成缓存） */
+  lines?: string[]
+  /** 表情保持时长（毫秒），默认 1800 */
+  holdMs?: number
+}
+
+/** 2D 立绘触摸演出的一帧：切到这张图 → 保持 holdMs → 播这句台词 */
+export interface SpriteTouchFrame {
+  /** 立绘文件名（必须属于该立绘集） */
+  image: string
+  /** 该张保持时长（毫秒） */
+  holdMs: number
+  /** 该张的台词（空 = 不出声） */
+  line?: string
+}
+
+/**
+ * 2D 立绘的触摸命中区。
+ * 与 Live2D 的 TouchRegion 分开：立绘没有动作/表情，触发的是"立绘序列"，
+ * 而且每个区域可以有自己的多段切换节奏。
+ */
+export interface SpriteTouchRegion {
+  id: string
+  label: string
+  /** 相对立绘内容框（alpha 包围盒）的归一化坐标 */
+  x: number
+  y: number
+  w: number
+  h: number
+  /** 按顺序播放的立绘序列 */
+  frames: SpriteTouchFrame[]
+  /** 演完是否回到触发前的立绘（false = 停在最后一帧，直到下一次切图请求） */
+  restore: boolean
+}
+
+/** 触摸互动全局开关 */
+export interface TouchSettings {
+  /** 互动模式：桌宠窗第三排按钮 + 画布可点击 */
+  enabled: boolean
+  /** 触摸后让 AI 立即回应（false = 只把旁白写进会话历史） */
+  aiReply: boolean
+  /** 触摸语音（TTS） */
+  voice: boolean
+  /** 是否把触摸旁白写进会话历史（关闭则 AI 完全不知道被摸了） */
+  saveNarration: boolean
+  /** 同一部位的冷却毫秒数 */
+  cooldownMs: number
 }
 
 export interface ModelSettings {
@@ -1125,6 +1202,10 @@ export interface ModelSettings {
   appearancesByModel: Record<string, string[]>
   /** 按模型保存的外观分组自定义（自动分类猜错时由用户改正，见 ModelAppearanceLayout） */
   appearanceLayoutByModel: Record<string, ModelAppearanceLayout>
+  /** 按模型保存的触摸命中区；缺省 = 用能力表里自动识别的 regions */
+  touchByModel: Record<string, TouchRegion[]>
+  /** 按立绘集保存的触摸命中区（2D 立绘模式） */
+  spriteTouchBySprite: Record<string, SpriteTouchRegion[]>
   animation: ModelAnimationSettings
   view: ModelViewSettings
   /** 2D 立绘集的缩放与位置（与 Live2D view 独立） */
@@ -1701,6 +1782,27 @@ export interface LogEntry {
  * 渲染进程只能调用这里声明的能力，不做通配符透传。
  */
 export interface WindowApi {
+  /** 触摸互动：取台词语音、上报触摸事件（AI 感知） */
+  touch: {
+    /** 取桌宠窗当前姿势的截图（拖框编辑用）；桌宠未就绪返回 null */
+    snapshot: () => Promise<{
+      image: string
+      width: number
+      height: number
+      bounds: { x: number; y: number; w: number; h: number }
+      /** 桌宠窗当前渲染模式与立绘集：设置窗据此判断截图是否与正在编辑的目标一致 */
+      mode?: 'live2d' | 'sprite'
+      spriteId?: string | null
+      /** 立绘模式下当前显示的文件名（用于在选择器里标「当前」） */
+      spriteFile?: string | null
+    } | null>
+    /** 取一句触摸台词的音频（base64 wav）；未命中且不允许合成时返回 null */
+    voice: (text: string, allowSynthesize?: boolean) => Promise<string | null>
+    /** 上报一次触摸：默认写旁白入史，开启「立即回应」时走一轮对话 */
+    notify: (payload: { label?: string; line?: string | null }) => Promise<void>
+    /** 上报「接下来 durationMs 内处于触摸演出」：主进程据此拦住主动搭话 */
+    reportPerforming: (durationMs: number) => void
+  }
   ai: {
     /**
      * 发送消息；主进程组装 system prompt（人设+记忆）、发起流式请求、持久化。
@@ -1735,6 +1837,11 @@ export interface WindowApi {
     onStreamError: (cb: (payload: StreamErrorPayload) => void) => () => void
     /** 订阅主进程广播的用户消息（跟随窗口即时补上用户气泡，无需等 stream-done 全量拉取） */
     onStreamUser: (cb: (payload: StreamUserPayload) => void) => () => void
+    /**
+     * 订阅「主进程直接落盘了一条消息」（触摸旁白这类不经过 LLM 的记录）。
+     * 与 streamUser 的区别：只追加气泡，不改 streaming 态——旁白之后没有回复可等。
+     */
+    onSessionAppended: (cb: (payload: { sessionId: string; message: ChatMessage }) => void) => () => void
     /** 取消当前流式请求 */
     cancel: () => void
     /** ===== 方案A快照协议 ===== */
@@ -1984,6 +2091,18 @@ export interface WindowApi {
     reportStateExpression: (name: string | null) => void
     /** 上报当前模型的参数能力表（模型加载完成后上报一次） */
     reportModelProfile: (profile: ModelProfile) => void
+    /** 订阅「要一张触摸编辑用的截图」 */
+    onTouchSnapshot: (cb: () => void) => () => void
+    /** 回传截图（image=dataURL；bounds=角色包围盒在图片内的像素坐标） */
+    sendTouchSnapshot: (payload: {
+      image: string
+      width: number
+      height: number
+      bounds: { x: number; y: number; w: number; h: number }
+      mode?: 'live2d' | 'sprite'
+      spriteId?: string | null
+      spriteFile?: string | null
+    } | null) => void
     /** 取消当前状态表情（外观面板点击"·状态"项时调用；直到状态变化前不再生效） */
     dismissStateExpression: () => Promise<void>
     /** 订阅「取消状态表情」指令（设置窗 → 桌宠窗） */

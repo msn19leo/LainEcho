@@ -16,6 +16,7 @@ import {
   BrainCircuit,
   Database,
   Eye,
+  Hand,
   Info,
   KeyRound,
   MessagesSquare,
@@ -27,6 +28,7 @@ import {
 } from 'lucide-react'
 import { WindowTitlebar } from '../components/WindowTitlebar'
 import { api } from '../api'
+import { initSettingsSync } from '../store/settingsStore'
 import { cn } from '../lib/utils'
 import { fadeSlideUp } from '../lib/motion'
 import { useSettingsStore } from '../store/settingsStore'
@@ -35,6 +37,7 @@ import { ApiAside } from './components/asides/ApiAside'
 import { ApiConfigPanel } from './panels/ApiConfigPanel'
 import { CharacterCardPanel } from './panels/CharacterCardPanel'
 import { CharacterModelPanel } from './panels/CharacterModelPanel'
+import { InteractionPanel } from './panels/InteractionPanel'
 import { DataPanel } from './panels/DataPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { ProactivePanel } from './panels/ProactivePanel'
@@ -49,6 +52,7 @@ export type ModuleId =
   | 'general'
   | 'character-card'
   | 'model'
+  | 'interaction'
   | 'api'
   | 'vision'
   | 'memory'
@@ -73,6 +77,7 @@ const MODULES: ModuleDef[] = [
   { id: 'general', title: '通用设置', icon: SlidersHorizontal, width: 'narrow' },
   { id: 'character-card', title: '角色卡', icon: Bot, group: '人格', width: 'wide' },
   { id: 'model', title: '角色模型', icon: PersonStanding, group: '人格', width: 'wide' },
+  { id: 'interaction', title: '角色互动', icon: Hand, group: '人格', width: 'wide' },
   { id: 'api', title: 'AI 模型接入', icon: KeyRound, group: '能力', width: 'medium' },
   { id: 'vision', title: '视觉感知', icon: Eye, group: '能力', width: 'narrow' },
   { id: 'voice', title: '语音合成', icon: AudioLines, group: '能力', width: 'narrow' },
@@ -108,6 +113,9 @@ export function SettingsLayout() {
   const mod = MODULES.find((m) => m.id === view) ?? MODULES[0]!
 
   // 打开设置窗口即加载设置（主题切换器需要反映已保存的主题）
+  // 订阅主进程广播：桌宠窗改的开关（互动模式等）要即时回显到设置面板
+  useEffect(() => initSettingsSync(), [])
+
   useEffect(() => {
     void useSettingsStore.getState().load()
   }, [])
@@ -181,6 +189,7 @@ export function SettingsLayout() {
               {view === 'general' && <GeneralPanel />}
               {view === 'character-card' && <CharacterCardPanel />}
               {view === 'model' && <CharacterModelPanel />}
+              {view === 'interaction' && <InteractionPanel />}
               {view === 'api' && <ApiConfigPanel />}
               {view === 'voice' && <VoicePanel />}
               {view === 'memory' && <MemoryPanel />}

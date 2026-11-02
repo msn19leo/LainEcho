@@ -183,6 +183,64 @@ class WindowManager {
     }
   }
 
+  /** 截图请求的挂起回调（设置窗要一张当前姿势的角色图） */
+  /**
+   * 等待截图几何的回调队列。
+   * 必须是队列而不是单槽：设置窗的 Live2D 卡与立绘卡可能并发请求，
+   * 单槽会把前一个 resolve 覆盖掉，那个 Promise 就永远不返回（表现为按钮一直"截图中…"）。
+   */
+  private pendingSnapshots: Array<
+    (v: { image: string; width: number; height: number; bounds: { x: number; y: number; w: number; h: number }; mode?: 'live2d' | 'sprite'; spriteId?: string | null; spriteFile?: string | null } | null) => void
+  > = []
+
+  /** 向桌宠窗要一张当前姿势的截图；3 秒无响应返回 null（并发请求共享同一次回传） */
+  requestPetSnapshot(): Promise<{ image: string; width: number; height: number; bounds: { x: number; y: number; w: number; h: number }; mode?: 'live2d' | 'sprite'; spriteId?: string | null; spriteFile?: string | null } | null> {
+    return new Promise((resolve) => {
+      if (!this.pet || this.pet.isDestroyed()) {
+        resolve(null)
+        return
+      }
+      const first = this.pendingSnapshots.length === 0
+      this.pendingSnapshots.push(resolve)
+      // 只发一次请求：多个等待者共用同一次几何回传
+      if (first) this.pet.webContents.send('pet:touch-snapshot')
+      setTimeout(() => {
+        const i = this.pendingSnapshots.indexOf(resolve)
+        if (i >= 0) {
+          this.pendingSnapshots.splice(i, 1)
+          resolve(null)
+        }
+      }, 3000)
+    })
+  }
+
+  /** 桌宠窗内容尺寸（CSS px）：截图是设备像素，换算包围盒要用它 */
+  getPetContentSize(): [number, number] | null {
+    if (!this.pet || this.pet.isDestroyed()) return null
+    return this.pet.getContentSize() as [number, number]
+  }
+
+  /** 截取桌宠窗当前画面（含模型当前姿势） */
+  async capturePetWindow(): Promise<{ image: string; width: number; height: number } | null> {
+    if (!this.pet || this.pet.isDestroyed()) return null
+    try {
+      const img = await this.pet.webContents.capturePage()
+      const size = img.getSize()
+      if (!size.width || !size.height) return null
+      return { image: img.toDataURL(), width: size.width, height: size.height }
+    } catch (err) {
+      console.warn('[pet] 窗口截图失败：', err instanceof Error ? err.message : err)
+      return null
+    }
+  }
+
+  /** 桌宠窗回传截图 */
+  resolvePetSnapshot(payload: { image: string; width: number; height: number; bounds: { x: number; y: number; w: number; h: number }; mode?: 'live2d' | 'sprite'; spriteId?: string | null; spriteFile?: string | null } | null): void {
+    const list = this.pendingSnapshots
+    this.pendingSnapshots = []
+    for (const cb of list) cb(payload)
+  }
+
   /** 当前模型的参数能力表（桌宠窗加载模型后上报；设置窗据此渲染滑杆） */
   private modelProfile: ModelProfile | null = null
 
@@ -290,7 +348,8 @@ class WindowManager {
 
   /** 把 AI 流式事件同时广播给聊天窗与宠物窗（两侧各自维护会话视图，保持同步） */
   broadcastAI(channel: string, payload?: unknown): void {
-    for (const win of [this.chat, this.pet]) {
+    // 设置窗也要收：否则在桌宠窗改的开关（如互动模式）不会回显到设置面板
+    for (const win of [this.chat, this.pet, this.settings]) {
       if (win && !win.isDestroyed()) {
         win.webContents.send(channel, payload)
       }

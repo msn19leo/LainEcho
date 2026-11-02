@@ -15,6 +15,7 @@ import { getSettings, listSessions } from '../repository'
 import { paths, readJson, writeJson } from '../storage'
 import { isChatBusy, runChatTurn } from '../chatTurn'
 import { isStoryActive } from '../storyEngine/engine'
+import { isTouchPerforming } from '../touchPerformance'
 import { buildNarration, intentTtlMs, selectIntentKind, type ProactiveIntentKind } from './strategyDispatcher'
 import { resolveVisionConfig } from './screenAnalyzer'
 import { windowManager } from '../../windows/windowManager'
@@ -236,6 +237,8 @@ async function tryDeliver(kind: ProactiveIntentKind, settings: AppSettings, st: 
   if (isChatBusy()) return false
   // 闸门 1.5：剧情演出进行中（剧情期间旁白会打断演出节奏）
   if (isStoryActive()) return false
+  // 闸门 1.6：触摸演出进行中（Live2D 动作 / 立绘序列），避免两段演出叠在一起
+  if (isTouchPerforming()) return false
   // 闸门 2：用户最近 2 分钟内发过消息（兴趣值也已被重置，双保险）
   if (st.lastUserMessageAt && Date.now() - st.lastUserMessageAt < USER_RECENT_COOLDOWN_MS) return false
   // 闸门 3：免打扰时段（调度层已拦截，此处兜底）

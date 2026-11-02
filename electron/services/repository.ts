@@ -1220,6 +1220,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   storyTextSpeed: 80,
   // 桌宠窗口：默认 300×480（模型区 440 + 输入条 40），x/y 未记录时落默认位置
   petWindow: { width: 300, height: 480, x: null, y: null },
+  touch: { enabled: false, aiReply: false, voice: true, saveNarration: true, cooldownMs: 1200 },
 }
 
 export async function getSettings(): Promise<AppSettings> {
@@ -1227,6 +1228,7 @@ export async function getSettings(): Promise<AppSettings> {
   const merged = { ...DEFAULT_SETTINGS, ...(saved ?? {}) }
   // vision 为嵌套对象：浅合并会让缺失的子字段变 undefined，此处逐字段兜底
   merged.vision = { ...DEFAULT_SETTINGS.vision, ...(saved?.vision ?? {}) }
+  merged.touch = { ...DEFAULT_SETTINGS.touch, ...(saved?.touch ?? {}) }
   merged.petWindow = { ...DEFAULT_SETTINGS.petWindow, ...(saved?.petWindow ?? {}) }
   return merged
 }
@@ -1269,6 +1271,18 @@ export async function saveSettings(patch: Partial<AppSettings>): Promise<AppSett
     if (patch.enableMemoryExtraction !== undefined) next.enableMemoryExtraction = patch.enableMemoryExtraction
     if (patch.stripParenNarration !== undefined) next.stripParenNarration = patch.stripParenNarration
     if (patch.enableProactive !== undefined) next.enableProactive = patch.enableProactive
+    if (patch.touch !== undefined) {
+      // 逐字段合并：桌宠窗只改 enabled 时不能把 aiReply/voice 等其他开关冲掉
+      const t = (patch.touch ?? {}) as Partial<AppSettings['touch']>
+      const cur = (current?.touch ?? DEFAULT_SETTINGS.touch) as AppSettings['touch']
+      next.touch = {
+        enabled: t.enabled ?? cur.enabled,
+        aiReply: t.aiReply ?? cur.aiReply,
+        voice: t.voice ?? cur.voice,
+        saveNarration: t.saveNarration ?? cur.saveNarration,
+        cooldownMs: Math.max(200, Math.min(10000, Number(t.cooldownMs ?? cur.cooldownMs) || 1200)),
+      }
+    }
     if (patch.enableScreenSense !== undefined) next.enableScreenSense = patch.enableScreenSense
     if (patch.vision !== undefined) {
       // 嵌套对象：逐字段校验并夹取，避免渲染端传入非法值污染磁盘
@@ -1376,6 +1390,8 @@ const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   parametersByModel: {},
   appearancesByModel: {},
   appearanceLayoutByModel: {},
+  touchByModel: {},
+  spriteTouchBySprite: {},
   animation: {
     mouseTracking: true,
     eyeOffsetX: 0, eyeOffsetY: 0,
@@ -1404,6 +1420,8 @@ export async function getModelSettings(): Promise<ModelSettings> {
     parametersByModel: saved.parametersByModel ?? {},
     appearancesByModel: saved.appearancesByModel ?? {},
     appearanceLayoutByModel: saved.appearanceLayoutByModel ?? {},
+    touchByModel: saved.touchByModel ?? {},
+    spriteTouchBySprite: saved.spriteTouchBySprite ?? {},
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(saved.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(saved.view ?? {}) },
     spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(saved.spriteView ?? {}) },
@@ -1422,6 +1440,8 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     if (patch.parametersByModel) next.parametersByModel = { ...(base.parametersByModel ?? {}), ...patch.parametersByModel }
     if (patch.appearancesByModel) next.appearancesByModel = { ...(base.appearancesByModel ?? {}), ...patch.appearancesByModel }
     if (patch.appearanceLayoutByModel) next.appearanceLayoutByModel = { ...(base.appearanceLayoutByModel ?? {}), ...patch.appearanceLayoutByModel }
+    if (patch.touchByModel) next.touchByModel = { ...(base.touchByModel ?? {}), ...patch.touchByModel }
+    if (patch.spriteTouchBySprite) next.spriteTouchBySprite = { ...(base.spriteTouchBySprite ?? {}), ...patch.spriteTouchBySprite }
     if (patch.animation) next.animation = { ...(base.animation ?? {}), ...patch.animation }
     if (patch.view) next.view = { ...(base.view ?? {}), ...patch.view }
     if (patch.spriteView) next.spriteView = { ...(base.spriteView ?? {}), ...patch.spriteView }
@@ -1434,6 +1454,8 @@ export async function saveModelSettings(patch: Partial<ModelSettings>): Promise<
     parametersByModel: result?.parametersByModel ?? {},
     appearancesByModel: result?.appearancesByModel ?? {},
     appearanceLayoutByModel: result?.appearanceLayoutByModel ?? {},
+    touchByModel: result?.touchByModel ?? {},
+    spriteTouchBySprite: result?.spriteTouchBySprite ?? {},
     animation: { ...DEFAULT_MODEL_SETTINGS.animation, ...(result?.animation ?? {}) },
     view: { ...DEFAULT_MODEL_SETTINGS.view, ...(result?.view ?? {}) },
     spriteView: { ...DEFAULT_MODEL_SETTINGS.spriteView, ...(result?.spriteView ?? {}) },
@@ -1470,7 +1492,30 @@ export async function dropModelSettings(modelId: string): Promise<ModelSettings 
       next.appearanceLayoutByModel = map
       changed = true
     }
+    if (next.touchByModel && modelId in next.touchByModel) {
+      const map = { ...next.touchByModel }
+      delete map[modelId]
+      next.touchByModel = map
+      changed = true
+    }
     return changed ? next : current
+  })
+  return changed ? getModelSettings() : null
+}
+
+/**
+ * 删除立绘集时清理它的触摸区域（2D 立绘），避免配置里留下指向不存在立绘集的孤儿键。
+ * @returns 清理后的完整设置（供主进程广播）
+ */
+export async function dropSpriteTouchRegions(spriteId: string): Promise<ModelSettings | null> {
+  assertValidResourceId(spriteId, 'sprite')
+  let changed = false
+  await mutateJson<Partial<ModelSettings> | null>(paths.modelSettingsFile, null, (current) => {
+    if (!current?.spriteTouchBySprite || !(spriteId in current.spriteTouchBySprite)) return current
+    const map = { ...current.spriteTouchBySprite }
+    delete map[spriteId]
+    changed = true
+    return { ...current, spriteTouchBySprite: map }
   })
   return changed ? getModelSettings() : null
 }

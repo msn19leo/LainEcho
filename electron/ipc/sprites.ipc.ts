@@ -11,7 +11,7 @@ import { dialog, ipcMain } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
 import type { CharacterSprite, CharacterSpriteImage } from '../../src/types'
-import { addSprite, genId, listSprites, removeSprite, updateSprite } from '../services/repository'
+import { addSprite, dropSpriteTouchRegions, genId, listSprites, removeSprite, updateSprite } from '../services/repository'
 import { annotateSpriteSet } from '../services/spriteAnnotation'
 import { paths } from '../services/storage'
 import { windowManager } from '../windows/windowManager'
@@ -84,6 +84,9 @@ export function registerSpritesIpc(): void {
 
   ipcMain.handle('sprite:remove', async (_e, spriteId: string) => {
     await removeSprite(spriteId)
+    // 清掉该立绘集的触摸区域（2D 立绘触摸配置与立绘集同生命周期）
+    const cleaned = await dropSpriteTouchRegions(spriteId)
+    if (cleaned) windowManager.notifyModelSettingsChanged(cleaned)
     windowManager.notifySpritesChanged()
   })
 

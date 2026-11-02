@@ -60,6 +60,8 @@ export const DEFAULT_MODEL_SETTINGS: ModelSettings = {
   parametersByModel: {},
   appearancesByModel: {},
   appearanceLayoutByModel: {},
+  touchByModel: {},
+  spriteTouchBySprite: {},
   animation: { ...DEFAULT_ANIMATION },
   view: { ...DEFAULT_VIEW },
   spriteView: { ...DEFAULT_VIEW },
@@ -97,6 +99,8 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
           parametersByModel: data.parametersByModel ?? {},
           appearancesByModel: data.appearancesByModel ?? {},
           appearanceLayoutByModel: data.appearanceLayoutByModel ?? {},
+          touchByModel: data.touchByModel ?? {},
+          spriteTouchBySprite: data.spriteTouchBySprite ?? {},
           animation: { ...DEFAULT_ANIMATION, ...data.animation },
           view: { ...DEFAULT_VIEW, ...data.view },
           spriteView: { ...DEFAULT_VIEW, ...data.spriteView },
@@ -118,6 +122,8 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
       parametersByModel: { ...cur.parametersByModel, ...(patch.parametersByModel ?? {}) },
       appearancesByModel: { ...cur.appearancesByModel, ...(patch.appearancesByModel ?? {}) },
       appearanceLayoutByModel: { ...cur.appearanceLayoutByModel, ...(patch.appearanceLayoutByModel ?? {}) },
+      touchByModel: { ...cur.touchByModel, ...(patch.touchByModel ?? {}) },
+      spriteTouchBySprite: { ...cur.spriteTouchBySprite, ...(patch.spriteTouchBySprite ?? {}) },
       animation: { ...cur.animation, ...(patch.animation ?? {}) },
       view: { ...get().settings.view, ...(patch.view ?? {}) },
       spriteView: { ...get().settings.spriteView, ...(patch.spriteView ?? {}) },
@@ -136,6 +142,8 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         parametersByModel: { ...cur.parametersByModel, ...(patch.parametersByModel ?? {}) },
         appearancesByModel: { ...cur.appearancesByModel, ...(patch.appearancesByModel ?? {}) },
         appearanceLayoutByModel: { ...cur.appearanceLayoutByModel, ...(patch.appearanceLayoutByModel ?? {}) },
+        touchByModel: { ...cur.touchByModel, ...(patch.touchByModel ?? {}) },
+        spriteTouchBySprite: { ...cur.spriteTouchBySprite, ...(patch.spriteTouchBySprite ?? {}) },
         animation: { ...cur.animation, ...(patch.animation ?? {}) },
         view: { ...cur.view, ...(patch.view ?? {}) },
         spriteView: { ...cur.spriteView, ...(patch.spriteView ?? {}) },
@@ -156,6 +164,8 @@ export const useModelSettingsStore = create<ModelSettingsState>((set, get) => ({
         parametersByModel: settings.parametersByModel ?? {},
         appearancesByModel: settings.appearancesByModel ?? {},
         appearanceLayoutByModel: settings.appearanceLayoutByModel ?? {},
+        touchByModel: settings.touchByModel ?? {},
+        spriteTouchBySprite: settings.spriteTouchBySprite ?? {},
         animation: { ...DEFAULT_ANIMATION, ...settings.animation },
         view: { ...DEFAULT_VIEW, ...settings.view },
         spriteView: { ...DEFAULT_VIEW, ...settings.spriteView },
@@ -182,6 +192,22 @@ export function resolveModelParameters(settings: ModelSettings, modelId: string 
 export function resolveModelAppearanceLayout(settings: ModelSettings, modelId: string | null | undefined): ModelAppearanceLayout {
   if (!modelId) return {}
   return settings.appearanceLayoutByModel?.[modelId] ?? {}
+}
+
+/** 取指定模型的触摸命中区（用户覆盖）；没有则返回 null，由调用方回落到自动识别结果 */
+export function resolveModelTouchRegions(settings: ModelSettings, modelId: string | null | undefined): import('../types').TouchRegion[] | null {
+  if (!modelId) return null
+  const list = settings.touchByModel?.[modelId]
+  return Array.isArray(list) && list.length > 0 ? list : null
+}
+
+/** 取指定立绘集的触摸命中区（2D 立绘）；没有配置返回空数组 */
+export function resolveSpriteTouchRegions(
+  settings: ModelSettings,
+  spriteId: string | null | undefined,
+): import('../types').SpriteTouchRegion[] {
+  if (!spriteId) return []
+  return settings.spriteTouchBySprite?.[spriteId] ?? []
 }
 
 /** 取指定模型的外观选中项（exp3 表情名数组，按应用顺序） */
